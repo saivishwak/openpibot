@@ -4,3 +4,9 @@
 [submodule "XLeRobot"]
 	path = XLeRobot
 	url = https://github.com/Vector-Wangel/XLeRobot/
+[submodule "XLerobot_xuweiwu"]
+	path = XLerobot_xuweiwu
+	url = https://github.com/xuweiwu/XLeRobot
+[submodule "openpi"]
+	path = openpi
+	url = https://github.com/xuweiwu/openpi
