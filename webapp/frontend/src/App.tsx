@@ -23,18 +23,25 @@ function GlobalStatus() {
   const s = vr.data;
   if (!s) return null;
 
-  const armColor = s.arm ? "indigo" : "gray";
+  const connectedSides = s.connected_sides ?? [];
+  const anyConnected = connectedSides.length > 0;
+  const armLabel = s.active_arm
+    ? `${s.active_arm} arm · active`
+    : anyConnected
+      ? `${connectedSides.join(" + ")} · connected`
+      : "no arm";
+  const armColor = s.active_arm ? "indigo" : anyConnected ? "teal" : "gray";
   const engagedColor =
     s.engaged ? "red" :
-    s.connected ? "yellow" :
+    anyConnected ? "yellow" :
     "gray";
   return (
     <Group gap="xs">
-      <Badge variant={s.connected ? "filled" : "light"} color={armColor}>
-        {s.connected ? `${s.arm} arm · connected` : "no arm"}
+      <Badge variant={anyConnected ? "filled" : "light"} color={armColor}>
+        {armLabel}
       </Badge>
       <Badge variant={s.engaged ? "filled" : "light"} color={engagedColor}>
-        {s.engaged ? "ENGAGED · VR live" : s.connected ? "armed · safe" : "idle"}
+        {s.engaged ? "ENGAGED · VR live" : anyConnected ? "armed · safe" : "idle"}
       </Badge>
     </Group>
   );

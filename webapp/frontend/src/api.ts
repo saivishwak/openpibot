@@ -122,21 +122,6 @@ export interface VRStatus {
   joint_bounds: Record<string, [number, number]>;
   /** URL the user should open on the Quest browser */
   vr_endpoint: string | null;
-
-  // ─── Legacy fields (deprecated) — mirror the active or first-connected arm.
-  // Kept so the existing single-arm UI keeps working until it migrates to `arms`.
-  /** @deprecated use `active_arm` or `arms` */
-  arm: ArmSide | null;
-  /** @deprecated use `connected_sides.length > 0` or `arms[side].connected` */
-  connected: boolean;
-  /** @deprecated use `arms[active_arm].calibrated` */
-  vr_calibrated: boolean;
-  /** @deprecated use `arms[active_arm].joint_target` */
-  joint_target: Record<string, number>;
-  /** @deprecated use `arms[active_arm].controller` */
-  controller: VRControllerPose;
-  /** @deprecated use `arms[active_arm].controller.age_ms` */
-  last_goal_age_ms: number | null;
 }
 
 async function req<T>(path: string, init?: RequestInit): Promise<T> {

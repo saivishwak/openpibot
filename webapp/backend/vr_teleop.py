@@ -86,12 +86,10 @@ PER_TICK_DEG_CAPS: dict[str, float] = {
     "gripper":       15.0,   # ~0.25s open/close
 }
 
-# Per-frame VR delta caps BEFORE the joint clamp. At scale=1.0, 6 mm/tick ×
-# 30 Hz = 18 cm/s EE speed, between the reference's 3 mm and the recent 20 mm.
-EE_DELTA_LIMIT_M = 0.006
+# Per-frame wrist rotation cap. The cartesian offset has its own LERP-based
+# smoothing in `_compute_targets_from_vr`; this is the equivalent step cap on
+# orientation, scaled per-tick by `scale` (user-adjustable in the UI).
 WRIST_RAD_DELTA_LIMIT = math.radians(5)
-MAX_ACCUMULATED_POS_M = 0.03
-MAX_ACCUMULATED_ROT_RAD = math.radians(20)
 SAFE_REAR_X_M = 0.035
 IK_JUMP_REJECT_DEG = 25.0
 
@@ -141,7 +139,6 @@ CALIBRATION_TARGET_MOTION_M: float = 0.10  # the wizard says "move ~10 cm"
 # Smoothing factors. 1.0 = raw input, 0.0 = frozen.
 POS_EMA_ALPHA: float = 0.5
 ORI_EMA_ALPHA: float = 0.4
-JOINT_EMA_ALPHA: float = 0.2
 WRIST_FLEX_SIGN: float = 1.0
 WRIST_ROLL_SIGN: float = -1.0
 
@@ -262,11 +259,9 @@ class _SO101Kin:
 _SO101_URDF = REPO_ROOT / "SO-ARM100" / "Simulation" / "SO101" / "so101_new_calib.urdf"
 _IK_JOINT_ORDER = ("shoulder_pan", "shoulder_lift", "elbow_flex", "wrist_flex", "wrist_roll")
 
-# VR controller tracking noise. Sub-mm deltas at rest = controller jitter, not
-# intentional motion. Below this threshold (per drive tick, AFTER accumulation),
-# treat as zero. At 30 Hz with ~2 VR frames per tick, controller jitter is ~0.6mm,
-# so 0.8 mm catches noise without eating real slow motion.
-POSITION_DEADBAND_M = 0.0008     # 0.8 mm per tick
+# Rotation noise deadband. Sub-degree wrist twitches at rest are controller
+# jitter, not intentional motion — skip the SLERP step for changes below this
+# threshold so the smoothed orientation target doesn't crawl.
 ROTVEC_DEADBAND_RAD = math.radians(0.3)  # 0.3° per tick
 
 # SO101 reach. Used to clamp the running EE target inside the actual workspace —
@@ -388,14 +383,6 @@ def _clamp_to_workspace_reach(position: _np.ndarray) -> _np.ndarray:
     if radius <= WORKSPACE_REACH_M or radius <= 1e-9:
         return position
     return position * (WORKSPACE_REACH_M / radius)
-
-
-def _limit_vector_norm(vec: tuple[float, float, float] | _np.ndarray, max_norm: float) -> tuple[float, float, float]:
-    arr = _np.array(vec, dtype=float)
-    norm = float(_np.linalg.norm(arr))
-    if max_norm > 0.0 and norm > max_norm:
-        arr *= max_norm / norm
-    return (float(arr[0]), float(arr[1]), float(arr[2]))
 
 
 def _clamp_target_position(position: _np.ndarray) -> _np.ndarray:
@@ -531,8 +518,10 @@ def _compute_session_frame(anchor_quat: tuple[float, float, float, float]) -> _n
 
 @dataclass
 class _LatestGoal:
-    """Snapshot of the most recent VR goal — used for status display and trigger/thumb.
-    Position/rotation deltas are NOT taken from here; see `_DeltaAccumulator` below.
+    """Snapshot of the most recent VR goal — used for status display, the
+    calibration wizard (which reads per-frame `rel_position`/`rel_rotvec`), and
+    the SE(3) controller-pose mapping (which reads `controller_position` +
+    `rotation_quat`).
 
     `buttons` carries the Quest face-button pressed-state, keyed by Meta's labels:
         right controller → {"A": bool, "B": bool}
@@ -551,44 +540,15 @@ class _LatestGoal:
 
 
 @dataclass
-class _DeltaAccumulator:
-    """Sums VR per-frame deltas (position + rotvec) between drive ticks.
-
-    XLeVR's WSS server already does per-frame differencing: each `relative_position`
-    is `current_frame - last_frame`, after which its "last" pose is reassigned to
-    current. The same applies to `relative_rotvec`. The WSS pump runs at the VR
-    frame rate (~60 Hz); the drive loop runs at LOOP_HZ. Without accumulating, the
-    drive loop would only see the most recent ~16 ms of motion and miss the rest.
-
-    Rotvec sum is only an approximation for general rotations, but for the
-    ~16 ms-worth deltas the WSS sends each frame it's accurate to small-angle
-    order. Per-tick this is what we hand to the IK + wrist mapping.
-    """
-    pos: tuple[float, float, float] = (0.0, 0.0, 0.0)
-    rotvec: tuple[float, float, float] = (0.0, 0.0, 0.0)
-
-    def add(self, dp: tuple[float, float, float], dr: tuple[float, float, float]) -> None:
-        pos = (self.pos[0] + dp[0], self.pos[1] + dp[1], self.pos[2] + dp[2])
-        rot = (self.rotvec[0] + dr[0], self.rotvec[1] + dr[1], self.rotvec[2] + dr[2])
-        self.pos = _limit_vector_norm(pos, MAX_ACCUMULATED_POS_M)
-        self.rotvec = _limit_vector_norm(rot, MAX_ACCUMULATED_ROT_RAD)
-
-    def drain(self) -> tuple[tuple[float, float, float], tuple[float, float, float]]:
-        """Atomically read + zero the accumulator. Caller holds the lock."""
-        p, r = self.pos, self.rotvec
-        self.pos = (0.0, 0.0, 0.0)
-        self.rotvec = (0.0, 0.0, 0.0)
-        return p, r
-
-
-@dataclass
 class _AnchorPose:
     """Robot + controller state snapshotted at the most recent RESET.
 
     Per-tick wrist targets are derived as (anchor_wrist + rotation_delta) where
-    rotation_delta is the absolute current-vs-anchor controller quaternion. Position
-    is still delta-integrated into `_target_T` (because XLeVR sends per-frame
-    position deltas, not absolute positions)."""
+    rotation_delta is the absolute current-vs-anchor controller quaternion.
+    Position uses the absolute controller pose carried in every goal too: the
+    VR-world displacement from the controller anchor maps through
+    `session_vr_to_robot` directly to the robot-frame cartesian offset, with no
+    per-frame delta integration."""
     ee_x: float = 0.0
     ee_y: float = 0.0
     pan_deg: float = 0.0
@@ -765,7 +725,6 @@ class _PerArm:
     # until calibration.
     session_vr_to_robot: _np.ndarray = field(default_factory=lambda: _VR_TO_ROBOT.copy())
     latest: _LatestGoal = field(default_factory=_LatestGoal)
-    delta: _DeltaAccumulator = field(default_factory=_DeltaAccumulator)
     reset_pending: bool = False
     # Last-tick button state for edge detection (A/B/X/Y face buttons).
     prev_buttons: dict[str, bool] = field(default_factory=dict)
@@ -810,10 +769,11 @@ class _PerArm:
     kinematics: Any = None
     last_q_sol: _np.ndarray = field(default_factory=lambda: _np.zeros(5, dtype=float))
     using_analytical_fallback: bool = False
-    # Per-arm filtered target state. Position uses controller-delta EMA before
-    # integration; orientation uses SLERP EMA on the actual IK target; joints use
-    # EMA after IK to damp solver noise before motor rate caps.
-    pos_ema: tuple[float, float, float] = (0.0, 0.0, 0.0)
+    # Per-arm filtered target state. The cartesian offset is LERP-smoothed in
+    # `_compute_targets_from_vr` (no separate field); orientation uses SLERP EMA
+    # on the actual IK target. There is no joint-level EMA — relying on the
+    # per-tick joint cap as the only motor-rate limiter (matches wrist behaviour
+    # and avoids double smoothing on pan/lift/elbow).
     smoothed_R_target: _np.ndarray = field(default_factory=lambda: _np.eye(3))
     last_q_filtered: Optional[_np.ndarray] = None
     # Anchor orientation matrix (3×3) captured at RESET. Combined with the
@@ -893,8 +853,8 @@ class VRTeleopSession:
         whether it's explicitly set (override mode). Also reads the global
         smoothing and rate-limit factors."""
         import yaml
-        global KP, EE_DELTA_LIMIT_M, WRIST_RAD_DELTA_LIMIT
-        global POS_EMA_ALPHA, ORI_EMA_ALPHA, JOINT_EMA_ALPHA
+        global KP, WRIST_RAD_DELTA_LIMIT
+        global POS_EMA_ALPHA, ORI_EMA_ALPHA
         global WRIST_FLEX_SIGN, WRIST_ROLL_SIGN
         try:
             cfg = yaml.safe_load((REPO_ROOT / "config" / "xlerobot.yaml").read_text()) or {}
@@ -906,7 +866,6 @@ class VRTeleopSession:
                 return max(lo, min(hi, float(value)))
 
             KP = _float_key("kp", KP, 0.0, 1.0)
-            EE_DELTA_LIMIT_M = _float_key("ee_delta_limit_m", EE_DELTA_LIMIT_M, 0.001, 0.05)
             wrist_deg = _float_key("wrist_delta_limit_deg", math.degrees(WRIST_RAD_DELTA_LIMIT), 1.0, 30.0)
             WRIST_RAD_DELTA_LIMIT = math.radians(wrist_deg)
             POS_EMA_ALPHA = _float_key("pos_ema_alpha", POS_EMA_ALPHA, 0.0, 1.0)
@@ -914,7 +873,6 @@ class VRTeleopSession:
             ori_alpha = vr_section.get("ori_ema_alpha", vr_section.get("rotvec_ema_alpha"))
             if ori_alpha is not None:
                 ORI_EMA_ALPHA = max(0.0, min(1.0, float(ori_alpha)))
-            JOINT_EMA_ALPHA = _float_key("joint_ema_alpha", JOINT_EMA_ALPHA, 0.0, 1.0)
             joint_caps = vr_section.get("joint_deg_caps") or {}
             if isinstance(joint_caps, dict):
                 for joint, cap in joint_caps.items():
@@ -927,10 +885,10 @@ class VRTeleopSession:
                 -1.0 if _float_key("wrist_roll_sign", WRIST_ROLL_SIGN, -1.0, 1.0) < 0 else 1.0
             )
             log.info(
-                "VR smoothing loaded: kp=%.2f pos_ema=%.2f ori_ema=%.2f joint_ema=%.2f "
-                "ee_cap=%.3fm wrist_cap=%.1f° wrist_signs=(flex %.0f, roll %.0f)",
-                KP, POS_EMA_ALPHA, ORI_EMA_ALPHA, JOINT_EMA_ALPHA,
-                EE_DELTA_LIMIT_M, math.degrees(WRIST_RAD_DELTA_LIMIT),
+                "VR smoothing loaded: kp=%.2f pos_ema=%.2f ori_ema=%.2f "
+                "wrist_cap=%.1f° wrist_signs=(flex %.0f, roll %.0f)",
+                KP, POS_EMA_ALPHA, ORI_EMA_ALPHA,
+                math.degrees(WRIST_RAD_DELTA_LIMIT),
                 WRIST_FLEX_SIGN, WRIST_ROLL_SIGN,
             )
         except Exception as e:
@@ -1124,8 +1082,6 @@ class VRTeleopSession:
             self._engaged = bool(engaged)
             if self._active_arm is not None and self._active_arm != old_active:
                 arm = self._arms[self._active_arm]
-                arm.pos_ema = (0.0, 0.0, 0.0)
-                arm.delta.drain()
                 arm.stale_since = None
             return self.status()
 
@@ -1150,9 +1106,8 @@ class VRTeleopSession:
                     "joint_target": arm.targets.to_dict_with_prefix(s)
                                      if MOTORS.is_connected(s) else {},
                     "controller": {
-                        "position": list(arm.latest.rel_position),
-                        "absolute_position": (list(arm.latest.controller_position)
-                                              if arm.latest.controller_position else None),
+                        "position": (list(arm.latest.controller_position)
+                                     if arm.latest.controller_position else None),
                         "rotation": (list(arm.latest.rotation_quat)
                                      if arm.latest.rotation_quat else None),
                         "trigger": arm.latest.trigger,
@@ -1267,34 +1222,6 @@ class VRTeleopSession:
                 "joint_bounds": {j: list(MOTORS.bounds[j]) for j in MOTORS.bounds},
                 "vr_endpoint": self._vr_endpoint_url(),
             }
-            # Back-compat: surface the active (or only-connected) arm's data
-            # under the old top-level keys so the existing frontend keeps working
-            # until it switches to the per-arm `arms` view.
-            legacy_side = self._active_arm or (
-                MOTORS.connected_sides[0] if MOTORS.connected_sides else None
-            )
-            if legacy_side is not None:
-                a = self._arms[legacy_side]
-                out["arm"] = legacy_side
-                out["connected"] = MOTORS.is_connected(legacy_side)
-                out["vr_calibrated"] = a.calibrated
-                out["joint_target"] = a.targets.to_dict_with_prefix(legacy_side)
-                out["controller"] = arms_status[legacy_side]["controller"]
-                out["last_goal_age_ms"] = (
-                    int(1000 * (now - a.latest.received_at))
-                    if a.latest.has_data else None
-                )
-            else:
-                out["arm"] = None
-                out["connected"] = False
-                out["vr_calibrated"] = False
-                out["joint_target"] = {}
-                out["controller"] = {
-                    "position": [0.0, 0.0, 0.0], "rotation": None,
-                    "trigger": False, "thumbstick": {"x": 0.0, "y": 0.0},
-                    "age_ms": None, "mode": "idle",
-                }
-                out["last_goal_age_ms"] = None
             return out
 
     def _mapping_dry_run_status(self, arm: _PerArm) -> dict[str, Any]:
@@ -1564,11 +1491,6 @@ class VRTeleopSession:
                     # overwrite the calibration trigger before the drive loop ticks.
                     if str(mode) == "reset":
                         arm.reset_pending = True
-                    # Accumulate per-frame deltas only on 'position' goals.
-                    if str(mode) == "position":
-                        rp_t = (float(rp[0]), float(rp[1]), float(rp[2])) if rp is not None else (0.0, 0.0, 0.0)
-                        rr_t = (float(rr[0]), float(rr[1]), float(rr[2])) if rr is not None else (0.0, 0.0, 0.0)
-                        arm.delta.add(rp_t, rr_t)
                     arm.latest = _LatestGoal(
                         received_at=time.time(),
                         has_data=True,
@@ -1684,11 +1606,9 @@ class VRTeleopSession:
         arm.anchor_R_robot = T_now[:3, :3].copy()
         arm.target_R_robot = T_now[:3, :3].copy()
         arm.offset_robot = (0.0, 0.0, 0.0)
-        arm.pos_ema = (0.0, 0.0, 0.0)
         arm.smoothed_R_target = T_now[:3, :3].copy()
         arm.last_q_sol = q_now_deg.copy()
         arm.last_q_filtered = q_now_deg.copy()
-        arm.delta.drain()
 
         # Keep the translation frame stable. Rebuilding `session_vr_to_robot`
         # from the controller quaternion on every RESET makes hand translation
@@ -1699,7 +1619,11 @@ class VRTeleopSession:
         ctrl_pos = arm.latest.controller_position if arm.latest.has_data else None
         if ctrl_quat is None or ctrl_pos is None:
             arm.controller_anchor_T = None
-            log.warning("[%s] missing controller pose in RESET goal; falling back to legacy delta mapping", side)
+            log.warning(
+                "[%s] missing controller pose in RESET goal; SE(3) mapping disabled "
+                "until next grip-press with full controller state",
+                side,
+            )
         else:
             arm.controller_anchor_T = _pose_matrix_from_vr(ctrl_pos, ctrl_quat)
         log.info("[%s] keeping VR→robot translation frame:\n%s", side, arm.session_vr_to_robot.round(3))
@@ -1794,11 +1718,6 @@ class VRTeleopSession:
                     if record_btn and cur_btn.get(record_btn) and not prev_btn.get(record_btn):
                         self._handle_record_button(side)
 
-                    # Drain accumulator every tick — keeps from leaking deltas
-                    # while waiting for engage/calibrate.
-                    with self._lock:
-                        arm.drained_dp_dr = arm.delta.drain()  # tuple of (pos, rotvec)
-
                 # Phase 1.5: drive any HOMING arms toward their home targets.
                 # Runs regardless of engage/active state — homing is its own mode.
                 # Uses the same per-tick caps + KP smoothing as VR teleop, so
@@ -1876,16 +1795,11 @@ class VRTeleopSession:
                 arm = self._arms[active]
                 with self._lock:
                     goal = arm.latest
-                    drained_dp, drained_dr = getattr(arm, "drained_dp_dr",
-                                                      ((0,0,0),(0,0,0)))
 
                 # Watchdog: skip if last goal too stale (controller put down).
                 goal_age = now - goal.received_at if goal.has_data else 1e9
                 if not goal.has_data or goal_age > GOAL_SKIP_AGE_S:
-                    arm.pos_ema = (0.0, 0.0, 0.0)
                     with self._lock:
-                        arm.delta.drain()
-                        arm.drained_dp_dr = ((0.0, 0.0, 0.0), (0.0, 0.0, 0.0))
                         if arm.stale_since is None:
                             arm.stale_since = now
                         if self._active_arm == active and now - arm.stale_since > 1.0:
@@ -1896,21 +1810,16 @@ class VRTeleopSession:
                     continue
                 arm.stale_since = None
                 if goal.mode != "position":
-                    # Grip release sends IDLE. Do not let EMA filter tails keep
-                    # moving the arm after control is intentionally released.
-                    arm.pos_ema = (0.0, 0.0, 0.0)
-                    with self._lock:
-                        arm.delta.drain()
-                        arm.drained_dp_dr = ((0.0, 0.0, 0.0), (0.0, 0.0, 0.0))
+                    # Grip release sends IDLE: hold last commanded targets; the
+                    # per-tick joint cap below already prevents drift.
                     next_tick = self._sleep_until(next_tick)
                     continue
                 if not arm.calibrated:
                     next_tick = self._sleep_until(next_tick)
                     continue
 
-                # Build joint targets from VR deltas.
-                self._compute_targets_from_vr(active, goal, scale,
-                                              drained_dp, drained_dr)
+                # Build joint targets from the latest VR controller pose.
+                self._compute_targets_from_vr(active, goal, scale)
 
                 # Per-tick joint clamp vs last sent (caps max joint velocity).
                 prefix = f"{active}_arm_"
@@ -2394,8 +2303,6 @@ class VRTeleopSession:
                     return
                 self._active_arm = side
                 arm = self._arms[side]
-                arm.pos_ema = (0.0, 0.0, 0.0)
-                arm.delta.drain()
                 arm.stale_since = None
                 log.info("[%s] engage button → SWITCHED active arm to %s", side, side)
             else:
@@ -2406,8 +2313,6 @@ class VRTeleopSession:
                 self._engaged = True
                 self._active_arm = side
                 arm = self._arms[side]
-                arm.pos_ema = (0.0, 0.0, 0.0)
-                arm.delta.drain()
                 arm.stale_since = None
                 log.info("[%s] engage button → ENGAGED on %s arm", side, side)
 
@@ -2588,148 +2493,111 @@ class VRTeleopSession:
             state["trig"] = trigger_now
 
     def _compute_targets_from_vr(self, side: ArmSide, goal: _LatestGoal,
-                                  scale: float,
-                                  drained_dp: tuple[float, float, float],
-                                  drained_dr: tuple[float, float, float]) -> None:
-        """Convert pre-drained VR deltas → joint targets via URDF IK.
+                                  scale: float) -> None:
+        """Convert the latest VR controller pose → joint targets via URDF IK.
 
         Pipeline (per-tick):
-          1. Transform VR deltas through `arm.session_vr_to_robot` to robot frame.
-          2. invert_lateral (if set): mirror lateral components.
-          3. Deadband: zero out sub-noise-threshold deltas.
-          4. Position-delta EMA: kills high-frequency controller translation noise.
-          5. Scale + per-tick EE caps.
-          6. Integrate position offset → target position = anchor + offset.
-          7. Compute absolute desired orientation and smooth it with quaternion SLERP.
-          8. Soft-saturate target to workspace (`EE_BOUNDS` box + reach sphere).
-          9. URDF/placo IK in the same gripper-frame coordinates used at RESET,
-             but only for pan/lift/elbow. Wrist orientation maps directly to wrist
-             joints so it cannot perturb the arm pose.
-          10. EMA-filter arm joints and build `_LiveTargets` + gripper.
+          1. Build the reset-relative SE(3) controller transform from the
+             absolute controller pose carried in the goal.
+          2. Map the VR-world hand displacement (current − anchor) through
+             `arm.session_vr_to_robot` into robot-frame translation; LERP-smooth
+             this into `arm.offset_robot` so the cartesian target chases the
+             hand exponentially without a hard rate cap.
+          3. Map the controller-relative rotation through the same calibration,
+             apply per-hand handedness correction, and SLERP-smooth toward the
+             robot-frame anchor-times-relative-rotation target.
+          4. Clamp the resulting EE position to the workspace box + reach sphere
+             + rear-singularity guard, then reconcile `arm.offset_robot` so a
+             clamped step doesn't accumulate hidden motion debt.
+          5. URDF/placo IK (position-only) for pan/lift/elbow; large jumps in
+             the IK solution are rejected and the previous solution reused.
+          6. Wrist flex/roll come directly from the smoothed orientation delta
+             (no IK, no EMA) so they stay snappy.
+          7. The per-tick joint cap in the drive loop is the only motor-rate
+             limiter — there is no joint-level EMA.
+
+        SE(3) mapping requires `arm.controller_anchor_T` (captured on RESET) and
+        the goal to carry both `controller_position` and `rotation_quat`. If
+        either is missing we leave the previous tick's targets in place; the
+        per-tick joint cap holds the robot still until valid input returns.
         """
         from scipy.spatial.transform import Rotation as _R
         arm = self._arms[side]
         M = arm.session_vr_to_robot
         current_pos = goal.controller_position
         current_q = goal.rotation_quat
-        controller_rel_T: Optional[_np.ndarray] = None
-        dp_robot = _np.zeros(3)
-        dp = _np.zeros(3)
-        R_wrist_delta = _np.eye(3)
         wrist_cap = WRIST_RAD_DELTA_LIMIT * scale
-        mapping_mode = "se3"
 
-        if arm.controller_anchor_T is not None and current_pos is not None and current_q is not None:
-            try:
-                controller_current_T = _pose_matrix_from_vr(current_pos, current_q)
-                controller_rel_T = _np.linalg.solve(arm.controller_anchor_T, controller_current_T)
-
-                # Translation calibration is learned from VR-world hand motions
-                # (forward/up/left), so use reset-relative world displacement
-                # for position. The homogeneous relative transform is still used
-                # for rotation, where controller-local handedness matters.
-                raw_vr_delta = _np.array(current_pos, dtype=float) - arm.controller_anchor_T[:3, 3]
-                dp_robot = M @ raw_vr_delta
-                if arm.invert_lateral:
-                    dp_robot = dp_robot * _np.array([1.0, -1.0, 1.0])
-                desired_offset = dp_robot * scale
-                current_offset = _np.array(arm.offset_robot, dtype=float)
-                # BEAVR-style LERP smoothing: cartesian offset tracks the desired
-                # offset exponentially. POS_EMA_ALPHA controls how aggressively the
-                # robot target chases the hand. Per-joint caps downstream provide
-                # the actual motor-rate safety; we keep only a glitch cap here so
-                # a controller tracking jump cannot teleport the IK seed.
-                pos_alpha = max(0.05, min(1.0, POS_EMA_ALPHA))
-                new_offset = (1.0 - pos_alpha) * current_offset + pos_alpha * desired_offset
-                step = new_offset - current_offset
-                step_norm = float(_np.linalg.norm(step))
-                GLITCH_CAP_M = 0.05
-                if step_norm > GLITCH_CAP_M:
-                    new_offset = current_offset + step * (GLITCH_CAP_M / step_norm)
-                dp = new_offset
-
-                R_delta_vr = _controller_rotation_delta_for_side(side, controller_rel_T[:3, :3])
-                R_delta_robot = _project_to_rotation_matrix(M @ R_delta_vr @ M.T)
-                if arm.invert_lateral:
-                    D = _np.diag([1.0, -1.0, 1.0])
-                    R_delta_robot = _project_to_rotation_matrix(D @ R_delta_robot @ D)
-
-                # BEAVR-style reset-relative target: robot anchor pose post-multiplied
-                # by the mapped controller-relative rotation.
-                R_raw = _project_to_rotation_matrix(arm.anchor_R_robot @ R_delta_robot)
-                raw_step = (
-                    _R.from_matrix(R_raw)
-                    * _R.from_matrix(arm.smoothed_R_target).inv()
-                ).magnitude()
-                if raw_step >= ROTVEC_DEADBAND_RAD:
-                    arm.smoothed_R_target = _slerp_rotation_matrix(
-                        arm.smoothed_R_target,
-                        R_raw,
-                        ORI_EMA_ALPHA,
-                        max_step_rad=wrist_cap,
-                    )
-                arm.target_R_robot = _project_to_rotation_matrix(arm.smoothed_R_target)
-            except Exception as e:
-                mapping_mode = "legacy_delta_after_se3_error"
-                log.warning("[%s] SE(3) controller mapping failed (%s); falling back to legacy deltas", side, e)
-        else:
-            mapping_mode = "legacy_delta"
-
-        if mapping_mode.startswith("legacy"):
-            dp_robot = M @ _np.array(drained_dp, dtype=float)
-            dr_robot = M @ _np.array(drained_dr, dtype=float)
-            if arm.invert_lateral:
-                dp_robot = dp_robot * _np.array([1.0, -1.0, 1.0])
-                dr_robot = dr_robot * _np.array([-1.0, -1.0, 1.0])
-            if float(_np.linalg.norm(dp_robot)) < POSITION_DEADBAND_M:
-                dp_robot = _np.zeros(3)
-                arm.pos_ema = (0.0, 0.0, 0.0)
-            else:
-                a_pos = POS_EMA_ALPHA
-                arm.pos_ema = (
-                    a_pos * float(dp_robot[0]) + (1.0 - a_pos) * arm.pos_ema[0],
-                    a_pos * float(dp_robot[1]) + (1.0 - a_pos) * arm.pos_ema[1],
-                    a_pos * float(dp_robot[2]) + (1.0 - a_pos) * arm.pos_ema[2],
-                )
-            dp = _np.array(arm.pos_ema, dtype=float) * scale
-
-            anchor_q = arm.anchor.ctrl_quat
-            if anchor_q is not None and current_q is not None:
-                try:
-                    R_anchor_vr = _R.from_quat(_np.array(anchor_q))
-                    R_current_vr = _R.from_quat(_np.array(current_q))
-                    R_delta_vr = _controller_rotation_delta_for_side(
-                        side, (R_anchor_vr.inv() * R_current_vr).as_matrix()
-                    )
-                    R_delta_robot = _project_to_rotation_matrix(M @ R_delta_vr @ M.T)
-                    R_raw = _project_to_rotation_matrix(arm.anchor_R_robot @ R_delta_robot)
-                    arm.smoothed_R_target = _slerp_rotation_matrix(
-                        arm.smoothed_R_target,
-                        R_raw,
-                        ORI_EMA_ALPHA,
-                        max_step_rad=wrist_cap,
-                    )
-                    arm.target_R_robot = _project_to_rotation_matrix(arm.smoothed_R_target)
-                except Exception as e:
-                    log.warning("[%s] legacy orientation mapping failed (%s); freezing", side, e)
-
-            ee_cap = EE_DELTA_LIMIT_M * scale
-            dp_norm = float(_np.linalg.norm(dp))
-            if dp_norm > ee_cap:
-                dp = dp * (ee_cap / dp_norm)
-            arm.offset_robot = (
-                arm.offset_robot[0] + float(dp[0]),
-                arm.offset_robot[1] + float(dp[1]),
-                arm.offset_robot[2] + float(dp[2]),
+        if arm.controller_anchor_T is None or current_pos is None or current_q is None:
+            log.warning(
+                "[%s] SE(3) inputs missing (anchor=%s current_pos=%s current_q=%s); holding targets",
+                side,
+                arm.controller_anchor_T is not None,
+                current_pos is not None,
+                current_q is not None,
             )
-        else:
-            arm.offset_robot = (float(dp[0]), float(dp[1]), float(dp[2]))
+            return
+
+        try:
+            controller_current_T = _pose_matrix_from_vr(current_pos, current_q)
+            controller_rel_T = _np.linalg.solve(arm.controller_anchor_T, controller_current_T)
+        except Exception as e:
+            log.warning("[%s] SE(3) controller mapping failed (%s); holding targets", side, e)
+            return
+
+        # Translation calibration is learned from VR-world hand motions
+        # (forward/up/left), so use reset-relative world displacement for
+        # position. The homogeneous relative transform is still used for
+        # rotation, where controller-local handedness matters.
+        raw_vr_delta = _np.array(current_pos, dtype=float) - arm.controller_anchor_T[:3, 3]
+        dp_robot = M @ raw_vr_delta
+        if arm.invert_lateral:
+            dp_robot = dp_robot * _np.array([1.0, -1.0, 1.0])
+        desired_offset = dp_robot * scale
+        current_offset = _np.array(arm.offset_robot, dtype=float)
+        # BEAVR-style LERP smoothing: cartesian offset tracks the desired offset
+        # exponentially. POS_EMA_ALPHA controls how aggressively the robot
+        # target chases the hand. The per-joint cap downstream is the real
+        # motor-rate safety; we only keep a glitch cap here so a controller
+        # tracking jump cannot teleport the IK seed.
+        pos_alpha = max(0.05, min(1.0, POS_EMA_ALPHA))
+        new_offset = (1.0 - pos_alpha) * current_offset + pos_alpha * desired_offset
+        step = new_offset - current_offset
+        step_norm = float(_np.linalg.norm(step))
+        GLITCH_CAP_M = 0.05
+        if step_norm > GLITCH_CAP_M:
+            new_offset = current_offset + step * (GLITCH_CAP_M / step_norm)
+        arm.offset_robot = (float(new_offset[0]), float(new_offset[1]), float(new_offset[2]))
+
+        R_delta_vr = _controller_rotation_delta_for_side(side, controller_rel_T[:3, :3])
+        R_delta_robot = _project_to_rotation_matrix(M @ R_delta_vr @ M.T)
+        if arm.invert_lateral:
+            D = _np.diag([1.0, -1.0, 1.0])
+            R_delta_robot = _project_to_rotation_matrix(D @ R_delta_robot @ D)
+
+        # BEAVR-style reset-relative target: robot anchor pose post-multiplied by
+        # the mapped controller-relative rotation.
+        R_raw = _project_to_rotation_matrix(arm.anchor_R_robot @ R_delta_robot)
+        raw_step = (
+            _R.from_matrix(R_raw)
+            * _R.from_matrix(arm.smoothed_R_target).inv()
+        ).magnitude()
+        if raw_step >= ROTVEC_DEADBAND_RAD:
+            arm.smoothed_R_target = _slerp_rotation_matrix(
+                arm.smoothed_R_target,
+                R_raw,
+                ORI_EMA_ALPHA,
+                max_step_rad=wrist_cap,
+            )
+        arm.target_R_robot = _project_to_rotation_matrix(arm.smoothed_R_target)
 
         R_wrist_delta = _project_to_rotation_matrix(arm.anchor_R_robot.T @ arm.target_R_robot)
 
-        # 8. Target position from anchor + offset, axis-clamped to EE_BOUNDS
-        # (sanity box), then radially clamped before IK to avoid placo hopping
-        # between local minima near the edge of the SO101 reach envelope.
+        # Target position from anchor + offset, axis-clamped to EE_BOUNDS (sanity
+        # box), then radially clamped before IK to avoid placo hopping between
+        # local minima near the edge of the SO101 reach envelope. We reconcile
+        # `arm.offset_robot` to the clamped position so a clamp doesn't leave
+        # the LERP integrator chasing an unreachable target.
         target_pos = _clamp_target_position(_np.array([
             arm.anchor_ee_pos[0] + arm.offset_robot[0],
             arm.anchor_ee_pos[1] + arm.offset_robot[1],
@@ -2744,7 +2612,7 @@ class VRTeleopSession:
         arm.target_T[:3, 3] = (tx, ty, tz)
         arm.target_T[:3, :3] = arm.target_R_robot
 
-        # 9. Position IK in URDF gripper-frame coordinates. We intentionally keep
+        # Position IK in URDF gripper-frame coordinates. We intentionally keep
         # orientation_weight=0 and only use the arm joints from the solution. The
         # URDF target frame matches the RESET anchor; the analytical planar IK
         # does not, because it models the arm linkage before the gripper offset.
@@ -2779,10 +2647,10 @@ class VRTeleopSession:
                     q_sol = arm.last_q_sol.copy()
                 if arm.last_q_filtered is None:
                     arm.last_q_filtered = q_sol.copy()
-                # Position offset already LERP-smoothed and per-tick joint cap
-                # below limits motor velocity; an additional joint EMA only
-                # compounds latency and is the reason the wrist (no EMA) felt
-                # snappy while pan/lift/elbow lagged badly.
+                # No joint-level EMA: the cartesian offset is already
+                # LERP-smoothed, and the per-tick joint cap in the drive loop is
+                # the motor-rate safety. Wrist joints bypass any joint smoothing
+                # entirely, and arm joints now match for consistent response.
                 bounds = MOTORS.bounds
                 for idx, joint in enumerate(_IK_JOINT_ORDER):
                     lo, hi = bounds.get(f"{side}_arm_{joint}", (-180.0, 180.0))
@@ -2793,8 +2661,8 @@ class VRTeleopSession:
             log.warning("[%s] position IK failed (%s); reusing previous q_sol", side, e)
             q_sol = arm.last_q_sol
 
-        # 10. Build the live joint targets. Order: shoulder_pan, shoulder_lift,
-        #     elbow_flex, wrist_flex, wrist_roll (matches _IK_JOINT_ORDER).
+        # Build the live joint targets. Order: shoulder_pan, shoulder_lift,
+        # elbow_flex, wrist_flex, wrist_roll (matches _IK_JOINT_ORDER).
         wrist_delta = _R.from_matrix(R_wrist_delta).as_rotvec()
         wrist_flex_delta_deg = arm.wrist_flex_sign * math.degrees(float(wrist_delta[1]))
         wrist_roll_delta_deg = arm.wrist_roll_sign * math.degrees(float(wrist_delta[0]))
@@ -2830,21 +2698,13 @@ class VRTeleopSession:
             gripper=gripper_target,
         )
         arm.last_diag = {
-            "mapping_mode": mapping_mode,
             "controller_rotation_handedness": "inverted_for_left" if side == "left" else "normal",
-            "translation_mapping_frame": "vr_world_displacement",
-            "drained_dp_vr": [float(v) for v in drained_dp],
-            "controller_position": [float(v) for v in current_pos] if current_pos is not None else None,
-            "controller_rel_translation": (
-                [float(v) for v in controller_rel_T[:3, 3]]
-                if controller_rel_T is not None else None
-            ),
-            "controller_world_delta": (
-                [float(v) for v in (_np.array(current_pos, dtype=float) - arm.controller_anchor_T[:3, 3])]
-                if current_pos is not None and arm.controller_anchor_T is not None else None
-            ),
+            "controller_position": [float(v) for v in current_pos],
+            "controller_rel_translation": [float(v) for v in controller_rel_T[:3, 3]],
+            "controller_world_delta": [
+                float(v) for v in (_np.array(current_pos, dtype=float) - arm.controller_anchor_T[:3, 3])
+            ],
             "dp_robot": [float(v) for v in dp_robot],
-            "dp_integrated": [float(v) for v in dp],
             "offset_robot": [float(v) for v in arm.offset_robot],
             "target_ee_pos": [tx, ty, tz],
             "target_quat_xyzw": [
