@@ -9,8 +9,9 @@ Drive one or both SO-101 arms with a Meta Quest 3.
 | **Grip** (side, middle finger) | **Hold to drive**, **first press = anchor for teleop**. Releasing stops motion. |
 | **Trigger** (front, index finger) | Close gripper while held. Released = open. |
 | **A** (right) / **X** (left) | Toggle engage for that arm. Pressing A while right is active = disengage; pressing X = switch to left. |
+| **Y** (left) | Toggle dual mode. Press Y by itself; X+Y chords are ignored so engage and dual mode do not fight. |
 | **B** (right) | Toggle dataset recording. |
-| Thumbstick / Y / menu | Unused. |
+| Thumbstick / menu | Unused. |
 
 ## Per-session flow
 
@@ -20,11 +21,29 @@ Drive one or both SO-101 arms with a Meta Quest 3.
 4. **Squeeze grip** on a controller to anchor that arm's EE pose. The card shows "anchored" and `anchor_ee_pos`.
 5. **Hold grip + move your hand**. The arm follows. Pull trigger to close the gripper.
 6. **Release grip** to stop. Re-grip = re-anchor (useful if you've walked around).
-7. (Optional) Press **A** instead of toggling Engage in the UI. Press **B** to start/stop dataset recording.
+7. (Optional) Press **A**/**X** instead of toggling Engage in the UI. Press **Y** on the left controller to toggle dual mode. Press **B** to start/stop dataset recording.
 
 ## Bimanual
 
-Both arms can be connected and torqued simultaneously, but only **one** is actively driven by VR at a time. The *Active arm* segmented control on the Engagement card switches between them. A/X buttons do the same from inside VR.
+Both arms can be connected and torqued simultaneously.
+
+### Single-arm mode
+
+The *Active arm* segmented control on the Engagement card switches which arm VR drives. The controller buttons do the same from inside VR:
+
+- **A** on the right controller engages/switches to the right arm.
+- **X** on the left controller engages/switches to the left arm.
+- Pressing the active arm's engage button again disengages.
+
+### Dual mode
+
+Press **Y** on the **left** controller to toggle dual mode. In dual mode, the backend runs the same per-arm VR path for both sides:
+
+- Hold **left grip** to drive the left arm.
+- Hold **right grip** to drive the right arm.
+- Hold **both grips** to drive both arms together.
+
+Each arm still needs its own calibration and grip-anchor. If one side is not anchored yet, squeeze that side's grip once before expecting it to move. Press **Y** again to turn dual mode off/disengage. Press **Y alone**; if **X** is held at the same time, the chord is ignored to avoid accidentally switching single-arm engage while toggling dual mode.
 
 ## Speed slider
 

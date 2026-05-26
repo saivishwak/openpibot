@@ -130,6 +130,7 @@ DEFAULT_GRIPPER_CLOSED = 0.0
 # Only the right controller has a B button — it's the global recording toggle.
 ENGAGE_BUTTON_BY_SIDE: dict[str, str] = {"right": "A", "left": "X"}
 RECORD_BUTTON_BY_SIDE: dict[str, str] = {"right": "B"}
+DUAL_MODE_BUTTON_BY_SIDE: dict[str, str] = {"left": "Y"}
 
 # Minimum motion magnitude (in metres) required to accept a calibration. Anything
 # smaller than this is too noisy to reliably determine "user-forward" direction.
@@ -1023,9 +1024,11 @@ class VRTeleopSession:
             "left":  _PerArm(side="left"),
             "right": _PerArm(side="right"),
         }
-        # The arm that VR is currently driving. Only ONE can be active at a time
-        # (engage-gated bimanual). None = no arm engaged.
+        # The arm that VR is currently driving in single-arm mode. In dual mode,
+        # both connected arms are driven and this remains the preferred fallback
+        # when dual mode is turned off.
         self._active_arm: Optional[ArmSide] = None
+        self._dual_mode: bool = False
 
         # VR pipeline (process-global, persists across motor reconnects).
         self._https: Optional[_StaticHTTPSServer] = None
@@ -1259,6 +1262,9 @@ class VRTeleopSession:
                 if self._active_arm == s:
                     self._active_arm = None
                     self._engaged = False
+                if self._dual_mode:
+                    self._dual_mode = False
+                    self._engaged = False
                 try: MOTORS.disconnect(s)
                 except Exception as e:
                     self._last_error = f"disconnect {s}: {e}"
@@ -1271,6 +1277,7 @@ class VRTeleopSession:
         with self._lock:
             self._engaged = False
             self._active_arm = None
+            self._dual_mode = False
             was_recording = self._recording
             self._recording = False
             rec = self._recorder
@@ -1319,7 +1326,9 @@ class VRTeleopSession:
         - If `active_arm` is omitted and `engaged=True`, the system picks the
           arm: if exactly one is connected, that one; if both, leaves the
           previous `_active_arm` if still valid; otherwise raises.
-        - `engaged=False` clears the active arm.
+        - `engaged=False` clears the active arm and dual mode.
+        - This API is single-arm selection; the left-controller Y button toggles
+          dual mode without changing the target/IK/control code.
         """
         with self._lock:
             old_active = self._active_arm
@@ -1358,7 +1367,10 @@ class VRTeleopSession:
                     )
             else:
                 self._active_arm = None
+                self._dual_mode = False
             self._engaged = bool(engaged)
+            if self._engaged and self._active_arm is not None:
+                self._dual_mode = False
             if self._active_arm is not None and self._active_arm != old_active:
                 arm = self._arms[self._active_arm]
                 arm.stale_since = None
@@ -1498,6 +1510,7 @@ class VRTeleopSession:
                 "arms": arms_status,
                 "connected_sides": list(MOTORS.connected_sides),
                 "active_arm": self._active_arm,
+                "dual_mode": self._dual_mode,
                 "engaged": self._engaged,
                 "scale": self._scale,
                 "recording": self._recording,
@@ -1774,6 +1787,9 @@ class VRTeleopSession:
                 thumb = getattr(goal, "thumbstick", None) or {}
                 btn  = getattr(goal, "buttons", None) or {}
                 with self._lock:
+                    cur_buttons = {str(k): bool(v) for k, v in btn.items()}
+                    prev_buttons = arm.prev_buttons
+                    arm.prev_buttons = dict(cur_buttons)
                     # Latch reset edges so a fast-following 'position' goal can't
                     # overwrite the calibration trigger before the drive loop ticks.
                     if str(mode) == "reset":
@@ -1788,12 +1804,13 @@ class VRTeleopSession:
                         rotation_quat=(tuple(float(v) for v in rot.as_quat()) if rot is not None and hasattr(rot, "as_quat") else None),
                         trigger=trig,
                         thumbstick=(float(thumb.get("x", 0)), float(thumb.get("y", 0))),
-                        buttons={str(k): bool(v) for k, v in btn.items()},
+                        buttons=cur_buttons,
                     )
                     # Advance the calibration state machine if active for this arm.
                     # Must hold `self._lock` (still held inside this `with` block).
                     if arm.cal_state != "idle":
                         self._advance_calibration(side, arm.latest)
+                    self._handle_button_edges(side, cur_buttons, prev_buttons)
             except Exception as e:
                 log.warning("goal-drain: %s", e)
 
@@ -1944,8 +1961,8 @@ class VRTeleopSession:
 
     def _drive_loop(self) -> None:
         """Per-tick: process RESETs for ALL connected arms (so each arm's anchor
-        is up-to-date), but only command motion on the ACTIVE arm. The non-active
-        arm holds its position via its servo PID — no software command needed."""
+        is up-to-date). Command motion on the active arm, or both arms when
+        dual mode is enabled. The target/IK/control math remains per-arm."""
         next_tick = time.monotonic()
         while not self._stop_evt.is_set():
             now = time.time()
@@ -1953,6 +1970,7 @@ class VRTeleopSession:
                 with self._lock:
                     engaged = self._engaged
                     active = self._active_arm
+                    dual_mode = self._dual_mode
                     scale = self._scale
                     connected = list(MOTORS.connected_sides)
                 self._last_drive_tick = now
@@ -1961,7 +1979,7 @@ class VRTeleopSession:
                     next_tick = self._sleep_until(next_tick)
                     continue
 
-                # Phase 1: handle RESET / IDLE / button edges / drain accumulator
+                # Phase 1: handle RESET / IDLE / drain accumulator
                 # for EVERY connected arm. We do this regardless of which one is
                 # "active" so that switching active_arm mid-session doesn't pick up
                 # stale accumulator data or skip a fresh anchor.
@@ -1972,12 +1990,6 @@ class VRTeleopSession:
                         reset_now = arm.reset_pending
                         if reset_now:
                             arm.reset_pending = False
-                        # Button edge detection (drive-loop rate is fast enough
-                        # — ~30 Hz — to never miss a press, but slow enough that
-                        # holding a button for ~16 ms doesn't toggle twice).
-                        cur_btn = dict(goal.buttons or {})
-                        prev_btn = arm.prev_buttons
-                        arm.prev_buttons = cur_btn
 
                     # Note: we do NOT clear `arm.calibrated` on IDLE goals.
                     # Releasing grip just stops motion; the anchor stays valid so
@@ -1995,15 +2007,6 @@ class VRTeleopSession:
                             and arm.cal_state == "idle":
                         with self._lock:
                             self._capture_anchor(side)
-
-                    # A/X edge → engage toggle.
-                    engage_btn = ENGAGE_BUTTON_BY_SIDE.get(side)
-                    if engage_btn and cur_btn.get(engage_btn) and not prev_btn.get(engage_btn):
-                        self._handle_engage_button(side)
-                    # B edge (right controller only) → recording toggle.
-                    record_btn = RECORD_BUTTON_BY_SIDE.get(side)
-                    if record_btn and cur_btn.get(record_btn) and not prev_btn.get(record_btn):
-                        self._handle_record_button(side)
 
                 # Phase 1.5: drive any HOMING arms toward their home targets.
                 # Runs regardless of engage/active state — homing is its own mode.
@@ -2064,80 +2067,84 @@ class VRTeleopSession:
                 # their observation.state.
                 self._record_frame_if_active()
 
-                # Phase 2: command the active arm if engaged + calibrated.
-                if not engaged or active is None or active not in connected:
-                    next_tick = self._sleep_until(next_tick)
-                    continue
-                # Don't VR-drive an arm that's currently homing — homing already
-                # owns send_action above.
-                if self._arms[active].homing:
-                    next_tick = self._sleep_until(next_tick)
-                    continue
-                # Don't VR-drive an arm whose torque is released (user is
-                # hand-posing it).
-                if not MOTORS.is_torque_enabled(active):
-                    next_tick = self._sleep_until(next_tick)
-                    continue
-
-                arm = self._arms[active]
-                with self._lock:
-                    goal = arm.latest
-
-                # Watchdog: skip if last goal too stale (controller put down).
-                goal_age = now - goal.received_at if goal.has_data else 1e9
-                if not goal.has_data or goal_age > GOAL_SKIP_AGE_S:
-                    with self._lock:
-                        if arm.stale_since is None:
-                            arm.stale_since = now
-                        if self._active_arm == active and now - arm.stale_since > 1.0:
-                            self._engaged = False
-                            self._active_arm = None
-                            log.warning("[%s] VR goals stale for >1s; auto-disengaged", active)
-                    next_tick = self._sleep_until(next_tick)
-                    continue
-                arm.stale_since = None
-                if goal.mode != "position":
-                    # Grip release sends IDLE: hold last commanded targets; the
-                    # per-tick joint cap below already prevents drift.
-                    next_tick = self._sleep_until(next_tick)
-                    continue
-                if not arm.calibrated:
-                    next_tick = self._sleep_until(next_tick)
-                    continue
-
-                # Build joint targets from the latest VR controller pose.
-                self._compute_targets_from_vr(active, goal, scale)
-
-                # Per-tick joint clamp vs last sent (caps max joint velocity).
-                prefix = f"{active}_arm_"
-                raw = arm.targets.to_dict_with_prefix(active)
-                clamped: dict[str, float] = {}
-                for pj, val in raw.items():
-                    cap = PER_TICK_DEG_CAPS.get(pj.removeprefix(prefix), 1.0)
-                    prev = arm.last_sent_targets.get(pj, val)
-                    delta = max(-cap, min(cap, val - prev))
-                    clamped[pj] = prev + delta
-
-                # P-controller blend — but only if KP < 1.0. KP=1.0 collapses to
-                # `final = target`, so the present-position bus read (~10 ms) is
-                # wasted work that would otherwise eat into our 33 ms tick budget.
-                if KP >= 0.999:
-                    final = clamped
-                    present_full: dict[str, float] = {}     # for the debug log
+                # Phase 2: command the active arm if engaged + calibrated. In
+                # dual mode, run the same per-arm path for both connected arms.
+                if dual_mode:
+                    drive_sides = [s for s in ("left", "right") if s in connected]
+                elif active is not None and active in connected:
+                    drive_sides = [active]
                 else:
-                    present_full = MOTORS.read_positions(active)
-                    final = {}
-                    for pj, target in clamped.items():
-                        here = present_full.get(pj, target)
-                        final[pj] = here + KP * (target - here)
+                    drive_sides = []
+                if not engaged or not drive_sides:
+                    next_tick = self._sleep_until(next_tick)
+                    continue
+                for drive_side in drive_sides:
+                    # Don't VR-drive an arm that's currently homing — homing already
+                    # owns send_action above.
+                    if self._arms[drive_side].homing:
+                        continue
+                    # Don't VR-drive an arm whose torque is released (user is
+                    # hand-posing it).
+                    if not MOTORS.is_torque_enabled(drive_side):
+                        continue
 
-                sent = MOTORS.send_action(active, final)
-                arm.last_sent_targets = dict(sent)
-                arm.last_commanded_targets = dict(sent)
+                    arm = self._arms[drive_side]
+                    with self._lock:
+                        goal = arm.latest
 
-                # Debug: per-arm gripper trigger/target/sent/present log (1Hz).
-                self._debug_log_gripper(active, goal, arm.targets,
-                                         final, present_full, now)
+                    # Watchdog: skip if last goal too stale (controller put down).
+                    goal_age = now - goal.received_at if goal.has_data else 1e9
+                    if not goal.has_data or goal_age > GOAL_SKIP_AGE_S:
+                        with self._lock:
+                            if arm.stale_since is None:
+                                arm.stale_since = now
+                            if now - arm.stale_since > 1.0:
+                                self._engaged = False
+                                self._active_arm = None
+                                self._dual_mode = False
+                                log.warning("[%s] VR goals stale for >1s; auto-disengaged", drive_side)
+                        continue
+                    arm.stale_since = None
+                    if goal.mode != "position":
+                        # Grip release sends IDLE: hold last commanded targets; the
+                        # per-tick joint cap below already prevents drift.
+                        continue
+                    if not arm.calibrated:
+                        continue
+
+                    # Build joint targets from the latest VR controller pose.
+                    self._compute_targets_from_vr(drive_side, goal, scale)
+
+                    # Per-tick joint clamp vs last sent (caps max joint velocity).
+                    prefix = f"{drive_side}_arm_"
+                    raw = arm.targets.to_dict_with_prefix(drive_side)
+                    clamped: dict[str, float] = {}
+                    for pj, val in raw.items():
+                        cap = PER_TICK_DEG_CAPS.get(pj.removeprefix(prefix), 1.0)
+                        prev = arm.last_sent_targets.get(pj, val)
+                        delta = max(-cap, min(cap, val - prev))
+                        clamped[pj] = prev + delta
+
+                    # P-controller blend — but only if KP < 1.0. KP=1.0 collapses to
+                    # `final = target`, so the present-position bus read (~10 ms) is
+                    # wasted work that would otherwise eat into our 33 ms tick budget.
+                    if KP >= 0.999:
+                        final = clamped
+                        present_full: dict[str, float] = {}     # for the debug log
+                    else:
+                        present_full = MOTORS.read_positions(drive_side)
+                        final = {}
+                        for pj, target in clamped.items():
+                            here = present_full.get(pj, target)
+                            final[pj] = here + KP * (target - here)
+
+                    sent = MOTORS.send_action(drive_side, final)
+                    arm.last_sent_targets = dict(sent)
+                    arm.last_commanded_targets = dict(sent)
+
+                    # Debug: per-arm gripper trigger/target/sent/present log (1Hz).
+                    self._debug_log_gripper(drive_side, goal, arm.targets,
+                                             final, present_full, now)
 
             except Exception as e:
                 log.exception("drive loop error: %s", e)
@@ -2731,6 +2738,89 @@ class VRTeleopSession:
                 arm = self._arms[side]
                 arm.stale_since = None
                 log.info("[%s] engage button → ENGAGED on %s arm", side, side)
+
+    def _handle_button_edges(
+        self,
+        side: ArmSide,
+        cur_btn: dict[str, bool],
+        prev_btn: dict[str, bool],
+    ) -> None:
+        """Handle Quest face-button edges immediately as goals arrive.
+
+        This avoids sampling races from the 30 Hz drive loop where a quick tap
+        could be overwritten by a later goal before the drive loop saw it. Y is
+        intentionally a clean, single-button left-controller press: X+Y chords
+        are ignored so dual mode cannot accidentally fight single-arm engage.
+        """
+        pressed_edges = {
+            name for name, pressed in cur_btn.items()
+            if pressed and not prev_btn.get(name, False)
+        }
+        if not pressed_edges:
+            return
+
+        dual_btn = DUAL_MODE_BUTTON_BY_SIDE.get(side)
+        if dual_btn and dual_btn in pressed_edges:
+            other_face_held = any(
+                cur_btn.get(name, False)
+                for name in ("X", "Y")
+                if name != dual_btn
+            )
+            if other_face_held:
+                log.info("[%s] %s ignored for dual mode because another face button is held", side, dual_btn)
+                return
+            if self._arms[side].cal_state != "idle":
+                log.info("[%s] %s ignored for dual mode during calibration", side, dual_btn)
+                return
+            self._handle_dual_mode_button(side)
+            return
+
+        # B edge (right controller only) → recording toggle.
+        record_btn = RECORD_BUTTON_BY_SIDE.get(side)
+        if record_btn and record_btn in pressed_edges:
+            self._handle_record_button(side)
+
+        # A/X edge → single-arm engage toggle.
+        engage_btn = ENGAGE_BUTTON_BY_SIDE.get(side)
+        if engage_btn and engage_btn in pressed_edges:
+            if self._arms[side].cal_state != "idle":
+                log.info("[%s] %s ignored for engage during calibration", side, engage_btn)
+                return
+            self._handle_engage_button(side)
+
+    def _handle_dual_mode_button(self, side: ArmSide) -> None:
+        """Y button on the left controller toggles dual-arm drive mode.
+
+        This only changes enablement/selection: when dual mode is on, the drive
+        loop runs the existing per-arm target/IK/control path once for left and
+        once for right. It does not alter the IK, smoothing, wrist mapping, or
+        per-tick motor control.
+        """
+        with self._lock:
+            if side != "left":
+                return
+            connected = set(MOTORS.connected_sides)
+            if {"left", "right"} - connected:
+                log.warning("[left] Y dual-mode toggle ignored: connect both arms first")
+                return
+            if self._dual_mode:
+                self._dual_mode = False
+                self._engaged = False
+                log.info("[left] Y button → DUAL MODE OFF (disengaged)")
+                return
+            for s in ("left", "right"):
+                arm = self._arms[s]
+                if arm.cal_confidence in ("poor", "legacy"):
+                    log.warning(
+                        "[left] Y dual-mode toggle ignored: %s calibration confidence is %s; rerun calibration",
+                        s, arm.cal_confidence,
+                    )
+                    return
+                arm.stale_since = None
+            self._dual_mode = True
+            self._engaged = True
+            self._active_arm = None
+            log.info("[left] Y button → DUAL MODE ON (left + right arms)")
 
     def _handle_record_button(self, side: ArmSide) -> None:
         """B button on right controller was just pressed → toggle dataset recording."""

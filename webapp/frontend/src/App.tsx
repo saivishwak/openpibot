@@ -25,12 +25,14 @@ function GlobalStatus() {
 
   const connectedSides = s.connected_sides ?? [];
   const anyConnected = connectedSides.length > 0;
-  const armLabel = s.active_arm
+  const armLabel = s.dual_mode
+    ? "left + right · dual"
+    : s.active_arm
     ? `${s.active_arm} arm · active`
     : anyConnected
       ? `${connectedSides.join(" + ")} · connected`
       : "no arm";
-  const armColor = s.active_arm ? "indigo" : anyConnected ? "teal" : "gray";
+  const armColor = s.dual_mode ? "red" : s.active_arm ? "indigo" : anyConnected ? "teal" : "gray";
   const engagedColor =
     s.engaged ? "red" :
     anyConnected ? "yellow" :

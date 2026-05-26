@@ -35,8 +35,8 @@ function ageBadge(ms: number | null | undefined, prefix = "") {
 }
 
 /** Per-arm Connect / Disconnect row. Both arms are always shown so the user can
- *  bring up either one independently — bimanual is "both can be torqued, only one
- *  drives at a time" (see VRTeleopSession._active_arm). */
+ *  bring up either one independently. Single-arm mode drives active_arm;
+ *  dual_mode (left Y button) drives both arms with the existing per-arm path. */
 function ConnectionBar({ s, onConnect, onDisconnect, onEStop, busy }: {
   s: VRStatus | undefined;
   onConnect: (arm: ArmSide) => void;
@@ -47,7 +47,7 @@ function ConnectionBar({ s, onConnect, onDisconnect, onEStop, busy }: {
   const armCard = (side: ArmSide) => {
     const armState = s?.arms?.[side];
     const connected = !!armState?.connected;
-    const isActive = s?.active_arm === side;
+    const isActive = s?.dual_mode || s?.active_arm === side;
     return (
       <Card withBorder padding="sm" key={side}
             style={{ borderColor: isActive ? "var(--mantine-color-red-7)" : undefined }}>
@@ -160,6 +160,7 @@ function EngagementCard({ s, onEngage, busy }: {
   const anyConnected = connectedSides.length > 0;
   const engaged = !!s?.engaged;
   const activeArm = s?.active_arm;
+  const dualMode = !!s?.dual_mode;
 
   // When both arms are connected, user must pick which to drive.
   const [localActive, setLocalActive] = useState<ArmSide>("right");
@@ -179,8 +180,8 @@ function EngagementCard({ s, onEngage, busy }: {
           <Stack gap={0}>
             <Text fw={700} fz="md">Engagement</Text>
             <Text fz="xs" c="dimmed">
-              While ON, VR drives the <b>active</b> arm. The other arm stays torqued
-              and holds position. Grip on the active controller anchors + drives.
+              While ON, VR drives the <b>active</b> arm. Press left <b>Y</b> to
+              toggle dual mode, where both gripped controllers can drive their arms.
             </Text>
           </Stack>
           <Switch
@@ -210,7 +211,9 @@ function EngagementCard({ s, onEngage, busy }: {
               ]}
               disabled={busy}
             />
-            <Text fz="xs" c="dimmed">only one arm is driven at a time</Text>
+            <Text fz="xs" c="dimmed">
+              A/X selects one arm; left Y toggles dual mode
+            </Text>
           </Group>
         )}
 
@@ -231,7 +234,11 @@ function EngagementCard({ s, onEngage, busy }: {
         </Box>
 
         <Group gap="xs">
-          {activeArm ? (
+          {dualMode ? (
+            <Badge color="red" variant="filled">
+              dual mode: left + right
+            </Badge>
+          ) : activeArm ? (
             <Badge color={activeCalibrated ? "teal" : "gray"} variant="filled">
               {activeCalibrated
                 ? `${activeArm} anchored`
@@ -243,7 +250,14 @@ function EngagementCard({ s, onEngage, busy }: {
           {ageBadge(s?.last_tick_age_ms, "drive tick ")}
         </Group>
 
-        {activeArm && !activeCalibrated && engaged && (
+        {dualMode && engaged && (
+          <Alert color="yellow" icon={<IconAlertTriangleFilled />}>
+            Dual mode is on. Squeeze grip on each controller once to anchor that
+            arm; each side moves only while its controller is sending position goals.
+          </Alert>
+        )}
+
+        {!dualMode && activeArm && !activeCalibrated && engaged && (
           <Alert color="yellow" icon={<IconAlertTriangleFilled />}>
             VR data flowing for {activeArm} but no anchor captured yet. Squeeze the
             {" "}{activeArm} controller's <b>grip</b> button (middle finger) to anchor
@@ -1161,11 +1175,12 @@ export function VRTeleop() {
             <Group gap="xs"><IconHeadset size={26} /> VR Teleop</Group>
           </Title>
           <Text c="dimmed" fz="sm">
-            Bimanual Meta Quest 3 teleop, engage-gated: both arms can be torqued
-            simultaneously but only one is driven by VR at a time. Buttons:
+            Bimanual Meta Quest 3 teleop, engage-gated: drive one arm with A/X
+            or press left Y to toggle dual-arm mode. Buttons:
             <b> grip</b> (middle finger) = calibrate + drive;{" "}
             <b>trigger</b> (index) = gripper;{" "}
             <b>A</b> (right) / <b>X</b> (left) = toggle engage for that arm;{" "}
+            <b>Y</b> (left) = toggle dual mode;{" "}
             <b>B</b> (right) = toggle dataset recording. Safety: engage toggle,
             grip-press calibration, stale-goal watchdog. No motion on disconnect
             or shutdown.

@@ -104,7 +104,9 @@ export interface VRStatus {
   connected_sides: ArmSide[];
   /** Which arm VR is currently driving (engage-gated bimanual). null = none. */
   active_arm: ArmSide | null;
-  /** Global engage gate. To actually move motors: engaged && active_arm != null && that arm calibrated */
+  /** True when left-controller Y has enabled simultaneous left + right drive. */
+  dual_mode: boolean;
+  /** Global engage gate. Motors move when engaged and either active_arm or dual_mode is set. */
   engaged: boolean;
   /** Whether dataset recording is currently active (toggled by B button or UI). */
   recording: boolean;

@@ -155,5 +155,5 @@ vite.config.js.timestamp-*
 vite.config.ts.timestamp-*
 .vite/
 
-# Frontend build output (hashed JS/CSS bundles)
-**/static/assets/
+# Frontend build output served by backend
+webapp/backend/static/
