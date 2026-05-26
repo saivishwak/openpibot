@@ -1055,9 +1055,9 @@ class VRTeleopSession:
         # records pays no dataset cost).
         self._recording: bool = False
         self._recorder: Optional[_dataset.DatasetRecorder] = None
-        # Last task string passed via the UI. Cached here so that when the user
-        # presses B on the Quest controller (no UI typing possible), the
-        # backend uses the most-recently-typed task instead of an empty string.
+        # Last task string synced from the UI. Cached here so the Quest B button
+        # can start an episode with the task the user typed on the web page.
+        # Empty text clears the cache and recording start is rejected.
         self._last_task: str = ""
         # Resolved (absolute, ~-expanded) dataset storage root from most recent
         # recorder init. Shown on the UI's Recording card.
@@ -2061,11 +2061,9 @@ class VRTeleopSession:
                                         "arm may not have reached the saved pose",
                                         side, elapsed)
 
-                # Dataset capture: one frame per drive tick when recording is on,
-                # even if the active arm is stationary, grip is released, or the
-                # VR watchdog skips motor writes. Passive arms still contribute
-                # their observation.state.
-                self._record_frame_if_active()
+                # Commands sent during this tick become the dataset action for
+                # the same tick. Arms not commanded fall back to present state.
+                commanded_this_tick: dict[ArmSide, dict[str, float]] = {}
 
                 # Phase 2: command the active arm if engaged + calibrated. In
                 # dual mode, run the same per-arm path for both connected arms.
@@ -2076,6 +2074,9 @@ class VRTeleopSession:
                 else:
                     drive_sides = []
                 if not engaged or not drive_sides:
+                    # Still record idle/passive ticks; they become hold/no-op
+                    # frames with action equal to present state.
+                    self._record_frame_if_active(commanded_this_tick=commanded_this_tick)
                     next_tick = self._sleep_until(next_tick)
                     continue
                 for drive_side in drive_sides:
@@ -2141,10 +2142,16 @@ class VRTeleopSession:
                     sent = MOTORS.send_action(drive_side, final)
                     arm.last_sent_targets = dict(sent)
                     arm.last_commanded_targets = dict(sent)
+                    commanded_this_tick[drive_side] = dict(sent)
 
                     # Debug: per-arm gripper trigger/target/sent/present log (1Hz).
                     self._debug_log_gripper(drive_side, goal, arm.targets,
                                              final, present_full, now)
+
+                # Dataset capture: one frame per drive tick when recording is on.
+                # Capture after motor writes so `action` is the command from this
+                # tick, not the previous tick.
+                self._record_frame_if_active(commanded_this_tick=commanded_this_tick)
 
             except Exception as e:
                 log.exception("drive loop error: %s", e)
@@ -2827,6 +2834,12 @@ class VRTeleopSession:
         log.info("[%s] B button → toggle recording", side)
         self.set_recording(not self._recording)
 
+    def set_recording_task(self, task: str) -> dict:
+        """Cache the UI task text for future B-button recording starts."""
+        with self._lock:
+            self._last_task = (task or "").strip()
+        return self.status()
+
     def set_recording(self, enabled: bool, task: str = "",
                        home_first: Optional[bool] = None,
                        root: Optional[str] = None) -> bool:
@@ -2838,6 +2851,12 @@ class VRTeleopSession:
         in config/xlerobot.yaml), move every connected arm to its saved home
         pose before opening the new episode. Ensures consistent training data.
         """
+        effective_task = (task or "").strip() or self._last_task
+        if enabled and not effective_task:
+            self._last_error = "task description required before starting an episode"
+            log.warning(self._last_error)
+            return self._recording
+
         # Resolve home_first from config if not explicitly set.
         if home_first is None:
             try:
@@ -2864,9 +2883,6 @@ class VRTeleopSession:
         with self._lock:
             if bool(enabled) == self._recording:
                 return self._recording
-            # Resolve task: use the just-passed value if non-empty, else fall
-            # back to whatever was last typed in the UI. Stash for next B-press.
-            effective_task = (task or "").strip() or self._last_task
             if effective_task and enabled:
                 self._last_task = effective_task
             if enabled:
@@ -2922,11 +2938,15 @@ class VRTeleopSession:
                         self._recorder = None
         return self._recording
 
-    def _record_frame_if_active(self) -> None:
+    def _record_frame_if_active(
+        self,
+        commanded_this_tick: Optional[dict[ArmSide, dict[str, float]]] = None,
+    ) -> None:
         """If recording is on and an episode is active, append one frame.
 
-        Action = last commanded joint positions (per-arm, prefixed keys), merged
-        across both arms. Observation.state = present joint positions (both arms).
+        Action = same-tick commanded joint positions for arms moved this tick,
+        with passive arms falling back to present joint positions.
+        Observation.state = present joint positions (both arms).
         Observation.images.<role> = latest snapshot from each configured camera.
         Missing arm or camera data is filled with zeros by the recorder.
         """
@@ -2937,21 +2957,9 @@ class VRTeleopSession:
             # Snapshot dictionaries while holding the lock; release before doing
             # camera capture (which is slow).
             connected = list(MOTORS.connected_sides)
-            active = self._active_arm
-            engaged = self._engaged
-            now = time.time()
-            active_is_live = False
-            if active in connected:
-                goal = self._arms[active].latest
-                active_is_live = (
-                    engaged
-                    and goal.has_data
-                    and goal.mode == "position"
-                    and (now - goal.received_at) <= GOAL_SKIP_AGE_S
-                )
             commanded_by_side = {
-                s: dict(self._arms[s].last_commanded_targets)
-                for s in connected
+                s: dict(commanded)
+                for s, commanded in (commanded_this_tick or {}).items()
             }
         # Outside lock: read present positions (bus I/O) + camera snapshots.
         try:
@@ -2962,7 +2970,7 @@ class VRTeleopSession:
         action_dict: dict[str, float] = {}
         for s in connected:
             prefix = f"{s}_arm_"
-            if s == active and active_is_live and commanded_by_side.get(s):
+            if commanded_by_side.get(s):
                 action_dict.update(commanded_by_side[s])
             else:
                 for j in _motors.JOINTS_PER_ARM:

@@ -923,7 +923,7 @@ function RecordingCard({ s, task, onTaskChange, storageRoot, onStorageRootChange
 
         <TextInput
           label="Task description"
-          description="Natural-language instruction this episode demonstrates. Required for LeRobot v2 — stored on every frame and used as conditioning for VLA training. Example: 'Pick the red block and place it in the bin'."
+          description="Required natural-language instruction for this episode. Stored in LeRobot metadata and used as conditioning for VLA finetuning. Example: 'Pick the red block and place it in the bin'."
           placeholder="Pick the red block and place it in the bin"
           value={task}
           onChange={(e) => onTaskChange(e.currentTarget.value)}
@@ -941,9 +941,11 @@ function RecordingCard({ s, task, onTaskChange, storageRoot, onStorageRootChange
         />
 
         <Text fz="xs" c="dimmed">
-          Press <b>B</b> on the right Quest controller, or click <b>Start recording</b>, to
-          begin an episode. Both arms' commanded + present joints and every camera with a
-          role assigned on the Cameras page are captured. Writes LeRobot v2 to{" "}
+          Enter a descriptive task, then click <b>Start recording</b> or press <b>B</b> on
+          the right Quest controller to begin an episode. The task text is synced to
+          the backend before recording; empty text is rejected. Both arms' commanded +
+          present joints and every camera with a role assigned on the Cameras page are
+          captured. Writes LeRobot to{" "}
           <span className="mono">{info?.root || defaultRoot}</span> · repo_id{" "}
           <span className="mono">{info?.repo_id || "(configure dataset.repo_id)"}</span>.
         </Text>
@@ -996,6 +998,16 @@ export function VRTeleop() {
       setTaskInitialized(true);
     }
   }, [s, taskInitialized]);
+
+  useEffect(() => {
+    if (!taskInitialized || s?.recording) return;
+    const id = window.setTimeout(() => {
+      api.vrSetRecordingTask(taskDescription.trim()).catch(() => {
+        // Recording start still validates the task; avoid noisy per-keystroke errors.
+      });
+    }, 300);
+    return () => window.clearTimeout(id);
+  }, [taskDescription, taskInitialized, s?.recording]);
 
   const handleConnect = async (arm: ArmSide) => {
     setBusy(true);

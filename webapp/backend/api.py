@@ -257,5 +257,16 @@ def api_vr_recording():
         abort(400, "enabled required")
     task = body.get("task") or ""
     root = body.get("root") or ""
+    if bool(body["enabled"]) and not task.strip():
+        abort(400, "task description required before starting an episode")
     vr_mod.SESSION.set_recording(bool(body["enabled"]), task=task, root=root)
     return jsonify(vr_mod.SESSION.status())
+
+
+@bp.post("/api/vr/recording/task")
+def api_vr_recording_task():
+    """Body: `{task: str}`. Cache the UI task text for Quest B-button starts."""
+    body = request.get_json(silent=True) or {}
+    if "task" not in body:
+        abort(400, "task required")
+    return jsonify(vr_mod.SESSION.set_recording_task(str(body.get("task") or "")))

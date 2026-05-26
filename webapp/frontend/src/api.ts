@@ -179,6 +179,12 @@ export const api = {
     req<VRStatus>("/api/vr/recording", {
       method: "POST", body: JSON.stringify({ enabled, task, root }),
     }),
+  /** Cache the current UI task text so Quest B-button recording starts use the
+   *  same prompt. Empty text clears the cached prompt and start is rejected. */
+  vrSetRecordingTask: (task: string) =>
+    req<VRStatus>("/api/vr/recording/task", {
+      method: "POST", body: JSON.stringify({ task }),
+    }),
   /** Begin a guided motion-based calibration for one arm. */
   vrCalibrateStart: (arm: ArmSide) =>
     req<VRStatus>("/api/vr/calibrate/start", {
