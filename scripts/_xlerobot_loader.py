@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import logging
 import pathlib
+import json
 from typing import Any
 
 import yaml
@@ -46,6 +47,14 @@ def build_cameras(cfg: dict) -> dict[str, Any]:
     return cams
 
 
+def _refresh_motor_registry(bus: Any) -> None:
+    """Rebuild id maps after pruning motors; clear cached `ids` / `models`."""
+    bus._id_to_model_dict = {m.id: m.model for m in bus.motors.values()}
+    bus._id_to_name_dict = {m.id: name for name, m in bus.motors.items()}
+    for key in ("ids", "models", "_has_different_ctrl_tables"):
+        bus.__dict__.pop(key, None)
+
+
 def patch_motors_bus_lenient() -> None:
     """Make `MotorsBus._assert_motors_exist` PRUNE missing motors instead of raising.
 
@@ -68,25 +77,33 @@ def patch_motors_bus_lenient() -> None:
     original = MotorsBus._assert_motors_exist
 
     def lenient(self) -> None:  # type: ignore[no-untyped-def]
-        try:
-            original(self)
-            return
-        except RuntimeError as exc:
-            msg = str(exc)
-            if "Missing motor IDs" not in msg:
-                raise   # different failure (wrong model, etc.) — bubble up
-            # Re-run the ping, this time to figure out which configured motors are present.
+        # MotorsBus.ids is a @cached_property; must refresh after pruning motors.
+        for _ in range(len(self.motors) + 1):
+            try:
+                original(self)
+                return
+            except RuntimeError as exc:
+                msg = str(exc)
+                if "Missing motor IDs" not in msg:
+                    raise  # wrong model, protocol error, etc.
+
             found_ids: set[int] = set()
             for id_ in self.ids:
                 if self.ping(id_) is not None:
                     found_ids.add(id_)
-            to_drop = [name for name, motor in list(self.motors.items())
-                       if motor.id not in found_ids]
+            to_drop = [
+                name for name, motor in list(self.motors.items())
+                if motor.id not in found_ids
+            ]
             if not to_drop:
-                raise  # something deeper is wrong
+                raise
+
             log.warning(
                 "[lenient-motors] Pruning %d absent motor(s) from %s on port %s: %s",
-                len(to_drop), type(self).__name__, self.port, to_drop,
+                len(to_drop),
+                type(self).__name__,
+                self.port,
+                to_drop,
             )
             print(
                 f"[lenient-motors] {type(self).__name__} on {self.port}: "
@@ -94,8 +111,12 @@ def patch_motors_bus_lenient() -> None:
             )
             for name in to_drop:
                 del self.motors[name]
-            # Sanity-check that what remains is wholly present (raises if not).
-            original(self)
+            _refresh_motor_registry(self)
+
+        raise RuntimeError(
+            f"{type(self).__name__} motor check failed on port {self.port!r} "
+            "after lenient pruning"
+        )
 
     MotorsBus._assert_motors_exist = lenient  # type: ignore[assignment]
     MotorsBus._xlerobot_lenient_patch = True  # type: ignore[attr-defined]
@@ -108,8 +129,33 @@ def make_config(robot_id: str = "xlerobot") -> Any:
     cfg = load_yaml()
     r = cfg.get("robot") or {}
     cams = build_cameras(cfg)
+    calib_dir = REPO_ROOT / "config" / "calibration" / "xlerobot"
+    calib_dir.mkdir(parents=True, exist_ok=True)
+
+    # Build XLerobot-prefixed calibration from per-arm SOFollower calibrations.
+    # This lets XLerobot connect(calibrate=False) use the same calibration source as the
+    # rest of this repo (config/calibration/so_follower/{left,right}_follower_arm.json).
+    so_calib_dir = REPO_ROOT / "config" / "calibration" / "so_follower"
+    left_id = str(r.get("left_arm_id", "left_follower_arm"))
+    right_id = str(r.get("right_arm_id", "right_follower_arm"))
+    left_path = so_calib_dir / f"{left_id}.json"
+    right_path = so_calib_dir / f"{right_id}.json"
+    merged: dict[str, Any] = {}
+    try:
+        if left_path.is_file():
+            left = json.loads(left_path.read_text())
+            merged.update({f"left_arm_{k}": v for k, v in left.items()})
+        if right_path.is_file():
+            right = json.loads(right_path.read_text())
+            merged.update({f"right_arm_{k}": v for k, v in right.items()})
+        if merged:
+            merged_path = calib_dir / f"{robot_id}.json"
+            merged_path.write_text(json.dumps(merged, indent=4))
+    except Exception as e:
+        log.warning("failed to build xlerobot calibration JSON: %s", e)
 
     kwargs: dict[str, Any] = {"id": robot_id}
+    kwargs["calibration_dir"] = calib_dir
     if r.get("port_left_base"):
         kwargs["port_left_base"] = r["port_left_base"]
     if r.get("port_right_head"):
