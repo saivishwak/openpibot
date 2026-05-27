@@ -99,6 +99,7 @@ class DatasetRecorder:
                 use_videos=True,                     # MP4-encode image streams
                 image_writer_threads=2,              # async JPEG → video encode
             )
+        self._episode_count = int(getattr(self._dataset.meta, "total_episodes", 0))
         log.info("dataset recorder ready: repo_id=%s fps=%d cameras=%s root=%s",
                  repo_id, self.fps, self.camera_roles, self._dataset.root)
 
@@ -169,13 +170,16 @@ class DatasetRecorder:
                 except Exception as e: log.warning("clear_episode_buffer: %s", e)
                 log.info("episode discarded (0 frames)")
                 return False
-            self._episode_count += 1
+            episode_count = self._episode_count + 1
+            frame_count = self._frame_count
         # Save outside the lock — save_episode does I/O + may take a while
         # (especially with batch_encoding_size=1, the video gets encoded now).
         try:
             self._dataset.save_episode()
+            with self._lock:
+                self._episode_count = episode_count
             log.info("episode %d saved (%d frames)",
-                     self._episode_count, self._frame_count)
+                     episode_count, frame_count)
             return True
         except Exception as e:
             log.exception("save_episode failed: %s", e)

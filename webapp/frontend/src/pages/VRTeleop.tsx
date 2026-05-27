@@ -972,7 +972,7 @@ function CameraStrip() {
 
 export function VRTeleop() {
   const { data: s, mutate, isLoading } = useSWR<VRStatus>(
-    "/api/vr/status", fetcher, { refreshInterval: 200 },
+    "/api/vr/status", fetcher, { refreshInterval: 1000 },
   );
   const [busy, setBusy] = useState(false);
   const [eStopConfirm, setEStopConfirm] = useState(false);
@@ -999,15 +999,13 @@ export function VRTeleop() {
     }
   }, [s, taskInitialized]);
 
-  useEffect(() => {
-    if (!taskInitialized || s?.recording) return;
-    const id = window.setTimeout(() => {
-      api.vrSetRecordingTask(taskDescription.trim()).catch(() => {
-        // Recording start still validates the task; avoid noisy per-keystroke errors.
-      });
-    }, 300);
-    return () => window.clearTimeout(id);
-  }, [taskDescription, taskInitialized, s?.recording]);
+  const handleTaskDescriptionChange = (next: string) => {
+    setTaskDescription(next);
+    if (s?.recording) return;
+    api.vrSetRecordingTask(next.trim()).catch(() => {
+      // Recording start still validates the task; avoid noisy per-keystroke errors.
+    });
+  };
 
   const handleConnect = async (arm: ArmSide) => {
     setBusy(true);
@@ -1212,7 +1210,7 @@ export function VRTeleop() {
         <EngagementCard s={s} onEngage={handleEngage} busy={busy} />
         <RecordingCard s={s}
                        task={taskDescription}
-                       onTaskChange={setTaskDescription}
+                       onTaskChange={handleTaskDescriptionChange}
                        storageRoot={storageRoot}
                        onStorageRootChange={setStorageRoot}
                        onToggle={handleRecordingToggle}

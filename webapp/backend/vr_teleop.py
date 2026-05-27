@@ -1055,6 +1055,8 @@ class VRTeleopSession:
         # records pays no dataset cost).
         self._recording: bool = False
         self._recorder: Optional[_dataset.DatasetRecorder] = None
+        self._recording_transition_lock = threading.Lock()
+        self._episodes_saved: int = 0
         # Last task string synced from the UI. Cached here so the Quest B button
         # can start an episode with the task the user typed on the web page.
         # Empty text clears the cache and recording start is rejected.
@@ -1294,6 +1296,9 @@ class VRTeleopSession:
         if was_recording and rec is not None:
             try: rec.end_episode()
             except Exception as e: log.warning("e-stop: end_episode: %s", e)
+            else:
+                with self._lock:
+                    self._episodes_saved = max(self._episodes_saved, rec.episode_count)
         if rec is not None:
             try: rec.finalize()
             except Exception as e: log.warning("e-stop: finalize: %s", e)
@@ -1480,7 +1485,7 @@ class VRTeleopSession:
                     shown_root = ""
             recording_info = {
                 "active": self._recording,
-                "episodes_saved": rec.episode_count if rec else 0,
+                "episodes_saved": max(self._episodes_saved, rec.episode_count if rec else 0),
                 "frames_in_current_episode": rec.frame_count_in_episode if rec else 0,
                 "repo_id": rec.repo_id if rec else None,
                 "last_task": self._last_task,
@@ -2843,6 +2848,12 @@ class VRTeleopSession:
     def set_recording(self, enabled: bool, task: str = "",
                        home_first: Optional[bool] = None,
                        root: Optional[str] = None) -> bool:
+        with self._recording_transition_lock:
+            return self._set_recording_locked(enabled, task=task, home_first=home_first, root=root)
+
+    def _set_recording_locked(self, enabled: bool, task: str = "",
+                              home_first: Optional[bool] = None,
+                              root: Optional[str] = None) -> bool:
         """Idempotent recording toggle. Lazy-creates the LeRobotDataset on first
         start, opens a new episode each ON transition, saves the episode on the
         OFF transition. Returns the new recording state.
@@ -2932,6 +2943,8 @@ class VRTeleopSession:
             # LeRobot buffers episode metadata until finalize(); without this,
             # the viewer sees data/video files but no meta/episodes parquet.
             if saved:
+                with self._lock:
+                    self._episodes_saved = max(self._episodes_saved, rec.episode_count)
                 rec.finalize()
                 with self._lock:
                     if self._recorder is rec:

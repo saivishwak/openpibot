@@ -1,4 +1,7 @@
+import asyncio
 import time
+import threading
+from types import SimpleNamespace
 
 from flask import Flask
 
@@ -20,6 +23,13 @@ class _FakeRecorder:
 
     def add_frame(self, action, present, camera_frames):
         self.frames.append((action, present, camera_frames))
+
+    def end_episode(self):
+        self.episode_count += 1
+        return True
+
+    def finalize(self):
+        self.finalized = True
 
 
 class _FakeMotors:
@@ -128,4 +138,118 @@ def test_recording_task_api_caches_prompt(monkeypatch):
 
     assert resp.status_code == 200
     assert session._last_task == "Pick the red block"
+
+
+def test_recording_restart_waits_for_previous_stop_to_finish(monkeypatch):
+    session = vr_mod.VRTeleopSession()
+    old_rec = _FakeRecorder()
+    new_rec = _FakeRecorder()
+    entered_end = threading.Event()
+    allow_end = threading.Event()
+    start_done = threading.Event()
+
+    def slow_end_episode():
+        entered_end.set()
+        assert allow_end.wait(timeout=2.0)
+        old_rec.episode_count += 1
+        return True
+
+    old_rec.end_episode = slow_end_episode
+    session._recording = True
+    session._recorder = old_rec
+    session._last_task = "Pick the red block"
+
+    monkeypatch.setattr(
+        vr_mod._dataset,
+        "load_dataset_config",
+        lambda: {
+            "home_before_episode": False,
+            "repo_id": "test/repo",
+            "fps": 30,
+            "push_to_hub": False,
+            "root": None,
+        },
+    )
+    monkeypatch.setattr(vr_mod._dataset, "role_camera_list", lambda: (["head"], (2, 2, 3)))
+    monkeypatch.setattr(vr_mod._dataset, "resolve_root", lambda root, repo_id: "/tmp/test/repo")
+    monkeypatch.setattr(vr_mod._dataset, "DatasetRecorder", lambda **kwargs: new_rec)
+
+    stop_thread = threading.Thread(target=lambda: session.set_recording(False))
+    stop_thread.start()
+    assert entered_end.wait(timeout=2.0)
+
+    start_thread = threading.Thread(
+        target=lambda: (session.set_recording(True, task="Pick the red block"), start_done.set())
+    )
+    start_thread.start()
+    time.sleep(0.05)
+    assert not start_done.is_set()
+
+    allow_end.set()
+    stop_thread.join(timeout=2.0)
+    start_thread.join(timeout=2.0)
+
+    assert start_done.is_set()
+    assert getattr(old_rec, "finalized", False) is True
+    assert session._recording is True
+    assert session._recorder is new_rec
+    assert new_rec.task == "Pick the red block"
+    assert session._episodes_saved == 1
+
+
+def test_b_button_start_requires_synced_task(monkeypatch):
+    session = vr_mod.VRTeleopSession()
+    recorder = _FakeRecorder()
+
+    monkeypatch.setattr(
+        vr_mod._dataset,
+        "load_dataset_config",
+        lambda: {
+            "home_before_episode": False,
+            "repo_id": "test/repo",
+            "fps": 30,
+            "push_to_hub": False,
+            "root": None,
+        },
+    )
+    monkeypatch.setattr(vr_mod._dataset, "role_camera_list", lambda: (["head"], (2, 2, 3)))
+    monkeypatch.setattr(vr_mod._dataset, "resolve_root", lambda root, repo_id: "/tmp/test/repo")
+    monkeypatch.setattr(vr_mod._dataset, "DatasetRecorder", lambda **kwargs: recorder)
+
+    session._handle_record_button("right")
+
+    assert session._recording is False
+    assert "task description required" in (session._last_error or "")
+
+    session.set_recording_task("Pick the red block")
+    session._handle_record_button("right")
+
+    assert session._recording is True
+    assert recorder.task == "Pick the red block"
+
+
+def test_vr_button_release_is_forwarded_for_repeat_b_toggles():
+    from xlevr.inputs.vr_ws_server import VRWebSocketServer
+
+    async def run():
+        queue = asyncio.Queue()
+        server = VRWebSocketServer(command_queue=queue, config=SimpleNamespace())
+
+        await server.process_single_controller(
+            "right",
+            {"gripActive": False, "buttons": {"B": True}},
+        )
+        await server.process_single_controller(
+            "right",
+            {"gripActive": False, "buttons": {"B": False}},
+        )
+        await server.process_single_controller(
+            "right",
+            {"gripActive": False, "buttons": {"B": True}},
+        )
+
+        goals = [await asyncio.wait_for(queue.get(), timeout=0.5) for _ in range(3)]
+        return [goal.buttons for goal in goals]
+
+    assert asyncio.run(run()) == [{"B": True}, {"B": False}, {"B": True}]
 
