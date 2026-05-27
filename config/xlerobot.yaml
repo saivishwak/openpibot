@@ -4,7 +4,7 @@ robot:
   port_right_head: /dev/ttyACM0
   left_arm_id: left_follower_arm
   right_arm_id: right_follower_arm
-  max_relative_target: null
+  max_relative_target: 8.0
   use_degrees: true
   home_pose:
     left_arm_shoulder_pan: 21.6703
@@ -27,16 +27,16 @@ cameras:
     width: 640
     height: 480
     fourcc: MJPG
-  right_wrist:
+  head:
     type: opencv
-    path: /dev/v4l/by-path/pci-0000:0e:00.0-usb-0:4.1:1.0-video-index0
+    path: /dev/v4l/by-path/pci-0000:0e:00.0-usb-0:3:1.0-video-index0
     fps: 30
     width: 640
     height: 480
     fourcc: MJPG
-  head:
+  right_wrist:
     type: opencv
-    path: /dev/v4l/by-path/pci-0000:0e:00.0-usb-0:3:1.0-video-index0
+    path: /dev/v4l/by-path/pci-0000:0e:00.0-usb-0:4.1:1.0-video-index0
     fps: 30
     width: 640
     height: 480
@@ -50,7 +50,7 @@ pi05:
   server_host: 127.0.0.1
   server_port: 8000
   action_horizon: 50
-  control_fps: 50
+  control_fps: 30
 vr:
   host_ip: 0.0.0.0
   https_port: 5443
@@ -59,18 +59,6 @@ vr:
   wrist_delta_limit_deg: 5.0
   pos_ema_alpha: 0.5
   ori_ema_alpha: 0.4
-  # Hardware polarity of the wrist motors, per arm. These answer
-  # "if the user pitches their controller +1 unit around its anchor-local x-axis
-  # and the resulting robot-frame y-component of the rotation comes out
-  # positive, does the wrist_flex motor want a positive or a negative delta to
-  # follow that motion?" That depends ONLY on how the motors are mounted and
-  # wired on each arm; it does not depend on where the user stood at
-  # calibration time. Defaults (-1 for all four) match the standard XLeRobot
-  # SO101 build. Only flip a sign here if you actually rewire or remount a
-  # wrist motor. The runtime `wrist_flex_sign` / `wrist_roll_sign` are derived
-  # from these polarities combined with the session_vr_to_robot matrix, so the
-  # wrist tracks the user even when they recalibrate facing a different
-  # direction.
   wrist_motor_polarity:
     left:
       flex: -1

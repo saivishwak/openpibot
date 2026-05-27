@@ -87,6 +87,18 @@ uv run python scripts/infer_pi05_finetuned.py \
   --device cuda
 ```
 
+Recommended for bimanual medicine→bowl (smoother motion, medicine-first prompt for the first ~20s):
+
+```bash
+uv run python scripts/infer_pi05_finetuned.py \
+  --policy-path outputs/pi05_finetune/checkpoints/last/pretrained_model \
+  --phase1-task "Pick up the medicine bottle from the table. Do not go to the bowl yet." \
+  --phase1-sec 20 \
+  --task "Pick up the medicine and place it in the bowl" \
+  --episodes 1 --episode-time 60 --fps 30 \
+  --open-loop-steps 20 --settle-steps 60 --replan-blend 0.3
+```
+
 ### Control loop
 
 - At `fps` (default from `pi05.control_fps` or `dataset.fps` in yaml), the script pops one action per tick from a chunk predicted by the policy.
@@ -112,13 +124,39 @@ uv run python scripts/infer_pi05_finetuned.py \
 | `--episode-time` | `120` | Max seconds per episode |
 | `--device` | `cuda` | `cuda`, `cpu`, or `mps` |
 | `--fps` | yaml | Control loop rate |
-| `--action-horizon` | yaml `pi05.action_horizon` | Re-infer every N control ticks |
+| `--action-horizon` | yaml `pi05.action_horizon` | Max policy chunk size |
+| `--open-loop-steps` | `20` | Steps per chunk before re-inferring (higher = smoother; very low values jitter) |
+| `--settle-steps` | `60` | Hold pose after homing (~2s @ 30Hz) before policy runs |
+| `--replan-blend` | `0.35` | Smooth first action after each new chunk |
+| `--phase1-task` | — | Shorter prompt for the first segment (e.g. reach medicine only) |
+| `--phase1-sec` | `0` | Seconds to use `--phase1-task` before `--task` |
+| `--command-ema-alpha` | `0.22` | Command EMA (lower = smoother) |
+| `--joint-deadband-deg` | `0.8` | Ignore tiny command changes vs previous filtered command |
 | `--skip-home` | off | Skip homing entirely |
 | `--home-before-episode` | yaml `dataset.home_before_episode` | Home at start of each episode |
 | `--home-timeout` | `60` | Seconds before homing gives up and continues |
 | `--strict-motors` | off | Fail if base/head motors are missing |
 | `--dry-run` | off | Print settings and exit |
 | `--dry-run-home` | off | Connect, home, disconnect; no policy |
+
+## How this matches VR recording (`webapp/backend/dataset.py`)
+
+Training data from the webapp uses:
+
+| Field | Meaning |
+|-------|---------|
+| `observation.state` | Present joint positions (degrees), 12-vector in `JOINT_ORDER` |
+| `action` | **Command sent to motors that tick** (absolute degrees), not the raw VR IK goal |
+| `observation.images.{head,left_wrist,right_wrist}` | RGB 640×480 @ 30 Hz |
+
+`action` is built in `vr_teleop.py` the same way as teleop:
+
+1. Per-joint cap vs **previous command**: `cmd = last_sent + clip(target - last_sent, ±cap)` (caps 5–15°/tick).
+2. With `vr.kp: 1.0` (default), that command is stored as the dataset label.
+
+So each training frame’s `|action − state|` is usually **small** (≤ per-tick cap) while moving, not a 40°+ jump.
+
+`infer_pi05_finetuned.py` applies the same shaping to policy outputs before `send_action`, and uses `robot.max_relative_target` as a second safety clamp. Use **`--fps 30`** to match `dataset.fps`.
 
 ## Configuration (`config/xlerobot.yaml`)
 
@@ -163,7 +201,8 @@ Expect weak zero-shot behavior until you finetune and use `infer_pi05_finetuned.
 | `missing camera observations` | Camera path wrong or unplugged | Fix `cameras.*.path` in yaml; check `/dev/v4l/...` |
 | CUDA OOM during **training** | Full PI0.5 finetune | Keep default `--oom-safe`; reduce batch or steps |
 | Policy moves wrong / no task following | Wrong checkpoint or no finetune | Use a finetuned `pretrained_model`, not only `pi05_base` |
-| Arms **oscillate** / jitter in place | FPS ≠ dataset (e.g. 50 vs 30), huge per-step joint jumps, weak finetune | Use `--fps 30`; watch startup `|cmd-present|` log; set `robot.max_relative_target` in yaml; use a later checkpoint |
+| Arms **oscillate** / jitter in place | FPS ≠ dataset, `--open-loop-steps` too low (re-plans every ~0.15s), triple clamp + EMA fighting the chunk | Use `--fps 30`, `--open-loop-steps 20` (not 5), `--replan-blend 0.3`, defaults for EMA/deadband; avoid lowering open-loop below ~15 |
+| Robot goes to **bowl before medicine** | Single task string for whole episode; head cam may bias toward bowl; demos pause at home first | Use `--settle-steps 60`, `--phase1-task` / `--phase1-sec`; align scene with training; finetune longer |
 | `create_causal_mask() got an unexpected keyword argument 'cache_position'` | transformers 5.6+ in venv | `uv sync` (root pins `transformers<5.6`) |
 
 ## File map
