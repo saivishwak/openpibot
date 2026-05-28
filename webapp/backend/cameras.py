@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import fcntl
+import logging
 import os
 import pathlib
 import struct
@@ -10,10 +11,17 @@ import time
 from dataclasses import dataclass
 
 import cv2
+import numpy as np
 import yaml
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
 CONFIG_YAML = REPO_ROOT / "config" / "xlerobot.yaml"
+
+log = logging.getLogger(__name__)
+
+# After this many failed reads, release V4L and wait for the device node to reappear.
+_READ_FAILS_BEFORE_RECOVER = 8
+_DEVICE_WAIT_S = 15.0
 
 # V4L2 — see linux/videodev2.h
 _VIDIOC_QUERYCAP = 0x80685600                     # _IOR('V', 0, struct v4l2_capability)
@@ -197,19 +205,43 @@ class CameraStream:
         self.spec = spec
         self.cap: cv2.VideoCapture | None = None
         self.last_jpeg: bytes | None = None
+        self.last_rgb: Any | None = None  # HWC uint8 RGB — policy path (no JPEG round-trip)
         self.last_error: str | None = None
         self.lock = threading.Lock()
         self.subscribers = 0
         self.thread: threading.Thread | None = None
         self.stop_evt = threading.Event()
+        # Inference only needs RGB; skipping JPEG encode reduces CPU/USB load.
+        self.encode_jpeg = True
+
+    def _close_cap(self) -> None:
+        if self.cap is not None:
+            try:
+                self.cap.release()
+            except Exception:
+                pass
+            self.cap = None
+
+    def _wait_for_device(self, timeout: float = _DEVICE_WAIT_S) -> bool:
+        path = pathlib.Path(self.spec.path)
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if self.stop_evt.is_set():
+                return False
+            if path.exists():
+                return True
+            time.sleep(0.15)
+        return False
 
     def _open(self) -> bool:
+        self._close_cap()
         cap = cv2.VideoCapture(self.spec.path, cv2.CAP_V4L2)
         if not cap.isOpened():
             cap = cv2.VideoCapture(self.spec.path)
         if not cap.isOpened():
             self.last_error = f"VideoCapture failed to open {self.spec.path}"
             return False
+        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
         if self.spec.fourcc:
             fcc = cv2.VideoWriter_fourcc(*self.spec.fourcc)
             cap.set(cv2.CAP_PROP_FOURCC, fcc)
@@ -217,35 +249,57 @@ class CameraStream:
         cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.spec.height)
         cap.set(cv2.CAP_PROP_FPS, self.spec.fps)
         self.cap = cap
+        self.last_error = None
         return True
 
-    def _loop(self) -> None:
-        if not self._open():
+    def _recover_capture(self) -> None:
+        """Release V4L handle and wait for the sysfs node (USB replug / errno 19)."""
+        log.warning(
+            "camera %s: recovering capture (%s)",
+            self.spec.name,
+            self.spec.path,
+        )
+        self._close_cap()
+        if not self._wait_for_device():
+            self.last_error = f"device missing: {self.spec.path}"
             return
+        if not self._open():
+            self.last_error = f"reopen failed: {self.spec.path}"
+
+    def _loop(self) -> None:
         period = 1.0 / max(self.spec.fps, 1)
-        consecutive_failures = 0
         while not self.stop_evt.is_set():
-            t0 = time.monotonic()
-            ok, frame = self.cap.read()  # type: ignore[union-attr]
-            if not ok:
-                consecutive_failures += 1
-                self.last_error = "read() returned False"
-                if consecutive_failures > 30:
-                    break
-                time.sleep(0.1)
+            if not self._open():
+                if not self._wait_for_device(timeout=5.0):
+                    time.sleep(0.5)
                 continue
             consecutive_failures = 0
-            ok2, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
-            if ok2:
+            while not self.stop_evt.is_set():
+                t0 = time.monotonic()
+                ok, frame = self.cap.read()  # type: ignore[union-attr]
+                if not ok:
+                    consecutive_failures += 1
+                    self.last_error = "read() returned False"
+                    if consecutive_failures >= _READ_FAILS_BEFORE_RECOVER:
+                        self._recover_capture()
+                        break
+                    time.sleep(0.05)
+                    continue
+                consecutive_failures = 0
+                rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                 with self.lock:
-                    self.last_jpeg = bytes(buf)
+                    self.last_rgb = rgb
+                    if self.encode_jpeg:
+                        ok2, buf = cv2.imencode(
+                            ".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 80]
+                        )
+                        if ok2:
+                            self.last_jpeg = bytes(buf)
                     self.last_error = None
-            dt = time.monotonic() - t0
-            if dt < period:
-                time.sleep(period - dt)
-        if self.cap:
-            self.cap.release()
-            self.cap = None
+                dt = time.monotonic() - t0
+                if dt < period:
+                    time.sleep(period - dt)
+        self._close_cap()
 
     def acquire(self) -> None:
         with self.lock:
@@ -261,6 +315,18 @@ class CameraStream:
             self.subscribers = max(0, self.subscribers - 1)
             if self.subscribers == 0:
                 self.stop_evt.set()
+
+    def get_rgb(self, timeout: float = 2.0) -> np.ndarray | None:
+        """Latest RGB frame (640×480 HWC uint8) for LeRobot / policy — not JPEG-compressed."""
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            with self.lock:
+                if self.last_rgb is not None:
+                    return self.last_rgb
+                if self.last_error and (self.thread is None or not self.thread.is_alive()):
+                    return None
+            time.sleep(0.05)
+        return None
 
     def get_jpeg(self, timeout: float = 2.0) -> bytes | None:
         deadline = time.monotonic() + timeout
@@ -308,6 +374,18 @@ def reset_streams() -> None:
         for s in _REGISTRY.values():
             s.stop_evt.set()
         _REGISTRY.clear()
+
+
+def restart_stream(cam_id: str) -> CameraStream | None:
+    """Stop and recreate one camera stream (e.g. after USB drop during inference)."""
+    with _REG_LOCK:
+        old = _REGISTRY.pop(cam_id, None)
+    if old is not None:
+        old.stop_evt.set()
+        if old.thread is not None and old.thread.is_alive():
+            old.thread.join(timeout=3.0)
+        old._close_cap()
+    return get_stream(cam_id)
 
 
 def mjpeg_iter(cam_id: str, max_fps: int = 15):

@@ -94,8 +94,9 @@ uv run python scripts/infer_pi05_finetuned.py \
 | Symptom | Try |
 |---------|-----|
 | Stuck at home, only small bobbing | Raise `--command-ema-alpha` (e.g. `0.26`) and/or lower `--joint-deadband-deg` (e.g. `0.65`) |
-| Reaches target but **jittery** | Lower `--command-ema-alpha` (e.g. `0.18`), raise `--joint-deadband-deg` (e.g. `0.85`), raise `--policy-ema-alpha` (e.g. `0.38`), or `--open-loop-steps 40` |
+| Reaches target but **jittery** | Lower `--command-ema-alpha` (e.g. `0.18`), raise `--joint-deadband-deg` (e.g. `0.85`), raise `--policy-ema-alpha` (e.g. `0.38`), or `--open-loop-steps 50` |
 | Snappy reach, still noisy at replans | `--replan-blend 0.15` and/or longer `--open-loop-steps` |
+| Misses grasp / stuck mid-chunk | `--replan-on-miss-deg 18` (execution lag vs last command; off by default) |
 
 Known snappy preset (reaches well, may jitter): `--command-ema-alpha 0.28 --joint-deadband-deg 0.6`.
 
@@ -115,7 +116,8 @@ uv run python scripts/infer_pi05_finetuned.py \
 ### Control loop
 
 - At `fps` (default from `pi05.control_fps` or `dataset.fps` in yaml), the script pops one action per tick from a chunk predicted by the policy.
-- Every `--action-horizon` steps (default `pi05.action_horizon`, often 50), it grabs a new observation (motors + three cameras), runs preprocessors, calls `predict_action_chunk`, and postprocesses.
+- Every `--open-loop-steps` (default 35), it grabs a new observation (motors + three cameras), runs preprocessors, calls `predict_action_chunk`, and postprocesses.
+- **Policy reset** at each episode start, after settle, and at episode end (clears action queue + preprocessor/postprocessor state).
 - **Homing**: unless `--skip-home`, the robot moves to `robot.home_pose` before the run and/or at each episode start (`--home-before-episode`, default from `dataset.home_before_episode`).
 
 ### Dry-run config (no robot)
@@ -129,27 +131,38 @@ uv run python scripts/infer_pi05_finetuned.py \
 
 ## CLI reference (`infer_pi05_finetuned.py`)
 
+Inference runs **one observation → one action** per control tick (batch size 1). There is no `--batch-size` flag here; training batch size is set in [`scripts/finetune_pi05.py`](scripts/finetune_pi05.py) (`--batch-size`, default `8`).
+
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--policy-path` | — | Path to `.../pretrained_model` (required for inference) |
 | `--task` | — | Language instruction for the policy (required for inference) |
 | `--episodes` | `2` | Number of episodes |
-| `--episode-time` | `120` | Max seconds per episode |
+| `--episode-time` | `120` | Max wall-clock seconds per episode (pre-home, loop, post-home share this budget) |
+| `--episode-steps` | — | Max control-loop steps per episode (includes settle); ends when this **or** `--episode-time` is hit |
+| `--stop-on-episode-error` | off | Abort remaining episodes after a failed episode |
 | `--device` | `cuda` | `cuda`, `cpu`, or `mps` |
-| `--fps` | yaml | Control loop rate |
-| `--action-horizon` | yaml `pi05.action_horizon` | Max policy chunk size |
-| `--open-loop-steps` | `35` | Steps per chunk before re-inferring (higher = smoother; very low values jitter) |
+| `--fps` | yaml `dataset.fps` (usually `30`) | Control loop rate (match training) |
+| `--action-horizon` | yaml `pi05.action_horizon` (often `50`) | Max policy chunk size (upper bound) |
+| `--open-loop-steps` | `35` | Steps per scheduled chunk before re-inferring (higher = smoother) |
+| `--replan-on-miss-deg` | `0` | Early re-infer if present lags **last sent command** (`18` typical when enabled); `0` = off |
+| `--replan-miss-steps` | `2` | Consecutive ticks over threshold before early replan |
+| `--replan-blend` | `0.2` | Blend first action after each new chunk (`1.0` = no blend) |
 | `--settle-steps` | `60` | Hold pose after homing (~2s @ 30Hz) before policy runs |
-| `--replan-blend` | `0.25` | Smooth first action after each new chunk |
+| `--policy-ema-alpha` | `0.36` | EMA on policy targets before VR shaping |
+| `--command-ema-alpha` | `0.2` | EMA on final motor command (lower = smoother) |
+| `--joint-deadband-deg` | `0.82` | Ignore tiny command deltas vs previous command |
+| `--clamp-to-present` | off | Clamp vs measured pose; usually causes jitter |
 | `--phase1-task` | — | Shorter prompt for the first segment (e.g. reach medicine only) |
 | `--phase1-sec` | `0` | Seconds to use `--phase1-task` before `--task` |
-| `--policy-ema-alpha` | `0.34` | EMA on policy targets before VR shaping |
-| `--command-ema-alpha` | `0.22` | Command EMA (lower = smoother; too low can stall at home) |
-| `--joint-deadband-deg` | `0.75` | Ignore tiny command changes vs previous filtered command |
-| `--clamp-to-present` | off | Clamp vs measured pose (`max_relative_target`); usually causes jitter |
+| `--camera-backend` | `webapp` | `webapp` (shared V4L streams) or `lerobot` (robot OpenCVCamera) |
+| `--show-cameras` / `--no-show-cameras` | on if `DISPLAY` set | Resizable pygame camera mosaic (background thread) |
+| `--preview-fps` | `15` | Max refresh rate for camera preview |
 | `--skip-home` | off | Skip homing entirely |
-| `--home-before-episode` | yaml `dataset.home_before_episode` | Home at start of each episode |
+| `--home-before-episode` / `--no-home-before-episode` | yaml `dataset.home_before_episode` | Home at start of each episode |
+| `--skip-home-after-episode` | off | Skip post-episode homing |
 | `--home-timeout` | `60` | Seconds before homing gives up and continues |
+| `--max-relative-target` | yaml `robot.max_relative_target` | Per-command joint cap (degrees); optional override |
 | `--strict-motors` | off | Fail if base/head motors are missing |
 | `--dry-run` | off | Print settings and exit |
 | `--dry-run-home` | off | Connect, home, disconnect; no policy |

@@ -42,7 +42,7 @@ cameras:
     height: 480
     fourcc: MJPG
 dataset:
-  repo_id: saivishwak/xlerobot-vr-teleop
+  repo_id: saivishwak/xlerobot-vr-teleop-medicine-bowl
   home_before_episode: true
   fps: 30
   push_to_hub: false

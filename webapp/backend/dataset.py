@@ -347,15 +347,19 @@ def grab_camera_frames() -> dict[str, Optional[np.ndarray]]:
             continue
         stream.acquire()
         try:
-            # Read whatever the producer thread has at the moment — non-blocking.
-            jpeg = stream.last_jpeg
-            if jpeg is None:
-                out[c.role] = None
-                continue
-            arr = np.frombuffer(jpeg, dtype=np.uint8)
-            img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
-            if img is not None:
-                img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+            # Prefer raw RGB from the capture thread (matches LeRobot OpenCVCamera path).
+            img = stream.last_rgb
+            if img is None:
+                img = stream.get_rgb(timeout=0.5)
+            if img is None:
+                jpeg = stream.last_jpeg
+                if jpeg is None:
+                    out[c.role] = None
+                    continue
+                arr = np.frombuffer(jpeg, dtype=np.uint8)
+                img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+                if img is not None:
+                    img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
             out[c.role] = img
         finally:
             stream.release()

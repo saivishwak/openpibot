@@ -28,7 +28,7 @@ def load_yaml() -> dict:
 
 def build_cameras(cfg: dict) -> dict[str, Any]:
     """Convert config/xlerobot.yaml's cameras section into lerobot CameraConfig objects."""
-    from lerobot.cameras.configs import ColorMode, Cv2Rotation
+    from lerobot.cameras.configs import ColorMode, Cv2Backends, Cv2Rotation
     from lerobot.cameras.opencv.configuration_opencv import OpenCVCameraConfig
 
     cams: dict[str, Any] = {}
@@ -43,6 +43,7 @@ def build_cameras(cfg: dict) -> dict[str, Any]:
             color_mode=ColorMode.RGB,
             rotation=Cv2Rotation.NO_ROTATION,
             fourcc=c.get("fourcc", "MJPG"),
+            backend=Cv2Backends.V4L2,
         )
     return cams
 
@@ -122,8 +123,29 @@ def patch_motors_bus_lenient() -> None:
     MotorsBus._xlerobot_lenient_patch = True  # type: ignore[attr-defined]
 
 
-def make_config(robot_id: str = "xlerobot") -> Any:
-    """Build an XLerobotConfig with all overrides from config/xlerobot.yaml applied."""
+def patch_xlerobot_motors_only_connected() -> None:
+    """Treat robot as connected when motor buses are up, even if a camera dropped.
+
+    Upstream XLerobot.is_connected also requires every OpenCVCamera.is_opened(). A single
+    USB glitch on right_wrist then blocks send_action() despite healthy arms.
+    """
+    import lerobot.robots.xlerobot.xlerobot as xr
+
+    if getattr(xr.XLerobot, "_xlerobot_motors_only_connected", False):
+        return
+
+    def _motors_only_connected(self: Any) -> bool:
+        return bool(self.bus_left_base.is_connected and self.bus_right_head.is_connected)
+
+    xr.XLerobot.is_connected = property(_motors_only_connected)  # type: ignore[method-assign]
+    xr.XLerobot._xlerobot_motors_only_connected = True  # type: ignore[attr-defined]
+
+
+def make_config(robot_id: str = "xlerobot", *, use_cameras: bool = True) -> Any:
+    """Build an XLerobotConfig with all overrides from config/xlerobot.yaml applied.
+
+    Set use_cameras=False when frames come from webapp.backend.cameras (inference/VR).
+    """
     from lerobot.robots.xlerobot import XLerobotConfig
 
     cfg = load_yaml()
@@ -163,7 +185,9 @@ def make_config(robot_id: str = "xlerobot") -> Any:
     if "max_relative_target" in r:
         kwargs["max_relative_target"] = r["max_relative_target"]
     kwargs["use_degrees"] = r.get("use_degrees", True)
-    if cams:
+    if use_cameras and cams:
         kwargs["cameras"] = cams
+    else:
+        kwargs["cameras"] = {}
 
     return XLerobotConfig(**kwargs)

@@ -7,6 +7,10 @@ bimanual SO-101 stack — the same robot/dataset layout used during VR recording
 Prerequisites:
     bash scripts/setup_xlerobot.sh   # copies xlerobot into lerobot submodule
 
+Default camera backend is webapp CameraStream (one V4L capture per role, same as VR recording).
+Use --camera-backend lerobot only if you are not sharing USB with the webapp and want
+per-step async_read (opens a second VideoCapture per camera on the robot object).
+
 Usage:
     uv run python scripts/infer_pi05_finetuned.py \\
         --policy-path outputs/pi05_finetune/checkpoints/005000/pretrained_model \\
@@ -82,7 +86,30 @@ def _parse_args() -> argparse.Namespace:
         help="Natural-language task prompt. Not needed with --dry-run-home.",
     )
     p.add_argument("--episodes", type=int, default=2)
-    p.add_argument("--episode-time", type=int, default=120, help="Max seconds per episode.")
+    p.add_argument(
+        "--episode-time",
+        type=int,
+        default=120,
+        help=(
+            "Wall-clock seconds for the whole episode (pre-home, control loop, and "
+            "post-home share this budget). Whichever limit is hit first with --episode-steps."
+        ),
+    )
+    p.add_argument(
+        "--episode-steps",
+        type=int,
+        default=None,
+        help=(
+            "Max control-loop steps per episode (includes settle steps). "
+            "Use this for step budgets (e.g. 2000 steps @ 30 Hz ≈ 67 s). "
+            "Ends when this OR --episode-time is reached."
+        ),
+    )
+    p.add_argument(
+        "--stop-on-episode-error",
+        action="store_true",
+        help="Abort remaining episodes after a failed episode (default: home and continue).",
+    )
     p.add_argument("--device", default="cuda", choices=["cuda", "cpu", "mps"])
     p.add_argument(
         "--fps",
@@ -101,9 +128,25 @@ def _parse_args() -> argparse.Namespace:
         type=int,
         default=35,
         help=(
-            "Policy chunk steps before re-inferring (default: 35 @ 30Hz ≈ 1.2s). "
-            "Higher = smoother; very low values (e.g. 5) cause jitter at replan boundaries."
+            "Policy chunk steps before scheduled re-infer (default: 35 @ 30Hz ≈ 1.2s). "
+            "Higher = fewer replans / smoother; very low values (e.g. 5) jitter at boundaries."
         ),
+    )
+    p.add_argument(
+        "--replan-on-miss-deg",
+        type=float,
+        default=0.0,
+        help=(
+            "Optional: when max |present - last sent command| exceeds this (degrees) for "
+            "--replan-miss-steps ticks, drop the open-loop chunk (re-infer next tick). "
+            "0 disables. Do not compare raw policy targets — that false-triggers during motion."
+        ),
+    )
+    p.add_argument(
+        "--replan-miss-steps",
+        type=int,
+        default=2,
+        help="Consecutive ticks over --replan-on-miss-deg before an early replan.",
     )
     p.add_argument(
         "--settle-steps",
@@ -117,7 +160,7 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument(
         "--replan-blend",
         type=float,
-        default=0.25,
+        default=0.2,
         help=(
             "Blend factor for the first action after each new chunk [0..1]. "
             "Lower = smoother across replans; 1.0 disables blending."
@@ -154,6 +197,11 @@ def _parse_args() -> argparse.Namespace:
         help="Return to home pose at the start of each episode (default: from dataset config).",
     )
     p.add_argument(
+        "--skip-home-after-episode",
+        action="store_true",
+        help="Skip post-episode homing (faster; next episode may still home at start).",
+    )
+    p.add_argument(
         "--home-timeout",
         type=float,
         default=60.0,
@@ -168,7 +216,7 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument(
         "--policy-ema-alpha",
         type=float,
-        default=0.34,
+        default=0.36,
         help=(
             "EMA on raw policy targets before VR shaping [0..1]. "
             "Lower is smoother; 1.0 disables."
@@ -177,7 +225,7 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument(
         "--command-ema-alpha",
         type=float,
-        default=0.22,
+        default=0.2,
         help=(
             "EMA smoothing for final command [0..1]. Lower is smoother, higher is snappier. "
             "Too low (~0.14) can stall at home; too high (~0.28) reaches targets but jitters."
@@ -186,7 +234,7 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument(
         "--joint-deadband-deg",
         type=float,
-        default=0.75,
+        default=0.82,
         help=(
             "Suppress command updates smaller than this vs the previous filtered command (deg). "
             "Too high (~1.0) can stall at home; too low (~0.6) is snappy but jittery."
@@ -211,6 +259,32 @@ def _parse_args() -> argparse.Namespace:
         "--dry-run-home",
         action="store_true",
         help="Connect and move to saved home pose only; skip policy load and inference.",
+    )
+    from _camera_preview_window import display_available
+
+    p.add_argument(
+        "--show-cameras",
+        action=argparse.BooleanOptionalAction,
+        default=display_available(),
+        help=(
+            "Show a live 3-camera mosaic in a background thread (reads webapp streams only; "
+            "does not block inference). Default: on when DISPLAY/WAYLAND_DISPLAY is set."
+        ),
+    )
+    p.add_argument(
+        "--preview-fps",
+        type=float,
+        default=15.0,
+        help="Max refresh rate for --show-cameras window (default: 15).",
+    )
+    p.add_argument(
+        "--camera-backend",
+        choices=("lerobot", "webapp"),
+        default="webapp",
+        help=(
+            "webapp: shared CameraStream registry — one capture per camera (default, stable USB). "
+            "lerobot: extra OpenCVCamera on the robot object (can conflict with webapp / hub)."
+        ),
     )
     args = p.parse_args()
     if args.dry_run and args.dry_run_home:
@@ -357,6 +431,28 @@ def _apply_joint_deadband(
     return out
 
 
+def _max_tracking_error_deg(
+    present: dict[str, float],
+    target: dict[str, float],
+) -> float:
+    errs = [
+        abs(float(present[f"{name}.pos"]) - float(target[f"{name}.pos"]))
+        for name in JOINT_ORDER
+        if f"{name}.pos" in present and f"{name}.pos" in target
+    ]
+    return max(errs) if errs else 0.0
+
+
+def _flush_policy_action_queue(policy: Any) -> int:
+    queue = getattr(policy, "_action_queue", None)
+    if queue is None:
+        return 0
+    n = len(queue)
+    if n:
+        queue.clear()
+    return n
+
+
 def _blend_action_dict(
     new_cmd: dict[str, float],
     prev_cmd: dict[str, float],
@@ -453,6 +549,20 @@ def _connect_robot_with_retries(
     raise last_err
 
 
+def _read_motor_observation(robot: Any, *, attempts: int = 5) -> dict[str, Any]:
+    """Motor-only observation with retries (USB contention during homing + cameras)."""
+    last_err: Exception | None = None
+    for attempt in range(1, max(1, attempts) + 1):
+        try:
+            return robot.get_observation(include_cameras=False)
+        except ConnectionError as e:
+            last_err = e
+            if attempt < attempts:
+                time.sleep(0.05 * attempt)
+    assert last_err is not None
+    raise last_err
+
+
 def go_to_home_pose(
     robot: Any,
     home_pose: dict[str, float],
@@ -460,6 +570,7 @@ def go_to_home_pose(
     fps: float,
     timeout_s: float,
     precise_sleep: Any,
+    episode_deadline: float | None = None,
 ) -> None:
     """Rate-limited move to `robot.home_pose` joint targets (degrees)."""
     targets = {f"{name}.pos": deg for name, deg in home_pose.items()}
@@ -467,39 +578,183 @@ def go_to_home_pose(
     last_sent: dict[str, float] = {}
     dt = 1.0 / fps
     deadline = time.perf_counter() + timeout_s
+    if episode_deadline is not None:
+        deadline = min(deadline, episode_deadline)
+    paused_lerobot_cams = False
 
     print(f"Homing to saved pose ({len(keys)} joints, timeout={timeout_s:.0f}s)...")
-    while time.perf_counter() < deadline:
-        loop_start = time.perf_counter()
-        obs = robot.get_observation(include_cameras=False)
-        present = {k: float(obs[k]) for k in keys if k in obs}
+    if getattr(robot, "cameras", None):
+        from _opencv_camera_patch import pause_robot_cameras
 
-        clamped: dict[str, float] = {}
-        converged = True
-        for key, target in targets.items():
-            cap = _cap_for_joint_key(key)
-            prev = last_sent.get(key, present.get(key, target))
-            step = max(-cap, min(cap, target - prev))
-            clamped[key] = prev + step
-            if abs(clamped[key] - target) > _HOMING_TOL_DEG:
-                converged = False
+        pause_robot_cameras(robot)
+        paused_lerobot_cams = True
+    try:
+        while time.perf_counter() < deadline:
+            loop_start = time.perf_counter()
+            obs = _read_motor_observation(robot)
+            present = {k: float(obs[k]) for k in keys if k in obs}
 
-        command = {
-            key: present.get(key, tgt) + _HOMING_KP * (tgt - present.get(key, tgt))
-            for key, tgt in clamped.items()
-        }
-        _send_positions(robot, command, present=present)
-        last_sent = dict(command)
+            clamped: dict[str, float] = {}
+            converged = True
+            for key, target in targets.items():
+                cap = _cap_for_joint_key(key)
+                prev = last_sent.get(key, present.get(key, target))
+                step = max(-cap, min(cap, target - prev))
+                clamped[key] = prev + step
+                if abs(clamped[key] - target) > _HOMING_TOL_DEG:
+                    converged = False
 
-        if converged:
-            print("Home pose reached.")
-            return
+            command = {
+                key: present.get(key, tgt) + _HOMING_KP * (tgt - present.get(key, tgt))
+                for key, tgt in clamped.items()
+            }
+            _send_positions(robot, command, present=present)
+            last_sent = dict(command)
 
-        remaining = dt - (time.perf_counter() - loop_start)
-        if remaining > 0:
-            precise_sleep(remaining)
+            if converged:
+                print("Home pose reached.")
+                return
 
-    print("Warning: homing timed out; continuing anyway.")
+            remaining = dt - (time.perf_counter() - loop_start)
+            if remaining > 0:
+                precise_sleep(remaining)
+
+        if episode_deadline is not None and _episode_timed_out(episode_deadline):
+            print("Warning: homing stopped (episode wall-clock limit).")
+        else:
+            print("Warning: homing timed out; continuing anyway.")
+    finally:
+        if paused_lerobot_cams:
+            from _opencv_camera_patch import resume_lerobot_cameras
+
+            resume_lerobot_cameras(robot)
+
+
+def _episode_seconds_left(episode_deadline: float) -> float:
+    return episode_deadline - time.perf_counter()
+
+
+def _episode_timed_out(episode_deadline: float) -> bool:
+    return time.perf_counter() >= episode_deadline
+
+
+def _episode_limit_reason(
+    step: int,
+    episode_deadline: float,
+    args: argparse.Namespace,
+) -> str | None:
+    if _episode_timed_out(episode_deadline):
+        return f"wall-clock limit ({args.episode_time}s)"
+    if args.episode_steps is not None and step >= args.episode_steps:
+        return f"step limit ({args.episode_steps} steps)"
+    return None
+
+
+def _reset_policy_episode_state(
+    policy: Any,
+    preprocessor: Any,
+    postprocessor: Any,
+    *,
+    open_loop_steps: int,
+    last_sent: dict[str, float],
+    last_filtered: dict[str, float],
+    last_policy_smoothed: dict[str, float],
+    reason: str,
+) -> None:
+    """Clear PI0.5 action queue, processor state, and command smoothers."""
+    policy.reset()
+    preprocessor.reset()
+    postprocessor.reset()
+    last_sent.clear()
+    last_filtered.clear()
+    last_policy_smoothed.clear()
+    policy.config.n_action_steps = min(
+        int(open_loop_steps),
+        int(policy.config.chunk_size),
+    )
+    print(f"  Policy reset ({reason}).")
+
+
+def _maybe_log_episode_progress(
+    *,
+    episode_deadline: float,
+    episode_time_s: float,
+    step: int,
+    last_log_t: float,
+    interval_s: float = 30.0,
+) -> float:
+    """Print elapsed/remaining every interval_s; return updated last_log_t."""
+    now = time.perf_counter()
+    if now - last_log_t < interval_s:
+        return last_log_t
+    elapsed = episode_time_s - _episode_seconds_left(episode_deadline)
+    left = max(0.0, _episode_seconds_left(episode_deadline))
+    print(
+        f"  Episode progress: {elapsed:.0f}s / {episode_time_s}s "
+        f"({left:.0f}s left), step {step}"
+    )
+    return now
+
+
+def _brief_hold_pose(
+    robot: Any,
+    hold_cmd: dict[str, float],
+    *,
+    fps: float,
+    hold_s: float,
+    precise_sleep: Any,
+) -> None:
+    """Send the same pose for a short time so the arms decelerate before homing."""
+    n = max(1, int(hold_s * fps))
+    for _ in range(n):
+        _send_positions(robot, hold_cmd, present=hold_cmd)
+        precise_sleep(1.0 / fps)
+
+
+def _safe_finish_episode(
+    robot: Any,
+    home_pose: dict[str, float],
+    *,
+    reason: str,
+    fps: float,
+    home_timeout_s: float,
+    precise_sleep: Any,
+    hold_cmd: dict[str, float] | None,
+    hold_s: float = 0.5,
+    episode_deadline: float | None = None,
+    skip_home_after: bool = False,
+) -> None:
+    """Stop cleanly: brief hold, then home (if configured) before the next episode."""
+    print(f"Episode stop: {reason}")
+    if hold_cmd and (
+        episode_deadline is None or _episode_seconds_left(episode_deadline) > hold_s + 1.0
+    ):
+        try:
+            _brief_hold_pose(
+                robot, hold_cmd, fps=fps, hold_s=hold_s, precise_sleep=precise_sleep
+            )
+        except Exception as exc:
+            print(f"  Warning: hold pose failed: {exc}")
+    if home_pose and not skip_home_after:
+        if episode_deadline is not None and _episode_seconds_left(episode_deadline) < 3.0:
+            print("  Skipping post-episode homing (episode wall-clock limit).")
+        else:
+            post_home_timeout = home_timeout_s
+            if episode_deadline is not None:
+                post_home_timeout = min(
+                    home_timeout_s, max(1.0, _episode_seconds_left(episode_deadline) - 1.0)
+                )
+            try:
+                go_to_home_pose(
+                    robot,
+                    home_pose,
+                    fps=fps,
+                    timeout_s=post_home_timeout,
+                    precise_sleep=precise_sleep,
+                    episode_deadline=episode_deadline,
+                )
+            except Exception as exc:
+                print(f"  Warning: post-episode homing failed: {exc}")
 
 
 def _run_home_only(args: argparse.Namespace, cfg: dict[str, Any]) -> None:
@@ -513,7 +768,7 @@ def _run_home_only(args: argparse.Namespace, cfg: dict[str, Any]) -> None:
     if not args.strict_motors:
         patch_motors_bus_lenient()
 
-    robot = XLerobot(make_config(robot_id="xlerobot"))
+    robot = XLerobot(make_config(robot_id="xlerobot", use_cameras=False))
     _connect_robot_with_retries(robot)
     try:
         go_to_home_pose(
@@ -579,11 +834,26 @@ def main() -> None:
     print("=" * 60)
     print(f"  Policy checkpoint : {policy_path}")
     print(f"  Task              : {args.task}")
-    print(f"  Episodes          : {args.episodes} x <= {args.episode_time}s @ {args.fps} fps")
+    ep_lim = [f"<= {args.episode_time}s wall-clock"]
+    if args.episode_steps is not None:
+        ep_lim.append(f"<= {args.episode_steps} steps")
+    print(f"  Episodes          : {args.episodes} x ({', '.join(ep_lim)}, first wins) @ {args.fps} fps")
+    if args.episode_time >= 600 and args.episode_steps is None:
+        print(
+            f"  Warning           : --episode-time {args.episode_time}s is "
+            f"{args.episode_time / 60:.0f} min; did you mean --episode-steps {args.episode_time}?"
+        )
     print(f"  Action horizon    : {args.action_horizon} (chunk cap)")
-    print(f"  Open-loop steps   : {args.open_loop_steps} (re-infer interval)")
+    print(f"  Open-loop steps   : {args.open_loop_steps} (scheduled re-infer interval)")
     print(f"  Settle steps      : {args.settle_steps} (hold pose after homing)")
     print(f"  Replan blend      : {args.replan_blend}")
+    if args.replan_on_miss_deg > 0:
+        print(
+            f"  Replan on miss    : >{args.replan_on_miss_deg:.1f} deg for "
+            f"{args.replan_miss_steps} tick(s) → early re-infer"
+        )
+    else:
+        print("  Replan on miss    : disabled")
     if args.phase1_task and args.phase1_sec > 0:
         print(f"  Phase-1 task      : {args.phase1_task!r} for {args.phase1_sec}s")
     print(f"  Device            : {args.device}")
@@ -600,6 +870,11 @@ def main() -> None:
     print(f"  Policy EMA alpha  : {args.policy_ema_alpha}")
     print(f"  Command EMA alpha : {args.command_ema_alpha}")
     print(f"  Joint deadband    : {args.joint_deadband_deg} deg")
+    print(f"  Camera backend    : {args.camera_backend}")
+    print(
+        f"  Camera preview    : {args.show_cameras} "
+        "(resizable pygame window, Q/Esc closes preview only)"
+    )
     print("=" * 60)
     if args.dry_run:
         return
@@ -607,12 +882,35 @@ def main() -> None:
     home_pose = _read_home_pose(cfg) if not args.skip_home else {}
 
     _ensure_xlerobot_import()
-    from _xlerobot_loader import make_config, patch_motors_bus_lenient
+    from _camera_preview_window import CameraPreviewWindow
+    from _camera_utils import print_inference_camera_map
+    from _webapp_camera_session import attach_webapp_cameras_to_robot, detach_webapp_cameras_from_robot
+    from _xlerobot_loader import (
+        make_config,
+        patch_motors_bus_lenient,
+        patch_xlerobot_motors_only_connected,
+    )
     from lerobot.common.control_utils import predict_action
     from lerobot.policies.factory import make_pre_post_processors
     from lerobot.robots.xlerobot import XLerobot
     from lerobot.utils.robot_utils import precise_sleep
 
+    use_webapp_cameras = args.camera_backend == "webapp"
+    if not use_webapp_cameras:
+        print(
+            "Note: --camera-backend lerobot opens 3 V4L captures on the robot; "
+            "this often destabilizes right_wrist on a shared USB hub. "
+            "Prefer --camera-backend webapp (default) unless required."
+        )
+    patch_xlerobot_motors_only_connected()
+    if not use_webapp_cameras:
+        from _opencv_camera_patch import (
+            patch_opencv_camera_resilient,
+            patch_xlerobot_camera_observation,
+        )
+
+        patch_opencv_camera_resilient()
+        patch_xlerobot_camera_observation()
     if not args.strict_motors:
         patch_motors_bus_lenient()
 
@@ -637,12 +935,34 @@ def main() -> None:
         pretrained_path=str(policy_path),
     )
 
-    robot_cfg = make_config(robot_id="xlerobot")
+    robot_cfg = make_config(robot_id="xlerobot", use_cameras=not use_webapp_cameras)
     robot = XLerobot(robot_cfg)
     _connect_robot_with_retries(robot)
+    cam_session = None
+    if use_webapp_cameras:
+        from _camera_preflight import run_camera_preflight
+
+        run_camera_preflight(CONFIG_YAML)
+        cam_session = attach_webapp_cameras_to_robot(robot, warmup_s=3.0)
+    print_inference_camera_map(cfg, policy)
+    camera_preview: CameraPreviewWindow | None = None
+    if args.show_cameras:
+        preview_src: Any = cam_session if use_webapp_cameras else robot.cameras
+        camera_preview = CameraPreviewWindow(
+            preview_src, preview_fps=min(float(args.preview_fps), float(args.fps))
+        )
+        camera_preview.start()
     import lerobot.robots.xlerobot.xlerobot as xlerobot_module
 
     print(f"  XLerobot driver    : {xlerobot_module.__file__}")
+    print(
+        f"  Cameras            : {args.camera_backend} "
+        + (
+            "(CameraStream registry)"
+            if use_webapp_cameras
+            else "(LeRobot OpenCVCamera, RGB async_read)"
+        )
+    )
 
     dt = 1.0 / float(args.fps)
     vr_kp = _vr_kp(cfg)
@@ -662,142 +982,264 @@ def main() -> None:
 
         for ep in range(args.episodes):
             print(f"\n=== Episode {ep + 1}/{args.episodes} ===")
+            episode_deadline = time.perf_counter() + float(args.episode_time)
+            progress_log_t = 0.0
             if home_pose and args.home_before_episode:
+                pre_home_timeout = float(args.home_timeout)
+                if _episode_seconds_left(episode_deadline) < pre_home_timeout:
+                    pre_home_timeout = max(1.0, _episode_seconds_left(episode_deadline) - 1.0)
                 go_to_home_pose(
                     robot,
                     home_pose,
                     fps=float(args.fps),
-                    timeout_s=float(args.home_timeout),
+                    timeout_s=pre_home_timeout,
                     precise_sleep=precise_sleep,
+                    episode_deadline=episode_deadline,
                 )
-            policy.reset()
-            preprocessor.reset()
-            postprocessor.reset()
-            last_sent.clear()
-            last_filtered.clear()
-            last_policy_smoothed.clear()
-            policy.config.n_action_steps = min(
-                int(args.open_loop_steps),
-                int(policy.config.chunk_size),
+            _reset_policy_episode_state(
+                policy,
+                preprocessor,
+                postprocessor,
+                open_loop_steps=int(args.open_loop_steps),
+                last_sent=last_sent,
+                last_filtered=last_filtered,
+                last_policy_smoothed=last_policy_smoothed,
+                reason=f"episode {ep + 1} start",
             )
 
-            t_end = time.perf_counter() + args.episode_time
+            t_start = time.perf_counter()
             step = 0
             logged_action_debug = False
             settle_steps = max(0, int(args.settle_steps))
+            stop_reason: str | None = None
+            abort_run = False
+            miss_streak = 0
+            miss_replans = 0
 
-            while time.perf_counter() < t_end:
-                loop_start = time.perf_counter()
+            try:
+                while True:
+                    stop_reason = _episode_limit_reason(step, episode_deadline, args)
+                    if stop_reason:
+                        break
 
-                raw_obs = robot.get_observation()
-                present_dict = {f"{n}.pos": float(raw_obs[f"{n}.pos"]) for n in JOINT_ORDER}
+                    loop_start = time.perf_counter()
+                    try:
+                        raw_obs = robot.get_observation()
+                    except Exception as exc:
+                        stop_reason = f"observation failed: {exc}"
+                        break
+                    if _episode_timed_out(episode_deadline):
+                        stop_reason = f"wall-clock limit ({args.episode_time}s)"
+                        break
 
-                if step < settle_steps:
-                    hold_cmd = dict(present_dict)
-                    _send_positions(robot, hold_cmd, present=present_dict)
-                    last_sent = dict(hold_cmd)
-                    last_filtered = dict(hold_cmd)
+                    present_dict = {
+                        f"{n}.pos": float(raw_obs[f"{n}.pos"]) for n in JOINT_ORDER
+                    }
+
+                    if step < settle_steps:
+                        hold_cmd = dict(present_dict)
+                        _send_positions(robot, hold_cmd, present=present_dict)
+                        last_sent = dict(hold_cmd)
+                        last_filtered = dict(hold_cmd)
+                        step += 1
+                        remaining = dt - (time.perf_counter() - loop_start)
+                        if remaining > 0:
+                            precise_sleep(remaining)
+                        continue
+
+                    if step == settle_steps:
+                        _reset_policy_episode_state(
+                            policy,
+                            preprocessor,
+                            postprocessor,
+                            open_loop_steps=int(args.open_loop_steps),
+                            last_sent=last_sent,
+                            last_filtered=last_filtered,
+                            last_policy_smoothed=last_policy_smoothed,
+                            reason=f"episode {ep + 1} after settle",
+                        )
+
+                    try:
+                        obs_frame = _build_observation(raw_obs, JOINT_ORDER)
+                        task_prompt = _task_for_step(
+                            args, step=step, settle_steps=settle_steps, fps=float(args.fps)
+                        )
+                        queue_empty_before = len(getattr(policy, "_action_queue", ())) == 0
+                        action = predict_action(
+                            obs_frame,
+                            policy,
+                            device,
+                            preprocessor,
+                            postprocessor,
+                            use_amp=bool(getattr(policy.config, "use_amp", False)),
+                            task=task_prompt,
+                            robot_type=robot.name,
+                        )
+                    except Exception as exc:
+                        stop_reason = f"policy step failed: {exc}"
+                        break
+                    if _episode_timed_out(episode_deadline):
+                        stop_reason = f"wall-clock limit ({args.episode_time}s)"
+                        break
+
+                    action_dict = _actions_to_robot_dict(action, policy_joint_names)
+                    if args.policy_ema_alpha < 0.999:
+                        policy_ref = (
+                            last_policy_smoothed if last_policy_smoothed else action_dict
+                        )
+                        action_dict = _ema_command(
+                            action_dict, policy_ref, float(args.policy_ema_alpha)
+                        )
+                        last_policy_smoothed = dict(action_dict)
+                    if (
+                        queue_empty_before
+                        and last_filtered
+                        and args.replan_blend < 0.999
+                    ):
+                        action_dict = _blend_action_dict(
+                            action_dict, last_filtered, float(args.replan_blend)
+                        )
+                    shaped = _shape_action_like_recording(
+                        action_dict,
+                        present_dict,
+                        last_sent,
+                        kp=vr_kp,
+                    )
+                    final_cmd = shaped
+                    if args.clamp_to_present:
+                        max_rel_cfg = getattr(robot.config, "max_relative_target", None)
+                        if max_rel_cfg is not None:
+                            final_cmd = _clamp_max_relative(
+                                shaped, present_dict, float(max_rel_cfg)
+                            )
+                    final_cmd = _apply_joint_deadband(
+                        final_cmd, last_filtered, float(args.joint_deadband_deg)
+                    )
+                    final_cmd = _ema_command(
+                        final_cmd, last_filtered, float(args.command_ema_alpha)
+                    )
+                    if args.replan_on_miss_deg > 0 and last_filtered:
+                        exec_err = _max_tracking_error_deg(
+                            present_dict, last_filtered
+                        )
+                        if exec_err >= float(args.replan_on_miss_deg):
+                            miss_streak += 1
+                        else:
+                            miss_streak = 0
+                        if (
+                            miss_streak >= int(args.replan_miss_steps)
+                            and _flush_policy_action_queue(policy) > 0
+                        ):
+                            miss_streak = 0
+                            miss_replans += 1
+                    if not logged_action_debug:
+                        present = _build_state_vector(raw_obs, JOINT_ORDER)
+                        raw_cmd = np.array([action_dict[f"{n}.pos"] for n in JOINT_ORDER])
+                        shaped_cmd = np.array([shaped[f"{n}.pos"] for n in JOINT_ORDER])
+                        sent_cmd = np.array([final_cmd[f"{n}.pos"] for n in JOINT_ORDER])
+                        raw_delta = raw_cmd - present
+                        shaped_delta = shaped_cmd - present
+                        final_delta = sent_cmd - present
+                        print(
+                            f"  First step |policy-present| max={np.abs(raw_delta).max():.2f} deg "
+                            f"(raw policy, before VR shaping)"
+                        )
+                        print(
+                            f"  First step |shaped-present| max={np.abs(shaped_delta).max():.2f} deg "
+                            f"(after VR shaping only)"
+                        )
+                        sent_note = (
+                            "after present clamp"
+                            if args.clamp_to_present
+                            else "after EMA/deadband (VR caps only)"
+                        )
+                        print(
+                            f"  First step |sent-present|   max={np.abs(final_delta).max():.2f} deg "
+                            f"(final command {sent_note})"
+                        )
+                        for name, delta in _top_joint_deltas(final_cmd, present_dict):
+                            print(f"    sent delta {name}: {delta:+.2f} deg")
+                        logged_action_debug = True
+
+                    try:
+                        send_present = present_dict if args.clamp_to_present else None
+                        _send_positions(robot, final_cmd, present=send_present)
+                    except Exception as exc:
+                        stop_reason = f"motor command failed: {exc}"
+                        break
+
+                    last_sent = dict(final_cmd)
+                    last_filtered = dict(final_cmd)
+
                     step += 1
+                    progress_log_t = _maybe_log_episode_progress(
+                        episode_deadline=episode_deadline,
+                        episode_time_s=float(args.episode_time),
+                        step=step,
+                        last_log_t=progress_log_t,
+                    )
                     remaining = dt - (time.perf_counter() - loop_start)
                     if remaining > 0:
                         precise_sleep(remaining)
-                    continue
 
-                if step == settle_steps:
-                    policy.reset()
-                    preprocessor.reset()
-                    postprocessor.reset()
-                    last_sent.clear()
-                    last_filtered.clear()
-                    last_policy_smoothed.clear()
-
-                obs_frame = _build_observation(raw_obs, JOINT_ORDER)
-                task_prompt = _task_for_step(
-                    args, step=step, settle_steps=settle_steps, fps=float(args.fps)
-                )
-                queue_empty_before = len(getattr(policy, "_action_queue", ())) == 0
-                action = predict_action(
-                    obs_frame,
+            except Exception as exc:
+                stop_reason = f"unhandled error: {exc}"
+                abort_run = bool(args.stop_on_episode_error)
+                if abort_run:
+                    raise
+            finally:
+                elapsed = time.perf_counter() - t_start
+                hold = dict(last_filtered or last_sent)
+                _reset_policy_episode_state(
                     policy,
-                    device,
                     preprocessor,
                     postprocessor,
-                    use_amp=bool(getattr(policy.config, "use_amp", False)),
-                    task=task_prompt,
-                    robot_type=robot.name,
+                    open_loop_steps=int(args.open_loop_steps),
+                    last_sent=last_sent,
+                    last_filtered=last_filtered,
+                    last_policy_smoothed=last_policy_smoothed,
+                    reason=f"episode {ep + 1} end",
                 )
-                action_dict = _actions_to_robot_dict(action, policy_joint_names)
-                if args.policy_ema_alpha < 0.999:
-                    policy_ref = last_policy_smoothed if last_policy_smoothed else action_dict
-                    action_dict = _ema_command(
-                        action_dict, policy_ref, float(args.policy_ema_alpha)
-                    )
-                    last_policy_smoothed = dict(action_dict)
-                if queue_empty_before and last_filtered and args.replan_blend < 0.999:
-                    action_dict = _blend_action_dict(
-                        action_dict, last_filtered, float(args.replan_blend)
-                    )
-                shaped = _shape_action_like_recording(
-                    action_dict,
-                    present_dict,
-                    last_sent,
-                    kp=vr_kp,
+                _safe_finish_episode(
+                    robot,
+                    home_pose,
+                    reason=stop_reason or "episode loop ended",
+                    fps=float(args.fps),
+                    home_timeout_s=float(args.home_timeout),
+                    precise_sleep=precise_sleep,
+                    hold_cmd=hold if hold else None,
+                    episode_deadline=episode_deadline,
+                    skip_home_after=bool(args.skip_home_after_episode),
                 )
-                final_cmd = shaped
-                if args.clamp_to_present:
-                    max_rel_cfg = getattr(robot.config, "max_relative_target", None)
-                    if max_rel_cfg is not None:
-                        final_cmd = _clamp_max_relative(
-                            shaped, present_dict, float(max_rel_cfg)
-                        )
-                final_cmd = _apply_joint_deadband(
-                    final_cmd, last_filtered, float(args.joint_deadband_deg)
+                miss_note = (
+                    f", {miss_replans} early replan(s) on tracking miss"
+                    if miss_replans
+                    else ""
                 )
-                final_cmd = _ema_command(final_cmd, last_filtered, float(args.command_ema_alpha))
-                if not logged_action_debug:
-                    present = _build_state_vector(raw_obs, JOINT_ORDER)
-                    raw_cmd = np.array([action_dict[f"{n}.pos"] for n in JOINT_ORDER])
-                    shaped_cmd = np.array([shaped[f"{n}.pos"] for n in JOINT_ORDER])
-                    sent_cmd = np.array([final_cmd[f"{n}.pos"] for n in JOINT_ORDER])
-                    raw_delta = raw_cmd - present
-                    shaped_delta = shaped_cmd - present
-                    final_delta = sent_cmd - present
-                    print(
-                        f"  First step |policy-present| max={np.abs(raw_delta).max():.2f} deg "
-                        f"(raw policy, before VR shaping)"
-                    )
-                    print(
-                        f"  First step |shaped-present| max={np.abs(shaped_delta).max():.2f} deg "
-                        f"(after VR shaping only)"
-                    )
-                    sent_note = (
-                        "after present clamp"
-                        if args.clamp_to_present
-                        else "after EMA/deadband (VR caps only)"
-                    )
-                    print(
-                        f"  First step |sent-present|   max={np.abs(final_delta).max():.2f} deg "
-                        f"(final command {sent_note})"
-                    )
-                    for name, delta in _top_joint_deltas(final_cmd, present_dict):
-                        print(f"    sent delta {name}: {delta:+.2f} deg")
-                    logged_action_debug = True
+                print(
+                    f"Episode {ep + 1} done: {step} steps, {elapsed:.1f}s elapsed{miss_note}"
+                    + (f" ({stop_reason})" if stop_reason else "")
+                )
 
-                send_present = present_dict if args.clamp_to_present else None
-                _send_positions(robot, final_cmd, present=send_present)
-                last_sent = dict(final_cmd)
-                last_filtered = dict(final_cmd)
-
-                step += 1
-                remaining = dt - (time.perf_counter() - loop_start)
-                if remaining > 0:
-                    precise_sleep(remaining)
-
-            print(f"Episode {ep + 1} finished ({step} control steps).")
+            if abort_run:
+                break
     except KeyboardInterrupt:
         print("\nInterrupted by user.")
     finally:
-        robot.disconnect()
+        if camera_preview is not None:
+            try:
+                camera_preview.stop()
+            except Exception as exc:
+                print(f"Warning: camera preview stop: {exc}")
+        if cam_session is not None:
+            try:
+                detach_webapp_cameras_from_robot(robot)
+            except Exception as exc:
+                print(f"Warning: camera session teardown: {exc}")
+        try:
+            robot.disconnect()
+        except Exception as exc:
+            print(f"Warning: robot disconnect: {exc}")
 
 
 if __name__ == "__main__":

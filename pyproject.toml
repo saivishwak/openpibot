@@ -13,6 +13,7 @@ dependencies = [
     "mani-skill>=3.0.1",
     "openpi-client",
     "pynput>=1.8.2",
+    "pygame>=2.5.1,<2.7.0",
     "pyyaml>=6.0.3",
     "websockets>=16.0",
     "accelerate>=1.13.0",

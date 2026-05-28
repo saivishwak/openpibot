@@ -2067,7 +2067,11 @@ class VRTeleopSession:
                     converged = True
                     for pj, target_deg in arm.home_target.items():
                         cap = PER_TICK_DEG_CAPS.get(pj.removeprefix(prefix), 1.0)
-                        prev = arm.last_sent_targets.get(pj, present.get(pj, target_deg))
+                        # Use the measured present pose as the integration base.
+                        # If low-level safety clamps a prior command, `last_sent_targets`
+                        # can drift from what the motors actually followed, which can
+                        # keep re-requesting too-large jumps during homing.
+                        prev = present.get(pj, target_deg)
                         delta = max(-cap, min(cap, target_deg - prev))
                         clamped[pj] = prev + delta
                         if abs(clamped[pj] - target_deg) > HOMING_TOL_DEG:
@@ -2332,21 +2336,49 @@ class VRTeleopSession:
             for s in sides:
                 if not MOTORS.is_connected(s):
                     raise RuntimeError(f"{s} arm not connected")
-                target = {k: v for k, v in full_home.items()
-                          if k.startswith(f"{s}_arm_")}
+                target = {k: v for k, v in full_home.items() if k.startswith(f"{s}_arm_")}
                 if not target:
                     raise RuntimeError(
                         f"no home pose saved for {s} arm — capture one first"
                     )
                 arm = self._arms[s]
-                arm.home_target = target
+                present = MOTORS.read_positions(s)
+                if not present:
+                    raise RuntimeError(f"{s} arm position read failed")
+
+                # Clamp saved home targets to this arm's calibrated bounds so we
+                # don't queue unreachable goals that keep triggering low-level
+                # safety clamps forever.
+                bounded_target: dict[str, float] = {}
+                bounds = MOTORS.bounds
+                for pj, goal in target.items():
+                    lo, hi = bounds.get(pj, (-180.0, 180.0))
+                    safe_goal = max(lo, min(hi, float(goal)))
+                    if abs(safe_goal - float(goal)) > 1e-6:
+                        log.warning(
+                            "[%s] home target %s out of calibrated bounds: %.3f -> %.3f (bounds %.3f..%.3f)",
+                            s,
+                            pj,
+                            float(goal),
+                            safe_goal,
+                            lo,
+                            hi,
+                        )
+                    bounded_target[pj] = safe_goal
+
+                arm.home_target = bounded_target
+                # IMPORTANT: seed from present pose. If stale last_sent_targets
+                # are reused (e.g. from an earlier VR drive), homing can
+                # incorrectly mark itself converged immediately even though the
+                # arm is far from home.
+                arm.last_sent_targets = {pj: present.get(pj, v) for pj, v in bounded_target.items()}
                 arm.homing = True
                 arm.home_start_t = time.monotonic()
                 # While homing, don't accept VR drive on this arm.
                 if self._active_arm == s:
                     self._engaged = False
                     self._active_arm = None
-                log.info("[%s] go_home started; %d joint targets queued", s, len(target))
+                log.info("[%s] go_home started; %d joint targets queued", s, len(bounded_target))
         return self.status()
 
     def release_torque_for_posing(self, side: ArmSide) -> dict:

@@ -43,7 +43,82 @@ Frames are recorded **every drive-loop tick** (30 Hz) while recording is active,
 
 Episodes are written to `$HF_LEROBOT_HOME/<repo_id>/` (default `~/.cache/huggingface/lerobot/<repo_id>/`).
 
-If `push_to_hub: true`, the recorder pushes to the Hub on `emergency_stop` (which calls `finalize`).
+If `push_to_hub: true`, the webapp recorder pushes to the Hub when recording finalizes (e.g. on emergency stop). With the default `push_to_hub: false`, upload manually after recording (see below).
+
+## Push to Hugging Face Hub
+
+Use `scripts/push_dataset.py` to upload a finished local dataset. It reads `dataset.repo_id` (and optional `dataset.root`) from `config/xlerobot.yaml` by default.
+
+**Prerequisites**
+
+- Recording is finished and flushed (episodes on disk under the local root).
+- The folder is a valid LeRobot dataset (`meta/info.json` must exist).
+- Hugging Face CLI login with write access to the target dataset repo:
+
+```bash
+hf auth login
+```
+
+**Default upload** (uses `repo_id` from `config/xlerobot.yaml`, e.g. `saivishwak/xlerobot-vr-teleop-medicine-bowl`):
+
+```bash
+cd /path/to/xlerobot
+
+# Show resolved repo id and local path without uploading
+uv run python scripts/push_dataset.py --dry-run
+
+# Upload
+uv run python scripts/push_dataset.py
+```
+
+Local root resolution (when `--root` is omitted):
+
+1. `dataset.root` in `config/xlerobot.yaml`, if set
+2. Else `$HF_LEROBOT_HOME/<repo_id>`
+3. Else `~/.cache/huggingface/lerobot/<repo_id>`
+
+**Explicit repo or path**
+
+```bash
+uv run python scripts/push_dataset.py \
+  --repo-id saivishwak/xlerobot-vr-teleop-medicine-bowl
+
+uv run python scripts/push_dataset.py \
+  --repo-id saivishwak/xlerobot-vr-teleop-medicine-bowl \
+  --root /custom/path/to/dataset
+```
+
+On success you should see:
+
+```text
+Uploaded dataset to https://huggingface.co/datasets/<repo_id>
+```
+
+**Large datasets (~500 MiB+, many videos)** — The script auto-selects `upload_large_folder` (resumable, parallel). For a ~3 GiB dataset this avoids `upload_folder` stalling around 50–70%.
+
+```bash
+uv run python scripts/push_dataset.py \
+  --repo-id saivishwak/xlerobot-vr-teleop-medicine-bowl \
+  --root ~/.cache/huggingface/lerobot/saivishwak/xlerobot-vr-teleop-medicine-bowl \
+  --large \
+  --num-workers 4
+```
+
+If an upload **hangs or stalls** (e.g. stuck at 62%):
+
+1. **Ctrl+C** the stuck process.
+2. Re-run the **same** command — large-folder mode skips files already on the Hub.
+3. Use `--dry-run` first to confirm `Upload mode: upload_large_folder (resumable)`.
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--large` / `--no-large` | auto (>500 MiB) | Resumable `upload_large_folder` vs plain `upload_folder` |
+| `--num-workers` | `4` | Parallel uploads (large mode only) |
+| `--private` | off | Create private Hub dataset |
+| `--no-videos` | off | Skip `videos/` (parquet only; faster test) |
+| `--dry-run` | off | Print paths, size, upload mode; no upload |
+
+**Task labels** — Before training, confirm episode prompts in `meta/tasks.parquet` and per-episode `tasks` in `meta/episodes/` match what you intend (e.g. one consistent string per episode for medicine→bowl demos).
 
 ## Stopping cleanly
 
@@ -56,17 +131,20 @@ If `push_to_hub: true`, the recorder pushes to the Hub on `emergency_stop` (whic
 Quick sanity check before viewing
 
 ```bash
+# Set REPO to match dataset.repo_id in config/xlerobot.yaml
+REPO=saivishwak/xlerobot-vr-teleop-medicine-bowl
+
 # Confirm episodes are on disk
-ls ~/.cache/huggingface/lerobot/saivishwak/xlerobot-vr-teleop/data/chunk-000/
+ls ~/.cache/huggingface/lerobot/$REPO/data/chunk-000/
 # -> file-000.parquet
 
 # Confirm v3 episode metadata exists
-ls ~/.cache/huggingface/lerobot/saivishwak/xlerobot-vr-teleop/meta/episodes/
+ls ~/.cache/huggingface/lerobot/$REPO/meta/episodes/
 # -> chunk-000/file-000.parquet
 
 # Open viewer for the most recent
-uv run python scripts/lerobot_dataset_viz_main.py --repo-id saivishwak/xlerobot-vr-teleop \
-  --episode-index $(ls ~/.cache/huggingface/lerobot/saivishwak/xlerobot-vr-teleop/data/chunk-000/ |
+uv run python scripts/lerobot_dataset_viz_main.py --repo-id $REPO \
+  --episode-index $(ls ~/.cache/huggingface/lerobot/$REPO/data/chunk-000/ |
 wc -l | awk '{print $1-1}')
 ```
 
@@ -74,6 +152,6 @@ Use the project wrapper instead of calling `lerobot-dataset-viz` directly. The v
 
 ```bash
 LEROBOT_DATASET_REVISION=my-branch uv run python scripts/lerobot_dataset_viz_main.py \
-  --repo-id saivishwak/xlerobot-vr-teleop \
+  --repo-id saivishwak/xlerobot-vr-teleop-medicine-bowl \
   --episode-index 0
 ```

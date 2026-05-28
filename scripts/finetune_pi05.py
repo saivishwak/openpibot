@@ -59,7 +59,20 @@ def _parse_args() -> argparse.Namespace:
         "--oom-safe",
         action=argparse.BooleanOptionalAction,
         default=True,
-        help="Enable low-memory training settings (default: enabled). Use --no-oom-safe to disable.",
+        help=(
+            "Cap batch size at 2 for low VRAM (default: on). "
+            "Does not control which layers train — use --train-expert-only / --no-train-expert-only."
+        ),
+    )
+    p.add_argument(
+        "--train-expert-only",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Freeze vision encoder and train the PI0 expert / action head only (default: on). "
+            "Use --no-train-expert-only for full finetune (vision + expert). "
+            "Works with --no-oom-safe and your chosen --batch-size."
+        ),
     )
     p.add_argument(
         "--cuda-alloc-conf",
@@ -114,7 +127,7 @@ def _resolve_resume_config_path(args: argparse.Namespace) -> pathlib.Path:
     )
 
 
-def _build_cmd(args: argparse.Namespace) -> tuple[list[str], pathlib.Path | None]:
+def _build_cmd(args: argparse.Namespace) -> tuple[list[str], pathlib.Path | None, int]:
     if args.resume:
         config_path = _resolve_resume_config_path(args)
         cmd = [
@@ -124,7 +137,7 @@ def _build_cmd(args: argparse.Namespace) -> tuple[list[str], pathlib.Path | None
             f"--config_path={config_path}",
             "--resume=true",
         ]
-        return cmd, config_path
+        return cmd, config_path, args.batch_size
 
     try:
         rename_map = json.loads(args.rename_map_json)
@@ -133,13 +146,12 @@ def _build_cmd(args: argparse.Namespace) -> tuple[list[str], pathlib.Path | None
     rename_map_json = json.dumps(rename_map, separators=(",", ":"))
 
     effective_batch_size = args.batch_size
-    freeze_vision = "false"
-    train_expert_only = "false"
     if args.oom_safe:
-        # PI0.5 full finetuning is memory-heavy on 24GB cards; default to safer settings.
         effective_batch_size = min(args.batch_size, 2)
-        freeze_vision = "true"
-        train_expert_only = "true"
+
+    expert_only = bool(args.train_expert_only)
+    freeze_vision = "true" if expert_only else "false"
+    train_expert_only = "true" if expert_only else "false"
 
     cmd = [
         "uv",
@@ -168,17 +180,27 @@ def _build_cmd(args: argparse.Namespace) -> tuple[list[str], pathlib.Path | None
         cmd.append("--policy.push_to_hub=true")
         if args.policy_repo_id:
             cmd.append(f"--policy.repo_id={args.policy_repo_id}")
-    return cmd, None
+    return cmd, None, effective_batch_size
 
 
 def main() -> None:
     args = _parse_args()
-    cmd, resume_cfg = _build_cmd(args)
+    cmd, resume_cfg, effective_batch_size = _build_cmd(args)
     print("Running:\n  " + " \\\n  ".join(shlex.quote(x) for x in cmd))
     if args.resume and resume_cfg is not None:
         print(f"Resume mode enabled from: {resume_cfg}")
-    elif args.oom_safe:
-        print("OOM-safe mode enabled: batch_size capped at 2, vision encoder frozen, expert-only training enabled.")
+    else:
+        if args.oom_safe and effective_batch_size < args.batch_size:
+            print(
+                f"OOM-safe: batch_size capped at {effective_batch_size} "
+                f"(requested {args.batch_size})."
+            )
+        elif not args.oom_safe:
+            print(f"OOM-safe off: using batch_size={effective_batch_size}.")
+        if args.train_expert_only:
+            print("Training scope: vision frozen, expert/action head only.")
+        else:
+            print("Training scope: full finetune (vision encoder + expert).")
     if args.dry_run:
         return
     env = dict(os.environ)
