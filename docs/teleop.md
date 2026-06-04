@@ -47,7 +47,7 @@ Each arm still needs its own calibration and grip-anchor. If one side is not anc
 
 ## Speed slider
 
-Default is **1.0** (true 1:1 hand-to-EE motion). Drop to 0.5 for fine work. The per-tick joint caps are the hard safety limit underneath.
+Default is **0.5** for fine control on the SO-101's small workspace. Raise toward 1.0 for faster true-scale hand-to-EE motion. The per-tick joint caps are the hard safety limit underneath.
 
 ## Motion mapping
 
@@ -79,7 +79,7 @@ vr:
 
 - **EMERGENCY STOP** button (top of page) — instantly disables torque on both arms. The robot freezes wherever it is.
 - **Watchdog** — if VR goals stop arriving (controller down, Wi-Fi blip), the drive loop stops within 0.3 s.
-- **Per-tick joint caps** — max joint speeds capped (e.g. shoulder_pan 60°/s). Independent of the speed slider.
+- **Per-tick joint caps** — max joint speeds capped (e.g. shoulder_pan 5°/tick at 30 Hz = 150°/s). Independent of the speed slider.
 - **No autonomous motion**, ever. Disconnect = torque off, no homing. The only motion the app initiates is the user-clicked *Go to Home*.
 
 See [troubleshooting.md](troubleshooting.md) if motion feels wrong or doesn't happen.

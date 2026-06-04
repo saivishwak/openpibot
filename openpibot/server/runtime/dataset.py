@@ -64,6 +64,10 @@ class DatasetRecorder:
         from lerobot.datasets.lerobot_dataset import LeRobotDataset
 
         self._lock = threading.Lock()
+        # Serializes writes/finalize calls on the underlying LeRobotDataset.
+        # The VR drive loop can be preparing a frame while a UI/B-button stop
+        # ends the episode; this prevents add_frame/save/finalize interleaving.
+        self._io_lock = threading.Lock()
         self.repo_id = repo_id
         self.fps = int(fps)
         self.camera_roles = list(camera_roles)
@@ -239,7 +243,8 @@ class DatasetRecorder:
         # Save outside the lock — save_episode does I/O + may take a while
         # (especially with batch_encoding_size=1, the video gets encoded now).
         try:
-            self._dataset.save_episode()
+            with self._io_lock:
+                self._dataset.save_episode()
             with self._lock:
                 self._episode_count = episode_count
                 self._last_saved_episode_index = episode_count - 1
@@ -285,7 +290,8 @@ class DatasetRecorder:
                 frame[f"observation.images.{role}"] = img
 
             try:
-                self._dataset.add_frame(frame)
+                with self._io_lock:
+                    self._dataset.add_frame(frame)
                 self._frame_count += 1
             except Exception as e:
                 # Don't bring down the drive loop on a single bad frame.
@@ -309,12 +315,14 @@ class DatasetRecorder:
                 # Save the in-flight episode before finalizing.
                 self._in_episode = False
                 try:
-                    self._dataset.save_episode()
+                    with self._io_lock:
+                        self._dataset.save_episode()
                     self._episode_count += 1
                 except Exception as e:
                     log.warning("finalize: save_episode failed: %s", e)
         try:
-            self._dataset.finalize()
+            with self._io_lock:
+                self._dataset.finalize()
             log.info("dataset finalized; %d episode(s) at %s",
                      self._episode_count, self._dataset.root)
         except Exception as e:

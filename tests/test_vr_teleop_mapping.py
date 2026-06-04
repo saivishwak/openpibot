@@ -30,6 +30,11 @@ def _six_axis_samples(matrix):
     return [_sample(label, delta, matrix @ delta) for label, delta in axes.items()]
 
 
+def _mark_urdf_available(arm):
+    arm.kinematics = object()
+    arm.using_analytical_fallback = False
+
+
 class _BoundsOnlyMotors:
     bounds = {
         f"right_arm_{joint}": (-180.0, 180.0)
@@ -430,6 +435,54 @@ def test_dual_arm_relative_offsets_are_independent(monkeypatch):
     np.testing.assert_allclose(session._arms["right"].vr_offset_accum, (0.01, 0.0, 0.0))
 
 
+def test_invert_lateral_keeps_controller_to_ee_wrist_alignment(monkeypatch):
+    session = vr.VRTeleopSession()
+    monkeypatch.setattr(vr, "MOTORS", _BoundsOnlyMotors())
+    monkeypatch.setattr(vr, "POS_EMA_ALPHA", 1.0)
+    monkeypatch.setattr(vr, "MAX_EE_STEP_M", 1.0)
+    monkeypatch.setattr(vr, "POS_DEADZONE_M", 0.0)
+
+    arm = session._arms["right"]
+    arm.using_analytical_fallback = True
+    arm.session_vr_to_robot = np.eye(3)
+    arm.invert_lateral = True
+    arm.controller_anchor_T = vr._pose_matrix_from_vr((0.0, 0.0, 0.0), (0.0, 0.0, 0.0, 1.0))
+    arm.vr_ctrl_to_ee = vr._R.from_euler("z", 90, degrees=True)
+    arm.anchor_ee_pos = (0.20, 0.0, 0.05)
+    arm.anchor_R_robot = np.eye(3)
+    arm.smoothed_R_target = np.eye(3)
+    arm.target_R_robot = np.eye(3)
+    arm.anchor = vr._AnchorPose(
+        shoulder_lift_deg=-60.0,
+        elbow_flex_deg=45.0,
+        wrist_flex_deg=20.0,
+        wrist_roll_deg=0.0,
+        captured=True,
+    )
+
+    session._compute_targets_from_vr(
+        "right",
+        vr._LatestGoal(
+            received_at=1.0,
+            has_data=True,
+            mode="position",
+            rel_position=(0.0, 0.0, 0.0),
+            controller_position=(0.0, 0.0, 0.0),
+            rotation_quat=(0.0, 0.0, 0.0, 1.0),
+            trigger=False,
+        ),
+        scale=1.0,
+    )
+
+    pitch_axis, _ = vr._effective_wrist_axes(
+        "right",
+        pitch_canonical=arm.wrist_pitch_canonical,
+        roll_canonical=arm.wrist_roll_canonical,
+    )
+    expected_pitch = arm.vr_ctrl_to_ee.apply(pitch_axis)
+    np.testing.assert_allclose(arm.last_diag["wrist_axes"]["pitch"], expected_pitch, atol=1e-6)
+
+
 def test_robot_verification_rejects_absolute_pose_fallback_without_relative_motion(monkeypatch):
     session = vr.VRTeleopSession()
     monkeypatch.setattr(vr, "MOTORS", _BoundsOnlyMotors())
@@ -534,10 +587,30 @@ def test_robot_verification_requires_named_six_directions():
         session._solve_robot_verified_calibration(arm)
 
 
+def test_robot_verification_start_requires_urdf_kinematics(monkeypatch):
+    session = vr.VRTeleopSession()
+    monkeypatch.setattr(vr, "MOTORS", _BoundsOnlyMotors())
+    monkeypatch.setattr(vr, "_load_urdf_kinematics", lambda: None)
+
+    with pytest.raises(RuntimeError, match="URDF kinematics unavailable"):
+        session.start_robot_verification("right")
+
+
+def test_recording_blocker_requires_urdf_kinematics(monkeypatch):
+    session = vr.VRTeleopSession()
+    monkeypatch.setattr(vr, "MOTORS", _BoundsOnlyMotors())
+    monkeypatch.setattr(vr, "_load_urdf_kinematics", lambda: None)
+
+    blockers = session._recording_calibration_blockers()
+
+    assert any("URDF kinematics missing" in blocker for blocker in blockers)
+
+
 def test_recording_blocker_requires_good_robot_verification(monkeypatch):
     session = vr.VRTeleopSession()
     monkeypatch.setattr(vr, "MOTORS", _BoundsOnlyMotors())
     arm = session._arms["right"]
+    _mark_urdf_available(arm)
     arm.cal_confidence = "good"
     arm.robot_verify_quality = "needs_recapture"
     arm.robot_verify_fit_error_cm = vr.ROBOT_VERIFY_PASS_ERROR_CM + 0.1
@@ -551,6 +624,7 @@ def test_recording_blocker_requires_low_scale_test_after_good_verification(monke
     session = vr.VRTeleopSession()
     monkeypatch.setattr(vr, "MOTORS", _BoundsOnlyMotors())
     arm = session._arms["right"]
+    _mark_urdf_available(arm)
     arm.cal_confidence = "good"
     arm.robot_verify_quality = "good"
     arm.robot_verify_fit_error_cm = 0.0
@@ -564,6 +638,7 @@ def test_recording_blocker_clears_after_low_scale_test_completed(monkeypatch):
     session = vr.VRTeleopSession()
     monkeypatch.setattr(vr, "MOTORS", _BoundsOnlyMotors())
     arm = session._arms["right"]
+    _mark_urdf_available(arm)
     arm.cal_confidence = "good"
     arm.robot_verify_quality = "good"
     arm.robot_verify_fit_error_cm = 0.0

@@ -83,11 +83,11 @@ Stage 1 is still useful for quick manual teleop, but training data should use th
 1. Finish stage 1 VR calibration first.
 2. Click **Start verification**. Torque is released for hand-posing; support the arm.
 3. For each sample, capture a paired motion:
-   - Place the robot end effector at the neutral pose and click **Robot neutral**.
-   - Move the robot end effector to the target pose and click **Robot target**. The arm locks there.
-   - Hold the VR controller comfortably and click **Set VR neutral**. This is only a temporary anchor for this sample.
+   - Place the robot end effector at the neutral pose and click **Robot start**.
+   - Move the robot end effector to the target pose and click **Robot end**. The arm locks there.
+   - Hold the VR controller comfortably and click **VR start**. This is only a temporary anchor for this sample.
    - Move the VR controller through the same relative motion. Watch the live target/mapped/error feedback.
-   - When the live match is good, click **Capture VR move**. The sample is saved and torque releases again for the next hand-posed sample.
+   - When the live match is good, click **VR end**. The sample is saved and torque releases again for the next hand-posed sample.
    - If torque is locked and you need to redo or start the next robot pose, click **Release for posing** in the Robot verification card.
 4. Capture at least six samples near the grasp workspace: forward, back, left, right, up, down.
 5. Click **Solve verification**. The backend fits a robot-verified translation matrix, keeps the stage-1 rotation for wrist/orientation, computes RMS residual error, and saves the result. If the solve fails, the card lists per-sample residuals so you can recapture the bad directions instead of guessing.
@@ -115,8 +115,9 @@ robot_target = robot_anchor + translation_vr_to_robot_matrix @ integrated_relati
 
 **Stage 1 vs stage 2 in config**: before you run Robot verification, the YAML
 will show `calibration_mode: vr_direction`. That is expected. It changes to
-`robot_verified` only after you capture all six directions, solve successfully,
-and complete the low-scale test for that arm.
+`robot_verified` after you capture all six directions and solve successfully.
+The low-scale test is a per-session safety gate before recording; it is not
+persisted as part of the calibration file.
 
 ## Files written
 

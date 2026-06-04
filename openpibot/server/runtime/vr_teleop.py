@@ -2382,6 +2382,15 @@ class VRTeleopSession:
             arm.using_analytical_fallback = arm.kinematics is None
         return arm.kinematics is not None
 
+    def _require_urdf_kinematics(self, side: ArmSide, context: str) -> None:
+        """Dataset-quality calibration/recording must use calibrated URDF FK/IK."""
+        arm = self._arms[side]
+        if not self._ensure_kinematics(arm):
+            raise RuntimeError(
+                f"{side} calibrated SO101 URDF kinematics unavailable; cannot {context}. "
+                "Install/load the calibrated URDF path before robot verification or recording."
+            )
+
     def _current_ee_transform(self, side: ArmSide) -> _np.ndarray:
         """Read current joints and return the estimated gripper-frame pose."""
         if not MOTORS.is_connected(side):
@@ -3314,6 +3323,7 @@ class VRTeleopSession:
             if self._recording:
                 raise RuntimeError("stop dataset recording before robot verification")
             arm = self._arms[side]
+            self._require_urdf_kinematics(side, "start robot verification")
             if arm.cal_state != "idle":
                 raise RuntimeError("finish or cancel the VR calibration wizard before robot verification")
             for other in self._arms.values():
@@ -3503,6 +3513,7 @@ class VRTeleopSession:
     def solve_robot_verification(self, side: ArmSide) -> dict:
         with self._lock:
             arm = self._arms[side]
+            self._require_urdf_kinematics(side, "solve robot verification")
             missing_labels = self._missing_robot_verification_labels(arm)
             if missing_labels:
                 raise RuntimeError(
@@ -4083,6 +4094,8 @@ class VRTeleopSession:
             return ["connect at least one arm"]
         for side in connected:
             arm = self._arms[side]
+            if not self._ensure_kinematics(arm):
+                blockers.append(f"{side} calibrated URDF kinematics missing")
             if arm.robot_verify_test_active:
                 blockers.append(f"{side} low-scale calibration test is still active")
             if arm.cal_confidence in ("poor", "legacy"):
@@ -4267,11 +4280,14 @@ class VRTeleopSession:
             D = _np.diag([1.0, -1.0, 1.0])
             R_delta_robot = _project_to_rotation_matrix(D @ R_delta_robot @ D)
 
-        if arm.vr_ctrl_to_ee is not None and current_pos is not None and not arm.invert_lateral:
+        if arm.vr_ctrl_to_ee is not None and current_pos is not None:
             try:
                 R_current_vr = _R.from_quat(_positive_quat_xyzw(_np.array(current_q, dtype=float)))
                 R_ctrl_in_robot = _R.from_matrix(_project_to_rotation_matrix(M)) * R_current_vr
                 R_raw = _project_to_rotation_matrix(R_ctrl_in_robot.as_matrix() @ arm.vr_ctrl_to_ee.inv().as_matrix())
+                if arm.invert_lateral:
+                    D = _np.diag([1.0, -1.0, 1.0])
+                    R_raw = _project_to_rotation_matrix(D @ R_raw @ D)
             except Exception:
                 R_raw = _project_to_rotation_matrix(arm.anchor_R_robot @ R_delta_robot)
         else:
@@ -4387,7 +4403,7 @@ class VRTeleopSession:
             pitch_canonical=arm.wrist_pitch_canonical,
             roll_canonical=arm.wrist_roll_canonical,
         )
-        if arm.vr_ctrl_to_ee is not None and not arm.invert_lateral:
+        if arm.vr_ctrl_to_ee is not None:
             wrist_rotvec_local = _np.asarray(_R.from_matrix(R_wrist_delta).as_rotvec(), dtype=float)
             pitch_axis = _np.asarray(arm.vr_ctrl_to_ee.apply(pitch_axis), dtype=float)
             roll_axis = _np.asarray(arm.vr_ctrl_to_ee.apply(roll_axis), dtype=float)
