@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Strict PI05 checkpoint loader with local key-compat handling.
 
-This module keeps PI05 weight-compat logic in the root repo so we don't need to
-patch the `lerobot` submodule.
+This module keeps PI05 weight-compat logic in the root repo so we don't patch
+the package-managed LeRobot installation.
 """
 
 from __future__ import annotations

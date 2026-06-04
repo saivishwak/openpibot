@@ -5,10 +5,10 @@ One-time install + hardware config for a bimanual SO-101 XLeRobot.
 ## Install
 
 ```bash
-make setup
+uv sync
 ```
 
-This pulls submodules (`lerobot`, `XLeRobot`, `XLerobot_xuweiwu`, `openpi`), installs Python deps in a `.venv`, and prints any hardware checks that fail.
+This prepares the OpenPIBot CLI, backend, dashboard runtime, LeRobot dataset tooling, and PI0.5 training/inference dependencies. The optional OpenPI WebSocket policy server is started through `uv` from a package-managed OpenPI runtime instead of a vendored checkout.
 
 ## Configure `config/xlerobot.yaml`
 
@@ -44,12 +44,7 @@ uv run lerobot-calibrate \
 
 Repeat for the right arm.
 
-**One known gotcha**: lerobot's calibration sometimes captures a `range_min == range_max` for the gripper if you don't move it through its full open↔close cycle. Fix with:
-
-```bash
-uv run python scripts/calibrate_gripper.py --arm right
-uv run python scripts/calibrate_gripper.py --arm left
-```
+**One known gotcha**: lerobot's calibration sometimes captures a `range_min == range_max` for the gripper if you don't move it through its full open↔close cycle. If that happens, re-run `lerobot-calibrate` for that arm and move the gripper through its full open/close range during calibration.
 
 ## Add yourself to `dialout`
 
@@ -58,12 +53,14 @@ sudo usermod -aG dialout $USER
 newgrp dialout         # picks up the group in this shell
 ```
 
-Required for `/dev/ttyACM*` access. Without it the webapp can't open the motor bus.
+Required for `/dev/ttyACM*` access. Without it the dashboard can't open the motor bus.
 
-## Run the webapp
+## Run the dashboard
 
 ```bash
-make webapp     # http://localhost:5000
+uv run openpibot run --host 0.0.0.0
 ```
+
+The run command installs frontend dependencies with `pnpm`, builds the dashboard, and starts the backend. Use `--no-build-dashboard` only when you are running the Vite dev server separately.
 
 That's it. Open the page, connect an arm, follow [teleop.md](teleop.md).

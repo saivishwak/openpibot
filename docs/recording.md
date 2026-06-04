@@ -21,29 +21,35 @@ dataset:
   fps: 30
   push_to_hub: false                  # set true to push to HF after finalizing
   home_before_episode: true           # auto-home all arms at start of each episode
+  allow_unverified_vr_recording: false # keep false for training data
 ```
 
 Set camera roles on the **Cameras page** (not the Teleop page). Each camera needs a role for it to be included as an `observation.images.*` feature.
 
 ## Recording flow
 
-1. Connect both arms, calibrate VR (once, see [calibration.md](calibration.md)).
-2. Capture home pose (once, see [calibration.md](calibration.md)).
-3. Set a task description. Either via API or the dataset config's `task_default`.
-4. **Press B** on the right controller — or click *Start recording* in the UI.
+1. Select or create the correct **Calibration Profile** for the current user/setup.
+2. Connect both arms, run stage 1 VR calibration, then run robot verification for every connected arm (see [calibration.md](calibration.md)).
+3. Run **Start low-scale test** on each verified arm and confirm the robot moves forward/left/up the same way your controller moves. Stop the test before recording.
+4. Capture home pose (once, see [calibration.md](calibration.md)).
+5. Set a task description. Either via API or the dataset config's `task_default`.
+6. **Press B** on the right controller — or click *Start recording* in the UI.
    - If `home_before_episode: true`, all arms slowly move to home first.
+   - If robot verification is missing/poor, or the low-scale test has not been completed for a connected arm, recording is blocked.
    - Then a new episode opens.
-5. Squeeze grip + perform the demonstration.
-6. **Press B again** — episode is saved to disk.
-7. Repeat for as many episodes as you want.
+7. Squeeze grip + perform the demonstration.
+8. **Press B again** — episode is saved to disk.
+9. Repeat for as many episodes as you want.
 
 Frames are recorded **every drive-loop tick** (30 Hz) while recording is active, regardless of whether you're actively teleoperating that tick. Passive arms still contribute their `observation.state`.
+
+For quick manual testing, VR-only calibration can still drive the robot. For VLA training data, use robot-verified calibration so the recorded joint actions match the intended end-effector motion.
 
 ## Where it lives
 
 Episodes are written to `$HF_LEROBOT_HOME/<repo_id>/` (default `~/.cache/huggingface/lerobot/<repo_id>/`).
 
-If `push_to_hub: true`, the webapp recorder pushes to the Hub when recording finalizes (e.g. on emergency stop). With the default `push_to_hub: false`, upload manually after recording (see below).
+If `push_to_hub: true`, the dashboard recorder pushes to the Hub when recording finalizes (e.g. on emergency stop). With the default `push_to_hub: false`, upload manually after recording (see below).
 
 ## Push to Hugging Face Hub
 

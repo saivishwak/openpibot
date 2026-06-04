@@ -13,7 +13,7 @@ from typing import TYPE_CHECKING, Any
 import numpy as np
 
 if TYPE_CHECKING:
-    from _webapp_camera_session import WebappCameraSession
+    from _dashboard_camera_session import DashboardCameraSession
 
 log = logging.getLogger(__name__)
 
@@ -58,7 +58,7 @@ class CameraPreviewWindow:
 
     def __init__(
         self,
-        source: WebappCameraSession | dict[str, Any],
+        source: DashboardCameraSession | dict[str, Any],
         *,
         preview_fps: float = 15.0,
         tile_width: int = 426,  # unused; kept for API compat

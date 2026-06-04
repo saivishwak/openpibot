@@ -1,27 +1,37 @@
 # VR→robot calibration data. Auto-managed by the calibration wizard in
-# the webapp — edit by re-running the wizard, not by hand.
+# the dashboard — edit by re-running the wizard, not by hand.
+# Multiple user/setup profiles live under profiles.<name>.
 # Wrist-motor polarity lives in config/xlerobot.yaml (vr.wrist_motor_polarity).
-left:
-  session_vr_to_robot:
-  - [-0.12019436051621635, 0.06684882923313075, 0.9904971225249757]
-  - [0.9917199619524926, 0.05353178889909433, 0.11672987896082611]
-  - [-0.045219827123111095, 0.9963260418193546, -0.07272953751766517]
-  calibrated_at: '2026-05-25T20:10:38'
-  forward_motion_m: 0.40759809745742487
-  up_motion_m: 0.32333766488219123
-  left_motion_m: 0.3234007319092264
-  confidence: good
-  invert_lateral: false
-  wrist_pitch_anchor_local: [-0.9890380555047216, -0.07109658357179229, -0.12941792985463127]
-right:
-  session_vr_to_robot:
-  - [-0.036968858955322315, 0.08454022676569374, 0.9957340275022978]
-  - [0.9982036163388582, 0.05013417599019442, 0.032804035206204736]
-  - [-0.047147044399062935, 0.9951580349151531, -0.08624176336464555]
-  calibrated_at: '2026-05-25T20:10:59'
-  forward_motion_m: 0.33583895328006086
-  up_motion_m: 0.3391619511600858
-  left_motion_m: 0.2939328596622544
-  confidence: good
-  invert_lateral: false
-  wrist_pitch_anchor_local: [0.9511274904593783, -0.20279121316519838, -0.23287812425264984]
+active_profile: default
+profiles:
+  default:
+    left:
+      calibration_mode: vr_direction
+      wrist_canonical_frame: raw_controller_anchor_local
+      session_vr_to_robot:
+      - [-0.9722744853699896, 0.09614983908589922, -0.2131608161512744]
+      - [-0.21316311023273732, 0.010367999123466823, 0.9769616128743656]
+      - [0.09614475302598473, 0.9953128719342131, 0.010415057735842257]
+      calibrated_at: '2026-06-04T21:22:52'
+      forward_motion_m: 0.2844325361487351
+      up_motion_m: 0.24560386623553404
+      left_motion_m: 0.2791860682127085
+      confidence: good
+      invert_lateral: false
+      wrist_pitch_anchor_local: [0.9899836940807587, -0.01785213810235029, 0.1400485152345049]
+      wrist_roll_anchor_local: [0.281458783442265, 0.5264363889367268, -0.8022753153540619]
+    right:
+      calibration_mode: vr_direction
+      wrist_canonical_frame: raw_controller_anchor_local
+      session_vr_to_robot:
+      - [-0.9796539813128438, 0.14257906686089003, -0.14124194345509564]
+      - [-0.13511015475550675, 0.05185776295567868, 0.9894725961355251]
+      - [0.14840257066451915, 0.988423989042309, -0.03153878415303767]
+      calibrated_at: '2026-06-04T21:23:27'
+      forward_motion_m: 0.26554589496497416
+      up_motion_m: 0.29748031785694784
+      left_motion_m: 0.15026460842482595
+      confidence: good
+      invert_lateral: false
+      wrist_pitch_anchor_local: [0.9897047305625514, -0.11875671685562068, -0.0798835934581148]
+      wrist_roll_anchor_local: [-0.2579377429090886, 0.44880801688591987, -0.8555930602581422]

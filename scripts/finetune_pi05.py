@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
 """Finetune a PI0.5 policy on the current LeRobot dataset.
 
-This script is a thin wrapper around LeRobot's native training entrypoint:
-`lerobot/src/lerobot/scripts/lerobot_train.py`.
+This script is a thin wrapper around LeRobot's package-managed native training entrypoint.
 
 Defaults are loaded from `config/xlerobot.yaml`:
   - dataset.repo_id
@@ -211,4 +210,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

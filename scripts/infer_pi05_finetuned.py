@@ -5,10 +5,10 @@ Loads the checkpoint locally (no OpenPI server) and drives the XLerobot
 bimanual SO-101 stack — the same robot/dataset layout used during VR recording.
 
 Prerequisites:
-    bash scripts/setup_xlerobot.sh   # copies xlerobot into lerobot submodule
+    The installed LeRobot package provides lerobot.robots.xlerobot.
 
-Default camera backend is webapp CameraStream (one V4L capture per role, same as VR recording).
-Use --camera-backend lerobot only if you are not sharing USB with the webapp and want
+Default camera backend is dashboard CameraStream (one V4L capture per role, same as VR recording).
+Use --camera-backend lerobot only if you are not sharing USB with the dashboard and want
 per-step async_read (opens a second VideoCapture per camera on the robot object).
 
 Usage:
@@ -36,7 +36,7 @@ import yaml
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 CONFIG_YAML = REPO_ROOT / "config" / "xlerobot.yaml"
 
-# Must match webapp/backend/dataset.py JOINT_ORDER (LeRobot action / observation.state).
+# Must match openpibot/server/runtime/dataset.py JOINT_ORDER (LeRobot action / observation.state).
 _JOINTS_PER_ARM = (
     "shoulder_pan",
     "shoulder_lift",
@@ -49,7 +49,7 @@ JOINT_ORDER: list[str] = [
     f"{side}_arm_{j}" for side in ("left", "right") for j in _JOINTS_PER_ARM
 ]
 
-# Per-tick joint caps (degrees) — match webapp/backend/vr_teleop.py PER_TICK_DEG_CAPS.
+# Per-tick joint caps (degrees) — match openpibot/server/runtime/vr_teleop.py PER_TICK_DEG_CAPS.
 _PER_TICK_DEG_CAPS: dict[str, float] = {
     "shoulder_pan": 5.0,
     "shoulder_lift": 5.0,
@@ -267,7 +267,7 @@ def _parse_args() -> argparse.Namespace:
         action=argparse.BooleanOptionalAction,
         default=display_available(),
         help=(
-            "Show a live 3-camera mosaic in a background thread (reads webapp streams only; "
+            "Show a live 3-camera mosaic in a background thread (reads dashboard streams only; "
             "does not block inference). Default: on when DISPLAY/WAYLAND_DISPLAY is set."
         ),
     )
@@ -279,11 +279,11 @@ def _parse_args() -> argparse.Namespace:
     )
     p.add_argument(
         "--camera-backend",
-        choices=("lerobot", "webapp"),
-        default="webapp",
+        choices=("lerobot", "dashboard"),
+        default="dashboard",
         help=(
-            "webapp: shared CameraStream registry — one capture per camera (default, stable USB). "
-            "lerobot: extra OpenCVCamera on the robot object (can conflict with webapp / hub)."
+            "dashboard: shared CameraStream registry — one capture per camera (default, stable USB). "
+            "lerobot: extra OpenCVCamera on the robot object (can conflict with dashboard / hub)."
         ),
     )
     args = p.parse_args()
@@ -301,7 +301,7 @@ def _ensure_xlerobot_import() -> None:
     except ImportError as e:
         sys.exit(
             "lerobot.robots.xlerobot is not installed.\n"
-            "Run: bash scripts/setup_xlerobot.sh\n"
+            "Install a LeRobot package release that provides the XLeRobot driver module, then run uv sync.\n"
             f"Original error: {e}"
         )
 
@@ -350,8 +350,8 @@ def _read_home_pose(cfg: dict[str, Any]) -> dict[str, float]:
     if not hp:
         sys.exit(
             "robot.home_pose is empty in config/xlerobot.yaml.\n"
-            "Capture a home pose first (webapp VR Teleop → Capture home, or "
-            "scripts/save_home_pose.py)."
+            "Capture a home pose first (dashboard VR Teleop → Capture home, or "
+            "edit robot.home_pose in config/xlerobot.yaml)."
         )
     return {str(k): float(v) for k, v in hp.items()}
 
@@ -884,7 +884,7 @@ def main() -> None:
     _ensure_xlerobot_import()
     from _camera_preview_window import CameraPreviewWindow
     from _camera_utils import print_inference_camera_map
-    from _webapp_camera_session import attach_webapp_cameras_to_robot, detach_webapp_cameras_from_robot
+    from _dashboard_camera_session import attach_dashboard_cameras_to_robot, detach_dashboard_cameras_from_robot
     from _xlerobot_loader import (
         make_config,
         patch_motors_bus_lenient,
@@ -895,15 +895,15 @@ def main() -> None:
     from lerobot.robots.xlerobot import XLerobot
     from lerobot.utils.robot_utils import precise_sleep
 
-    use_webapp_cameras = args.camera_backend == "webapp"
-    if not use_webapp_cameras:
+    use_dashboard_cameras = args.camera_backend == "dashboard"
+    if not use_dashboard_cameras:
         print(
             "Note: --camera-backend lerobot opens 3 V4L captures on the robot; "
             "this often destabilizes right_wrist on a shared USB hub. "
-            "Prefer --camera-backend webapp (default) unless required."
+            "Prefer --camera-backend dashboard (default) unless required."
         )
     patch_xlerobot_motors_only_connected()
-    if not use_webapp_cameras:
+    if not use_dashboard_cameras:
         from _opencv_camera_patch import (
             patch_opencv_camera_resilient,
             patch_xlerobot_camera_observation,
@@ -935,19 +935,19 @@ def main() -> None:
         pretrained_path=str(policy_path),
     )
 
-    robot_cfg = make_config(robot_id="xlerobot", use_cameras=not use_webapp_cameras)
+    robot_cfg = make_config(robot_id="xlerobot", use_cameras=not use_dashboard_cameras)
     robot = XLerobot(robot_cfg)
     _connect_robot_with_retries(robot)
     cam_session = None
-    if use_webapp_cameras:
+    if use_dashboard_cameras:
         from _camera_preflight import run_camera_preflight
 
         run_camera_preflight(CONFIG_YAML)
-        cam_session = attach_webapp_cameras_to_robot(robot, warmup_s=3.0)
+        cam_session = attach_dashboard_cameras_to_robot(robot, warmup_s=3.0)
     print_inference_camera_map(cfg, policy)
     camera_preview: CameraPreviewWindow | None = None
     if args.show_cameras:
-        preview_src: Any = cam_session if use_webapp_cameras else robot.cameras
+        preview_src: Any = cam_session if use_dashboard_cameras else robot.cameras
         camera_preview = CameraPreviewWindow(
             preview_src, preview_fps=min(float(args.preview_fps), float(args.fps))
         )
@@ -959,7 +959,7 @@ def main() -> None:
         f"  Cameras            : {args.camera_backend} "
         + (
             "(CameraStream registry)"
-            if use_webapp_cameras
+            if use_dashboard_cameras
             else "(LeRobot OpenCVCamera, RGB async_read)"
         )
     )
@@ -1233,7 +1233,7 @@ def main() -> None:
                 print(f"Warning: camera preview stop: {exc}")
         if cam_session is not None:
             try:
-                detach_webapp_cameras_from_robot(robot)
+                detach_dashboard_cameras_from_robot(robot)
             except Exception as exc:
                 print(f"Warning: camera session teardown: {exc}")
         try:

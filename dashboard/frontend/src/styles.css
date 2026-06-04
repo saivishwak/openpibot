@@ -1,0 +1,88 @@
+@import "tailwindcss";
+
+@custom-variant dark (&:is(.dark *));
+
+:root {
+  color-scheme: light;
+  --background: 0 0% 98%;
+  --foreground: 0 0% 8%;
+  --card: 0 0% 100%;
+  --card-foreground: 0 0% 8%;
+  --muted: 0 0% 94%;
+  --muted-foreground: 0 0% 42%;
+  --border: 0 0% 86%;
+  --input: 0 0% 84%;
+  --primary: 168 76% 32%;
+  --primary-foreground: 0 0% 100%;
+  --danger: 0 73% 48%;
+  --warning: 38 92% 50%;
+  --success: 160 84% 32%;
+}
+
+.dark {
+  color-scheme: dark;
+  --background: 0 0% 7%;
+  --foreground: 0 0% 98%;
+  --card: 0 0% 10%;
+  --card-foreground: 0 0% 98%;
+  --muted: 0 0% 15%;
+  --muted-foreground: 0 0% 66%;
+  --border: 0 0% 20%;
+  --input: 0 0% 22%;
+  --primary: 168 76% 45%;
+  --primary-foreground: 0 0% 5%;
+  --danger: 0 72% 58%;
+  --warning: 42 96% 58%;
+  --success: 160 72% 45%;
+}
+
+@theme inline {
+  --color-background: hsl(var(--background));
+  --color-foreground: hsl(var(--foreground));
+  --color-card: hsl(var(--card));
+  --color-card-foreground: hsl(var(--card-foreground));
+  --color-muted: hsl(var(--muted));
+  --color-muted-foreground: hsl(var(--muted-foreground));
+  --color-border: hsl(var(--border));
+  --color-input: hsl(var(--input));
+  --color-primary: hsl(var(--primary));
+  --color-primary-foreground: hsl(var(--primary-foreground));
+  --color-danger: hsl(var(--danger));
+  --color-warning: hsl(var(--warning));
+  --color-success: hsl(var(--success));
+}
+
+html, body, #root {
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  background: hsl(var(--background));
+  color: hsl(var(--foreground));
+  font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+}
+
+button, input, textarea {
+  font: inherit;
+}
+
+.mono {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+}
+
+.cam-tile {
+  position: relative;
+  aspect-ratio: 4 / 3;
+  overflow: hidden;
+  border-radius: 0.5rem;
+  background: #000;
+}
+
+.cam-tile img {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+}

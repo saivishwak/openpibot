@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Run LeRobot dataset viz against a non-version Hub revision.
 
-This keeps the vendored LeRobot submodule untouched while avoiding its
+This keeps the package-managed LeRobot installation untouched while avoiding its
 ``get_safe_version()`` fallback on untagged v3.0 datasets.
 """
 

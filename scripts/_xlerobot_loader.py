@@ -1,6 +1,6 @@
 """Build an XLerobotConfig from config/xlerobot.yaml.
 
-Shared between the CLI runners (scripts/) and the web app (webapp/backend/motors.py).
+Shared between the CLI runners (scripts/) and the dashboard (openpibot/server/runtime/motors.py).
 Passes every override explicitly to the XLerobotConfig constructor — setting class-level
 attributes does NOT change dataclass defaults, since `@dataclass` captures them into
 the generated `__init__` signature at decoration time.
@@ -144,7 +144,7 @@ def patch_xlerobot_motors_only_connected() -> None:
 def make_config(robot_id: str = "xlerobot", *, use_cameras: bool = True) -> Any:
     """Build an XLerobotConfig with all overrides from config/xlerobot.yaml applied.
 
-    Set use_cameras=False when frames come from webapp.backend.cameras (inference/VR).
+    Set use_cameras=False when frames come from openpibot.server.runtime.cameras (inference/VR).
     """
     from lerobot.robots.xlerobot import XLerobotConfig
 

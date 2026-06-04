@@ -15,7 +15,7 @@ Drive one or both SO-101 arms with a Meta Quest 3.
 
 ## Per-session flow
 
-1. **Open the webapp**: `http://<workstation>:5000`. Click *Connect* on each arm you want to use.
+1. **Open the dashboard**: `http://<workstation>:5000`. Click *Connect* on each arm you want to use.
 2. **Open the VR endpoint URL on the Quest browser** (shown on the page). Accept the self-signed cert, enter VR.
 3. **Calibrate** if you haven't, or if you're standing somewhere new — see [calibration.md](calibration.md). Once-per-setup; the calibration is saved.
 4. **Squeeze grip** on a controller to anchor that arm's EE pose. The card shows "anchored" and `anchor_ee_pos`.
@@ -48,6 +48,32 @@ Each arm still needs its own calibration and grip-anchor. If one side is not anc
 ## Speed slider
 
 Default is **1.0** (true 1:1 hand-to-EE motion). Drop to 0.5 for fine work. The per-tick joint caps are the hard safety limit underneath.
+
+## Motion mapping
+
+Grip press anchors two things for that arm:
+
+- The current robot gripper pose.
+- The current Quest controller pose and controller-to-gripper rotation.
+
+While grip is held, the backend integrates XLeVR's per-frame `relative_position`
+packets, maps that reset-relative controller displacement through the saved
+VR-to-robot frame, and caps the end-effector target step before IK. This keeps
+slow hand motion smooth and rejects one-frame tracking spikes. The controller's
+rotation is also mapped through the reset-time controller-to-EE alignment so
+wrist intent does not depend on the exact grip angle at anchor time.
+
+Useful tuning keys live in `config/xlerobot.yaml`:
+
+```yaml
+vr:
+  kp: 0.75
+  pos_ema_alpha: 0.3
+  ori_ema_alpha: 0.35
+  pos_deadzone_m: 0.001
+  rot_deadzone_deg: 0.3
+  max_ee_step_m: 0.004
+```
 
 ## Safety
 

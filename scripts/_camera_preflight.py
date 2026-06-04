@@ -51,7 +51,7 @@ def run_camera_preflight(config_yaml: pathlib.Path) -> None:
         if proc.returncode == 0 and combined.strip():
             any_busy = True
             print(
-                f"    WARNING: another process is using this device — stop webapp "
+                f"    WARNING: another process is using this device — stop dashboard "
                 f"backend / other capture before inference:\n"
                 f"    {combined.strip()[:400]}"
             )
@@ -60,7 +60,7 @@ def run_camera_preflight(config_yaml: pathlib.Path) -> None:
     if "usb-0:4.1" in rw:
         print(
             "  Note: right_wrist is on USB hub port 4.1; it often drops under load "
-            "(motors + 3×30fps). Use --camera-backend webapp (default), stop duplicate "
+            "(motors + 3×30fps). Use --camera-backend dashboard (default), stop duplicate "
             "captures, and prefer a powered hub or a different port if drops continue."
         )
     if any_busy:

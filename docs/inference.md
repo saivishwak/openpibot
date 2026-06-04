@@ -5,29 +5,21 @@ This repo supports two inference paths:
 | Path | Script | Policy runtime | When to use |
 |------|--------|----------------|-------------|
 | **Finetuned (recommended)** | `scripts/infer_pi05_finetuned.py` | Local LeRobot checkpoint on GPU | After finetuning on your VR dataset |
-| **OpenPI server (baseline)** | `scripts/run_pi05_inference.py` | Remote WebSocket (`scripts/run_openpi_server.sh`) | Zero-shot experiments with `pi05_base` only |
+| **OpenPI server (baseline)** | `scripts/run_pi05_inference.py` | Package-managed OpenPI WebSocket server | Zero-shot experiments with `pi05_base` only |
 
-The rest of this document focuses on **finetuned local inference**, which matches the dataset layout recorded via the webapp (`head`, `left_wrist`, `right_wrist` cameras and 12 arm joints).
+The rest of this document focuses on **finetuned local inference**, which matches the dataset layout recorded via the dashboard (`head`, `left_wrist`, `right_wrist` cameras and 12 arm joints).
 
 ## Prerequisites
 
-1. **Copy the XLerobot robot driver into the LeRobot submodule** (once per clone):
-
-   ```bash
-   bash scripts/setup_xlerobot.sh
-   ```
+1. **Initialized `lerobot` submodule** on the configured `main` branch. The root `uv.lock` uses this submodule as the editable LeRobot workspace so the XLeRobot driver overlay is available.
 
 2. **Hardware**: bimanual SO-101 arms on the ports in `config/xlerobot.yaml` (`port_left_base`, `port_right_head`), three USB cameras, and motor calibration files under `config/calibration/so_follower/`.
 
-3. **Home pose** in `config/xlerobot.yaml` (`robot.home_pose`). Capture it from the webapp (VR Teleop → Capture home) or:
-
-   ```bash
-   uv run python scripts/save_home_pose.py
-   ```
+3. **Home pose** in `config/xlerobot.yaml` (`robot.home_pose`). Capture it from the dashboard (VR Teleop → Capture home) or edit the YAML directly.
 
 4. **Finetuned checkpoint** (see [Finetuning](#finetuning)). Checkpoints are saved under `outputs/pi05_finetune/checkpoints/<step>/pretrained_model/`.
 
-5. **Dependencies**: root `pyproject.toml` pins `transformers>=5.4.0,<5.6.0` for PI0.5 (LeRobot submodule). After pulling changes, run `uv sync`. If inference fails with `create_causal_mask() ... cache_position`, you likely have transformers 5.6+ installed — re-sync the venv.
+5. **Dependencies**: root `pyproject.toml` pins `transformers>=5.4.0,<5.6.0` for PI0.5. After pulling changes, run `git submodule update --init lerobot` and `uv sync`. If inference fails with `create_causal_mask() ... cache_position`, you likely have transformers 5.6+ installed — re-sync the venv.
 
 ## Finetuning
 
@@ -155,7 +147,7 @@ Inference runs **one observation → one action** per control tick (batch size 1
 | `--clamp-to-present` | off | Clamp vs measured pose; usually causes jitter |
 | `--phase1-task` | — | Shorter prompt for the first segment (e.g. reach medicine only) |
 | `--phase1-sec` | `0` | Seconds to use `--phase1-task` before `--task` |
-| `--camera-backend` | `webapp` | `webapp` (shared V4L streams) or `lerobot` (robot OpenCVCamera) |
+| `--camera-backend` | `dashboard` | `dashboard` (shared V4L streams) or `lerobot` (robot OpenCVCamera) |
 | `--show-cameras` / `--no-show-cameras` | on if `DISPLAY` set | Resizable pygame camera mosaic (background thread) |
 | `--preview-fps` | `15` | Max refresh rate for camera preview |
 | `--skip-home` | off | Skip homing entirely |
@@ -167,9 +159,9 @@ Inference runs **one observation → one action** per control tick (batch size 1
 | `--dry-run` | off | Print settings and exit |
 | `--dry-run-home` | off | Connect, home, disconnect; no policy |
 
-## How this matches VR recording (`webapp/backend/dataset.py`)
+## How this matches VR recording (`openpibot/server/runtime/dataset.py`)
 
-Training data from the webapp uses:
+Training data from the dashboard uses:
 
 | Field | Meaning |
 |-------|---------|
@@ -204,7 +196,7 @@ Observation keys sent to the policy match finetuning rename map:
 
 ## OpenPI server path (optional)
 
-For the upstream dual-arm example with a **generic** `pi05_base` checkpoint over WebSocket:
+For the dual-arm example with a **generic** `pi05_base` checkpoint over WebSocket:
 
 ```bash
 # Terminal 1
@@ -216,14 +208,16 @@ uv run python scripts/run_pi05_inference.py \
   --episodes 2 --episode-time 120
 ```
 
+The server launcher uses `uv --no-project --with "$OPENPI_PACKAGE"` so OpenPI's heavy runtime is resolved outside the robot/dashboard environment. Override `OPENPI_PACKAGE`, `OPENPI_CONFIG`, `OPENPI_CHECKPOINT_DIR`, or `OPENPI_PORT` when you need a different package source, policy config, checkpoint, or port.
+
 Expect weak zero-shot behavior until you finetune and use `infer_pi05_finetuned.py` instead.
 
 ## Troubleshooting
 
 | Symptom | Likely cause | What to do |
 |---------|----------------|------------|
-| `lerobot.robots.xlerobot is not installed` | Submodule copy missing | `bash scripts/setup_xlerobot.sh` |
-| `robot.home_pose is empty` | No saved pose | Webapp capture or `scripts/save_home_pose.py` |
+| `lerobot.robots.xlerobot is not installed` | The `lerobot` submodule overlay is missing or not synced | Run `git submodule update --init lerobot`, then `uv sync` |
+| `robot.home_pose is empty` | No saved pose | Capture it from the dashboard or edit `config/xlerobot.yaml` |
 | `Missing motor IDs` with `--strict-motors` | SO-101 without base/head | Drop `--strict-motors` (default lenient mode) |
 | `KeyError` on `head_pan` / `base_*` | Old driver without prune fix | Use current `xlerobot.py` + merged calibration |
 | `missing camera observations` | Camera path wrong or unplugged | Fix `cameras.*.path` in yaml; check `/dev/v4l/...` |

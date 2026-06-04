@@ -6,8 +6,6 @@ The actual policy runs out-of-process via the openpi WebSocket server (start it 
 scripts/run_openpi_server.sh in another terminal).
 
 Prerequisites:
-    bash scripts/setup_xlerobot.sh             # robot-side venv
-    cd openpi && uv sync                       # policy-server venv (one-time)
     bash scripts/run_openpi_server.sh          # start policy server in another shell
 
 Usage:
@@ -56,7 +54,7 @@ def load_yaml() -> dict:
 
 def patch_xlerobot_factory(robot_id: str) -> None:
     """Replace lerobot.robots.xlerobot.XLerobotConfig with one whose defaults come from
-    config/xlerobot.yaml. See scripts/run_vr_teleop_capture.py for the long explanation."""
+    config/xlerobot.yaml."""
     from _xlerobot_loader import make_config
     import lerobot.robots.xlerobot as xr
 

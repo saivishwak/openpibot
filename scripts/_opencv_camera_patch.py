@@ -1,8 +1,8 @@
 """Legacy lerobot OpenCVCamera monkeypatch (not used by infer_pi05_finetuned).
 
-Inference uses webapp CameraStream via scripts/_webapp_camera_session.py instead.
+Inference uses dashboard CameraStream via scripts/_dashboard_camera_session.py instead.
 
-Resilient OpenCVCamera behavior without editing the lerobot submodule.
+Resilient OpenCVCamera behavior without editing the package-managed LeRobot installation.
 
 Patches lerobot's OpenCVCamera at runtime (same pattern as patch_motors_bus_lenient):
   - Background read loop recovers from transient V4L/USB failures instead of exiting.
@@ -174,7 +174,7 @@ def warn_missing_camera_paths(cfg: dict[str, Any]) -> None:
         print("Available /dev/v4l/by-path nodes:")
         for name in available:
             print(f"  {by_path / name}")
-    print("Re-assign cameras in the webapp Cameras page or edit config/xlerobot.yaml.")
+    print("Re-assign cameras in the dashboard Cameras page or edit config/xlerobot.yaml.")
 
 
 def patch_opencv_camera_resilient() -> None:

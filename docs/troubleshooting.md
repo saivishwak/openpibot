@@ -7,16 +7,9 @@ Quick diagnostics for the most common issues. Run from the repo root in a `newgr
 Most likely cause: motor calibration JSON has `range_min == range_max` for the gripper. Lerobot writes this to the motor's `Min_Position_Limit`/`Max_Position_Limit` registers on every connect, and the motor refuses any goal outside that ~1-tick window.
 
 Diagnose:
-```bash
-uv run python scripts/test_gripper.py --arm right
-```
+Check the arm calibration JSON under `config/calibration/so_follower/` and the motor registers from the dashboard Diagnostics page.
 
-If the script reports zero motion and the dumped registers show `Min_Position_Limit ≈ Max_Position_Limit`, re-calibrate just the gripper:
-```bash
-uv run python scripts/calibrate_gripper.py --arm right
-```
-
-This disables torque on the gripper only, asks you to move it through its full open↔close range by hand, then writes the captured range back to both the calibration JSON and the motor EEPROM.
+If `Min_Position_Limit` and `Max_Position_Limit` are effectively the same, re-run `lerobot-calibrate` for that arm and move the gripper through its full open/close range during calibration.
 
 ## Robot doesn't move during teleop
 
@@ -39,13 +32,25 @@ Look at `session_yaw_deg` on the Calibration card — it should match (or be clo
 
 ## Wrist drifts when controller is still
 
-If you're seeing slow wrist drift even with your hand still, the patched XLeVR isn't running. Restart the backend (`make webapp-backend`) — the patch lives in `XLerobot_xuweiwu/XLeVR/xlevr/inputs/vr_ws_server.py` and only takes effect on backend restart.
+If you're seeing slow wrist drift even with your hand still, the patched XLeVR isn't running. Restart the OpenPIBot server (`uv run openpibot run --reload --no-build-dashboard` during development, or `uv run openpibot run --host 0.0.0.0` for the built dashboard) — the patch lives in `XLerobot_xuweiwu/XLeVR/xlevr/inputs/vr_ws_server.py` and only takes effect on server restart.
 
 If drift persists, the Quest controller may need re-calibration in the Quest system menu.
 
+## Arm jitters while hand is still
+
+The backend ignores very small VR `relative_position` and `relative_rotvec`
+packets before integrating them. If the arm still jitters:
+
+- Lower `vr.pos_ema_alpha` slightly (for example `0.25`).
+- Lower `vr.max_ee_step_m` slightly (for example `0.003`).
+- Check the Control page's per-arm **EE speed EMA** and **IK rejects** cards.
+  A nonzero speed while your hand is still points to controller tracking noise;
+  frequent IK rejects usually means the grip anchor or target is near the edge
+  of the SO101 workspace.
+
 ## "Release for posing" doesn't release torque
 
-Check the backend log for the `release_torque_for_posing` call. If you see no log line, the API didn't reach the backend (Flask not running, network blip). If you see the log but the arm still holds, the bus write failed silently — power-cycle the robot and try again.
+Check the server log for the `release_torque_for_posing` call. If you see no log line, the API didn't reach the OpenPIBot server. If you see the log but the arm still holds, the bus write failed silently — power-cycle the robot and try again.
 
 ## VR endpoint loads but motion doesn't reach the backend
 
@@ -64,7 +69,4 @@ The arm physically arrived, but the present-position check is stricter than the 
 ## Bus opens, then `Missing motor IDs` error
 
 A motor on that arm isn't responding. Common causes: power not connected, USB cable loose, motor ID mismatch (each arm should have IDs 1–6). Run:
-```bash
-uv run python scripts/diagnose_motor.py --arm right
-```
-to dump every motor's registers + Status byte. A `Status: 0x20 (Overload)` means the motor latched a fault — power-cycle the robot to clear.
+Use the dashboard Diagnostics page to inspect serial ports and motor status. A `Status: 0x20 (Overload)` means the motor latched a fault — power-cycle the robot to clear.
