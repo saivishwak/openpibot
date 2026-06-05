@@ -161,5 +161,15 @@ vite.config.ts.timestamp-*
 # Frontend build output served by OpenPIBot
 dashboard/dist/
 
+# Unity generated project state/build intermediates
+apps/quest-xlerobot/Library/
+apps/quest-xlerobot/Temp/
+apps/quest-xlerobot/Obj/
+apps/quest-xlerobot/Build/
+apps/quest-xlerobot/Builds/
+apps/quest-xlerobot/Logs/
+apps/quest-xlerobot/UserSettings/
+apps/quest-xlerobot/.utmp/
+
 # Local upstream/reference checkouts. These replace git submodules.
 reference/

@@ -73,7 +73,9 @@ export interface RobotVerificationSampleResidual {
   direction_error_deg: number | null;
   robot_motion_cm: number;
   vr_motion_cm: number;
+  target_robot_delta?: [number, number, number];
   predicted_robot_delta: [number, number, number];
+  error_vector_cm?: [number, number, number];
 }
 
 export interface RobotVerificationLive {
@@ -207,6 +209,8 @@ export interface VRArmState {
       translation_scale: number;
       fit_error_cm: number | null;
       sample_residuals: RobotVerificationSampleResidual[];
+      worst_residuals?: RobotVerificationSampleResidual[];
+      residual_hint?: string;
       quality: "unverified" | "collecting" | "good" | "warn" | "needs_recapture" | "poor" | string;
       verified_at: string | null;
       min_samples: number;
@@ -261,6 +265,9 @@ export interface VROperatorStatus {
     https_ready: boolean;
     websocket_ready: boolean;
     websocket_clients: number;
+    native_quest_ready?: boolean;
+    native_quest_clients?: number;
+    native_quest_last_seen_ms?: number | null;
     connected_arms: ArmSide[];
   };
   camera_roles: Record<string, {
@@ -326,6 +333,58 @@ export interface VRStatus {
   vr_endpoint: string | null;
 }
 
+export interface QuestVideoStream {
+  role: "head" | "left_wrist" | "right_wrist" | string;
+  camera_name: string;
+  device_path: string;
+  width: number;
+  height: number;
+  fps: number;
+  fourcc: string;
+  mount: string;
+  gst_launch: string;
+  udp_port: number;
+  receiver_pipeline: string;
+  active_gst_launch: string | null;
+  running: boolean;
+  pid: number | null;
+  last_error: string | null;
+}
+
+export interface QuestVideoStatus {
+  ready: boolean;
+  transport: "gstreamer-rtp-h264" | string;
+  gst_available: boolean;
+  running: boolean;
+  quest_host: string | null;
+  started_at: number | null;
+  roles: string[];
+  base_port: number;
+  bitrate_kbps: number;
+  running_roles: string[];
+  missing_roles: string[];
+  receive_health: Record<string, {
+    role: string;
+    received_at: number;
+    state: string;
+    fps: number;
+    latency_ms: number;
+    frames: number;
+    error: string;
+  }>;
+  streams: QuestVideoStream[];
+}
+
+export interface QuestBridgeStatus {
+  clients: number;
+  last_seen_ms: number | null;
+  endpoint: string;
+  ws_url: string;
+  coordinate_frame: string;
+  pairing_required: boolean;
+  max_packet_bytes: number;
+}
+
 async function req<T>(path: string, init?: RequestInit): Promise<T> {
   const r = await fetch(path, { headers: { "content-type": "application/json" }, ...init });
   if (!r.ok) {
@@ -357,6 +416,19 @@ export const api = {
     }),
 
   vrStatus: () => req<VRStatus>("/api/vr/status"),
+  questBridgeStatus: () => req<QuestBridgeStatus>("/api/vr/quest/status"),
+  questVideoStatus: () => req<QuestVideoStatus>("/api/vr/quest/video/status"),
+  questVideoStart: (questHost: string, token: string, roles?: string[]) =>
+    req<QuestVideoStatus>("/api/vr/quest/video/start", {
+      method: "POST",
+      headers: { "x-quest-pairing-token": token },
+      body: JSON.stringify({ quest_host: questHost, roles }),
+    }),
+  questVideoStop: (token: string) =>
+    req<QuestVideoStatus>("/api/vr/quest/video/stop", {
+      method: "POST",
+      headers: { "x-quest-pairing-token": token },
+    }),
   vrConnect: (arm: ArmSide) =>
     req<VRStatus>("/api/vr/connect", { method: "POST", body: JSON.stringify({ arm }) }),
   /** Pass `arm` to disconnect one side; omit to disconnect both. */
@@ -414,23 +486,23 @@ export const api = {
       method: "POST", body: JSON.stringify({ arm }),
     }),
   /** End the wizard's optional wrist pitch/roll motion without capturing an
-   *  empirical canonical for the remaining wrist axes. The runtime falls back to the WebXR analytical
-   *  canonical (works for standard Quest controllers). */
+   *  empirical canonical for the remaining wrist axes. The runtime falls back to the standard
+   *  Quest analytical canonical. */
   vrCalibrateSkipWristVerify: (arm: ArmSide) =>
     req<VRStatus>("/api/vr/calibrate/skip_wrist_verify", {
       method: "POST", body: JSON.stringify({ arm }),
     }),
   vrRobotVerifyStart: (arm: ArmSide) =>
     req<VRStatus>("/api/vr/calibrate/robot_verify/start", {
-      method: "POST", body: JSON.stringify({ arm, release_torque: true }),
+      method: "POST", body: JSON.stringify({ arm, release_torque: false }),
     }),
   vrRobotVerifyCancel: (arm: ArmSide) =>
     req<VRStatus>("/api/vr/calibrate/robot_verify/cancel", {
       method: "POST", body: JSON.stringify({ arm }),
     }),
-  vrRobotVerifyRobotPose: (arm: ArmSide, point: "start" | "end") =>
+  vrRobotVerifyRobotPose: (arm: ArmSide, point: "start" | "end", label = "") =>
     req<VRStatus>("/api/vr/calibrate/robot_verify/robot_pose", {
-      method: "POST", body: JSON.stringify({ arm, point }),
+      method: "POST", body: JSON.stringify({ arm, point, label }),
     }),
   vrRobotVerifyVrPose: (arm: ArmSide, point: "start" | "end", label = "") =>
     req<VRStatus>("/api/vr/calibrate/robot_verify/vr_pose", {

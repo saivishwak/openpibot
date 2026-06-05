@@ -104,9 +104,7 @@ def create_app() -> FastAPI:
     app.include_router(jobs.router)
     app.include_router(logs.router)
 
-    so101_root = REPO_ROOT / "reference" / "SO-ARM100" / "Simulation" / "SO101"
-    xlerobot_root = REPO_ROOT / "XLerobot_xuweiwu" / "simulation" / "Maniskill" / "assets" / "xlerobot"
-    app.mount("/robot_assets/so101", StaticFiles(directory=so101_root, check_dir=False), name="so101-assets")
+    xlerobot_root = REPO_ROOT / "vendor" / "xlerobot"
     app.mount("/robot_assets/xlerobot", StaticFiles(directory=xlerobot_root, check_dir=False), name="xlerobot-assets")
     app.mount("/assets", StaticFiles(directory=STATIC_ROOT / "assets", check_dir=False), name="assets")
 

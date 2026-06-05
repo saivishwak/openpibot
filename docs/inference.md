@@ -1,17 +1,16 @@
 # PI0.5 inference on XLeRobot (bimanual SO-101)
 
-This repo supports two inference paths:
+This repo supports local finetuned PI0.5 inference:
 
 | Path | Script | Policy runtime | When to use |
 |------|--------|----------------|-------------|
 | **Finetuned (recommended)** | `scripts/infer_pi05_finetuned.py` | Local LeRobot checkpoint on GPU | After finetuning on your VR dataset |
-| **OpenPI server (baseline)** | `scripts/run_pi05_inference.py` | Package-managed OpenPI WebSocket server | Zero-shot experiments with `pi05_base` only |
 
-The rest of this document focuses on **finetuned local inference**, which matches the dataset layout recorded via the dashboard (`head`, `left_wrist`, `right_wrist` cameras and 12 arm joints).
+This document focuses on **finetuned local inference**, which matches the dataset layout recorded via the dashboard (`head`, `left_wrist`, `right_wrist` cameras and 12 arm joints).
 
 ## Prerequisites
 
-1. **Initialized `lerobot` submodule** on the configured `main` branch. The root `uv.lock` uses this submodule as the editable LeRobot workspace so the XLeRobot driver overlay is available.
+1. **Initialized `vendor/lerobot` submodule** on the configured `main` branch. The root `uv.lock` uses this submodule as the editable LeRobot workspace so the XLeRobot driver overlay is available.
 
 2. **Hardware**: bimanual SO-101 arms on the ports in `config/xlerobot.yaml` (`port_left_base`, `port_right_head`), three USB cameras, and motor calibration files under `config/calibration/so_follower/`.
 
@@ -19,7 +18,7 @@ The rest of this document focuses on **finetuned local inference**, which matche
 
 4. **Finetuned checkpoint** (see [Finetuning](#finetuning)). Checkpoints are saved under `outputs/pi05_finetune/checkpoints/<step>/pretrained_model/`.
 
-5. **Dependencies**: root `pyproject.toml` pins `transformers>=5.4.0,<5.6.0` for PI0.5. After pulling changes, run `git submodule update --init lerobot` and `uv sync`. If inference fails with `create_causal_mask() ... cache_position`, you likely have transformers 5.6+ installed — re-sync the venv.
+5. **Dependencies**: root `pyproject.toml` pins `transformers>=5.4.0,<5.6.0` for PI0.5. After pulling changes, run `git submodule update --init vendor/lerobot` and `uv sync`. If inference fails with `create_causal_mask() ... cache_position`, you likely have transformers 5.6+ installed — re-sync the venv.
 
 ## Finetuning
 
@@ -194,29 +193,11 @@ Observation keys sent to the policy match finetuning rename map:
 - `observation.images.head`, `left_wrist`, `right_wrist`
 - `observation.state` — 12 arm joint positions (`.pos` keys)
 
-## OpenPI server path (optional)
-
-For the dual-arm example with a **generic** `pi05_base` checkpoint over WebSocket:
-
-```bash
-# Terminal 1
-bash scripts/run_openpi_server.sh
-
-# Terminal 2
-uv run python scripts/run_pi05_inference.py \
-  --task "Pick the red block and place it in the bin" \
-  --episodes 2 --episode-time 120
-```
-
-The server launcher uses `uv --no-project --with "$OPENPI_PACKAGE"` so OpenPI's heavy runtime is resolved outside the robot/dashboard environment. Override `OPENPI_PACKAGE`, `OPENPI_CONFIG`, `OPENPI_CHECKPOINT_DIR`, or `OPENPI_PORT` when you need a different package source, policy config, checkpoint, or port.
-
-Expect weak zero-shot behavior until you finetune and use `infer_pi05_finetuned.py` instead.
-
 ## Troubleshooting
 
 | Symptom | Likely cause | What to do |
 |---------|----------------|------------|
-| `lerobot.robots.xlerobot is not installed` | The `lerobot` submodule overlay is missing or not synced | Run `git submodule update --init lerobot`, then `uv sync` |
+| `lerobot.robots.xlerobot is not installed` | The `vendor/lerobot` submodule overlay is missing or not synced | Run `git submodule update --init vendor/lerobot`, then `uv sync` |
 | `robot.home_pose is empty` | No saved pose | Capture it from the dashboard or edit `config/xlerobot.yaml` |
 | `Missing motor IDs` with `--strict-motors` | SO-101 without base/head | Drop `--strict-motors` (default lenient mode) |
 | `KeyError` on `head_pan` / `base_*` | Old driver without prune fix | Use current `xlerobot.py` + merged calibration |
@@ -234,7 +215,6 @@ Expect weak zero-shot behavior until you finetune and use `infer_pi05_finetuned.
 scripts/finetune_pi05.py          # wrapper → lerobot-train
 scripts/infer_pi05_finetuned.py   # local finetuned inference + homing
 scripts/_xlerobot_loader.py       # yaml → XLerobotConfig, lenient motors, calib merge
-scripts/run_pi05_inference.py     # OpenPI WebSocket wrapper (baseline)
 config/xlerobot.yaml              # ports, cameras, home pose, dataset id
 config/calibration/so_follower/   # per-arm calibration (source of truth)
 config/calibration/xlerobot/      # merged xlerobot.json (generated at connect)

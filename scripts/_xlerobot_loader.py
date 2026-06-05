@@ -59,8 +59,7 @@ def _refresh_motor_registry(bus: Any) -> None:
 def patch_motors_bus_lenient() -> None:
     """Make `MotorsBus._assert_motors_exist` PRUNE missing motors instead of raising.
 
-    Reason: both reference scripts (XLerobot_xuweiwu/.../9_pi05_inference_dualarm.py and
-    8_vr_teleop_with_dataset_recording_dualarm.py) instantiate the full XLerobot driver,
+    Reason: older reference scripts instantiated the full XLerobot driver,
     whose motor list includes 3 lekiwi base wheels (left bus) + 2 head motors (right bus).
     Bimanual SO101 setups have only the 6 arm motors per side, so the connect-time presence
     check fails. *But* both scripts only ever read/write arm motors at runtime — the base/head

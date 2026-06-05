@@ -9,6 +9,7 @@ import struct
 import threading
 import time
 from dataclasses import dataclass
+from collections.abc import Iterable
 
 import cv2
 import numpy as np
@@ -351,11 +352,14 @@ class CameraStream:
 
 _REGISTRY: dict[str, CameraStream] = {}
 _REG_LOCK = threading.Lock()
+_SUSPENDED_ROLES: dict[str, str] = {}
 
 
 def get_stream(cam_id: str) -> CameraStream | None:
     spec = find_camera(cam_id)
     if spec is None:
+        return None
+    if spec.role and spec.role in _SUSPENDED_ROLES:
         return None
     with _REG_LOCK:
         cached = _REGISTRY.get(cam_id)
@@ -375,6 +379,75 @@ def reset_streams() -> None:
         for s in _REGISTRY.values():
             s.stop_evt.set()
         _REGISTRY.clear()
+        _SUSPENDED_ROLES.clear()
+
+
+def suspend_capture_roles(roles: Iterable[str], *, reason: str = "") -> list[str]:
+    """Stop and block OpenCV/MJPEG capture for roles owned by another transport.
+
+    The Quest GStreamer bridge opens the same V4L2 devices directly. Browser
+    dashboard previews are long-lived MJPEG clients, so merely checking for
+    contention makes Quest video fragile. Suspending the role closes the OpenCV
+    handle and prevents immediate reacquire until the bridge stops.
+    """
+    wanted = {str(role) for role in roles if str(role) in _ROLES}
+    stopped: list[CameraStream] = []
+    with _REG_LOCK:
+        for role in wanted:
+            _SUSPENDED_ROLES[role] = reason or "capture suspended"
+        for cam_id, stream in list(_REGISTRY.items()):
+            if stream.spec.role in wanted:
+                stream.subscribers = 0
+                stream.stop_evt.set()
+                stopped.append(stream)
+                del _REGISTRY[cam_id]
+
+    for stream in stopped:
+        if stream.thread is not None and stream.thread.is_alive():
+            stream.thread.join(timeout=2.0)
+        stream._close_cap()
+    return sorted(wanted)
+
+
+def resume_capture_roles(roles: Iterable[str] | None = None) -> list[str]:
+    """Allow OpenCV/MJPEG capture for the given roles again."""
+    with _REG_LOCK:
+        if roles is None:
+            resumed = sorted(_SUSPENDED_ROLES)
+            _SUSPENDED_ROLES.clear()
+            return resumed
+        wanted = {str(role) for role in roles if str(role) in _ROLES}
+        resumed = sorted(role for role in wanted if role in _SUSPENDED_ROLES)
+        for role in resumed:
+            _SUSPENDED_ROLES.pop(role, None)
+        return resumed
+
+
+def suspended_capture_roles() -> dict[str, str]:
+    with _REG_LOCK:
+        return dict(_SUSPENDED_ROLES)
+
+
+def capture_suspension_reason(cam_id: str) -> str:
+    spec = find_camera(cam_id)
+    if spec is None or not spec.role:
+        return ""
+    return _SUSPENDED_ROLES.get(spec.role, "")
+
+
+def active_capture_roles() -> list[str]:
+    """Camera roles with a live OpenCV stream handle.
+
+    GStreamer opens the same V4L2 devices directly for Quest video. Reporting
+    active OpenCV consumers lets the Quest bridge avoid racing the MJPEG/policy
+    capture path for exclusive USB camera handles.
+    """
+    with _REG_LOCK:
+        out: list[str] = []
+        for stream in _REGISTRY.values():
+            if stream.spec.role and stream.subscribers > 0:
+                out.append(stream.spec.role)
+        return sorted(set(out))
 
 
 def restart_stream(cam_id: str) -> CameraStream | None:
@@ -390,14 +463,19 @@ def restart_stream(cam_id: str) -> CameraStream | None:
 
 
 def mjpeg_iter(cam_id: str, max_fps: int = 15):
+    boundary = b"--frame"
     stream = get_stream(cam_id)
     if stream is None:
+        reason = capture_suspension_reason(cam_id) or "camera unavailable"
+        yield boundary + b"\r\nContent-Type: text/plain\r\n\r\n" + reason.encode() + b"\r\n"
         return
     stream.acquire()
     period = 1.0 / max_fps
-    boundary = b"--frame"
     try:
         while True:
+            if stream.stop_evt.is_set():
+                yield boundary + b"\r\nContent-Type: text/plain\r\n\r\ncamera stream suspended\r\n"
+                break
             t0 = time.monotonic()
             jpeg = stream.get_jpeg(timeout=1.5)
             if jpeg is None:

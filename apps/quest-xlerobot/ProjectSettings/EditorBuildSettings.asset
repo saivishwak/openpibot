@@ -1,0 +1,19 @@
+%YAML 1.1
+%TAG !u! tag:unity3d.com,2011:
+--- !u!1045 &1
+EditorBuildSettings:
+  m_ObjectHideFlags: 0
+  serializedVersion: 2
+  m_Scenes:
+  - enabled: 1
+    path: Assets/Scenes/BaseScene.unity
+    guid: d864b32590e77aae7bf70e18bba5b223
+  - enabled: 1
+    path: Assets/Scenes/MirrorScene.unity
+    guid: d5d7caab73b0a2b62aad3b9edebb5218
+  - enabled: 1
+    path: Assets/Scenes/TeleoperationScene.unity
+    guid: 107264338dc6ed5c69a2da9dfcf58c8d
+  m_configObjects:
+    com.unity.xr.management.loader_settings: {fileID: 11400000, guid: 8e0a01ac19074919180d707faf731157, type: 2}
+    com.unity.xr.openxr.settings4: {fileID: 11400000, guid: 7f3f1ff57c630d8029d525643a907e76, type: 2}

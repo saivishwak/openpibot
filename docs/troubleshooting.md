@@ -32,7 +32,7 @@ Look at `session_yaw_deg` on the Calibration card — it should match (or be clo
 
 ## Wrist drifts when controller is still
 
-If you're seeing slow wrist drift even with your hand still, the patched XLeVR isn't running. Restart the OpenPIBot server (`uv run openpibot run --reload --no-build-dashboard` during development, or `uv run openpibot run --host 0.0.0.0` for the built dashboard) — the patch lives in `XLerobot_xuweiwu/XLeVR/xlevr/inputs/vr_ws_server.py` and only takes effect on server restart.
+If you're seeing slow wrist drift even with your hand still, restart the OpenPIBot server and the native Quest app so both sides clear their controller anchors.
 
 If drift persists, the Quest controller may need re-calibration in the Quest system menu.
 
@@ -52,11 +52,9 @@ packets before integrating them. If the arm still jitters:
 
 Check the server log for the `release_torque_for_posing` call. If you see no log line, the API didn't reach the OpenPIBot server. If you see the log but the arm still holds, the bus write failed silently — power-cycle the robot and try again.
 
-## VR endpoint loads but motion doesn't reach the backend
+## Quest app connects but motion doesn't reach the backend
 
-Open the Quest browser → developer console. If you see WebSocket connection failures:
-- Wrong port: check `vr.websocket_port` in `config/xlerobot.yaml`.
-- Cert not accepted: open the HTTPS URL on the Quest, you should see a "Proceed anyway" page. Some ISP routers (Jio, Airtel) block self-signed certs on port 8443. Switch to 5443/5442 in the YAML config.
+Check the *VR Operator* page for the tokenized `ws://<workstation>:5000/api/vr/quest/ws` URL and make sure the Quest app uses the same pairing token as `XLE_QUEST_PAIRING_TOKEN`.
 
 ## EE stops at the workspace boundary
 

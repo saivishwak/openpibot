@@ -7,11 +7,11 @@ robot:
   max_relative_target: 8.0
   use_degrees: true
   home_pose:
-    left_arm_shoulder_pan: 21.6703
-    left_arm_shoulder_lift: -90.8132
-    left_arm_elbow_flex: 61.4505
-    left_arm_wrist_flex: 42.4176
-    left_arm_wrist_roll: -4.8791
+    left_arm_shoulder_pan: 21.8462
+    left_arm_shoulder_lift: -91.1648
+    left_arm_elbow_flex: 84.3956
+    left_arm_wrist_flex: 42.2418
+    left_arm_wrist_roll: -5.4945
     left_arm_gripper: 0.7644
     right_arm_shoulder_pan: -35.6923
     right_arm_shoulder_lift: -100.7033
@@ -52,9 +52,6 @@ pi05:
   action_horizon: 50
   control_fps: 30
 vr:
-  host_ip: 0.0.0.0
-  https_port: 5443
-  websocket_port: 5442
   kp: 0.75
   wrist_delta_limit_deg: 5.0
   pos_ema_alpha: 0.3
@@ -62,6 +59,17 @@ vr:
   pos_deadzone_m: 0.001
   rot_deadzone_deg: 0.3
   max_ee_step_m: 0.004
+  quest_video:
+    roles:
+    - head
+    - left_wrist
+    - right_wrist
+    base_port: 5600
+    bitrate_kbps: 2500
+    flip_method: rotate-180
+    brightness: 0.0
+    contrast: 1.0
+    saturation: 1.0
   wrist_motor_polarity:
     left:
       flex: -1

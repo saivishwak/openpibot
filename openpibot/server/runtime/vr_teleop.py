@@ -27,39 +27,31 @@ analytical 2-link model remains the no-placo fallback and for round-trip tests.
 """
 from __future__ import annotations
 
-import asyncio
-import http.server
 import json
 import logging
 import math
 import os
 import pathlib
+import secrets
 import socket
-import ssl
 import subprocess
-import sys
 import threading
 import time
 from dataclasses import dataclass, field
 from typing import Any, Optional
+from urllib.parse import urlparse
 
 from . import motors as _motors
 from .motors import SESSION as MOTORS, ArmSide
 from . import cameras as _cameras
 from . import dataset as _dataset
 from . import home as _home
+from . import quest_video_bridge as _quest_video_bridge
 from . import vr_calibration as _vrcal
+from .native_quest import MAX_NATIVE_QUEST_PACKET_BYTES, NativeQuestAdapter, NativeQuestProtocolError
 from openpibot.server.config import REPO_ROOT
 
 log = logging.getLogger(__name__)
-
-XLEVR_DIR = REPO_ROOT / "XLerobot_xuweiwu" / "XLeVR"
-
-# Make the extended XLeVR (with relative_position / relative_rotvec / RESET mode)
-# importable. The setup script wired the OLDER XLeRobot/XLeVR onto sys.path; this
-# overrides that.
-if str(XLEVR_DIR) not in sys.path:
-    sys.path.insert(0, str(XLEVR_DIR))
 
 # --- control / safety constants -----------------------------------------------
 
@@ -152,7 +144,7 @@ ROBOT_VERIFY_TEST_SCALE: float = 0.20
 # Smoothing factors. 1.0 = raw input, 0.0 = frozen.
 POS_EMA_ALPHA: float = 0.30
 ORI_EMA_ALPHA: float = 0.35
-# Input filtering for the Quest controller stream. XLeVR sends per-frame
+# Input filtering for the Quest controller stream. The native Quest app sends per-frame
 # relative_position/relative_rotvec values while grip is held; ignore tiny
 # controller noise before integrating it into the reset-relative target.
 POS_DEADZONE_M: float = 0.001
@@ -293,8 +285,9 @@ def _load_urdf_kinematics():
 
     The local LeRobot examples and `robot_kinematic_processor.py` use
     `so101_new_calib.urdf` with observed motor `.pos` values directly. Keep the
-    same convention here so RESET anchors, target IK, and the web URDF viewer
-    all describe the same pose.
+    same convention here so RESET anchors and target IK stay in the per-arm
+    SO101 motor frame. The dashboard viewer uses the full XLeRobot URDF only
+    for visualization and maps these motor-degree targets into that model.
     """
     try:
         from lerobot.model.kinematics import RobotKinematics
@@ -391,7 +384,7 @@ def _pose_matrix_from_vr(position: tuple[float, float, float],
 def _controller_rotation_delta_for_side(side: ArmSide, rotation_delta_vr: _np.ndarray) -> _np.ndarray:
     """Normalize controller rotation handedness before VR->robot mapping.
 
-    WebXR controller positions share the same room frame, but the left and right
+    Quest controller positions share the same room frame, but the left and right
     controller local orientation frames are mirrored. The right-hand controller
     rotation matches the robot mapping; the left-hand controller rotation must be
     inverted so wrist/tool rotation follows the same user intent.
@@ -437,7 +430,7 @@ def _wrist_rotvec_since_anchor(
 def _canonicalize_empirical_roll_axis(axis_local: _np.ndarray) -> tuple[_np.ndarray, bool]:
     """Normalize a captured roll axis without letting it invert roll direction.
 
-    Main-branch roll control used the WebXR analytical "roll right" canonical
+    Main-branch roll control used the Quest analytical "roll right" canonical
     of -Z in controller-anchor-local coordinates, then applied the left-hand
     runtime correction separately. The empirical roll step should refine the
     physical axis, not replace that known-good sign convention. If the user
@@ -682,7 +675,7 @@ def _compute_session_frame(anchor_quat: tuple[float, float, float, float]) -> _n
     hand-space) with the robot's +X axis. VR's +Y (up) remains robot's +Z (up) —
     we only calibrate the YAW; vertical is always preserved.
 
-    The controller's local "forward" axis in WebXR/A-Frame is -Z_local. We rotate
+    The controller's local "forward" axis in the backend VR frame is -Z_local. We rotate
     that into VR world frame, project to the horizontal plane (drop the vertical
     component — the user might be holding the controller tilted up/down, but we
     only care about which compass direction they're pointing), and use that as
@@ -692,7 +685,7 @@ def _compute_session_frame(anchor_quat: tuple[float, float, float, float]) -> _n
 
     # Controller-local forward in VR world frame.
     R_anchor = _R.from_quat(_np.array(anchor_quat))
-    fwd_local = _np.array([0.0, 0.0, -1.0])     # WebXR controller forward is -Z_local
+    fwd_local = _np.array([0.0, 0.0, -1.0])     # Quest/backend controller forward is -Z_local
     fwd_vr = R_anchor.as_matrix() @ fwd_local   # 3-vector in VR world frame
 
     # Project to horizontal (drop Y, the VR up axis) and normalise.
@@ -791,200 +784,6 @@ class _LiveTargets:
         }
 
 
-# --- minimal cwd-free HTTPS server for the web-ui ------------------------------
-
-class _StaticHTTPSServer:
-    """Serves the XLeVR web-ui's static files over HTTPS without cwd hacks.
-
-    The upstream SimpleHTTPSServer at XLerobot_xuweiwu/XLeVR/vr_monitor.py
-    calls `context.load_cert_chain('cert.pem', 'key.pem')` with relative paths
-    and serves files relative to `os.chdir(XLEVR_PATH)`. Both of those would
-    break the OpenPIBot server's working directory. We rebuild a minimal version that takes
-    absolute paths.
-
-    Also: the upstream `vr_app.js` has the WebSocket port (8442) hardcoded.
-    If the user moves the WSS server to a different port (e.g. to dodge a
-    router-level block on 8443/8442), we transparently rewrite the JS at
-    serve time so the Quest browser connects to the right port.
-    """
-
-    def __init__(self, host: str, port: int, web_root: pathlib.Path,
-                 cert: pathlib.Path, key: pathlib.Path,
-                 ws_port: int):
-        self.host = host
-        self.port = port
-        self.web_root = web_root.resolve()
-        self.cert = cert.resolve()
-        self.key = key.resolve()
-        self.ws_port = ws_port
-        self._httpd: Optional[http.server.HTTPServer] = None
-        self._thread: Optional[threading.Thread] = None
-
-    def start(self) -> None:
-        web_root = self.web_root
-        ws_port = self.ws_port
-
-        class Handler(http.server.BaseHTTPRequestHandler):
-            def log_message(self, *_): pass
-
-            def end_headers(self):
-                self.send_header("Access-Control-Allow-Origin", "*")
-                self.send_header("Access-Control-Allow-Headers", "content-type")
-                self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-                try: super().end_headers()
-                except (BrokenPipeError, ConnectionResetError, ssl.SSLError): pass
-
-            def do_OPTIONS(self):
-                self.send_response(200); self.end_headers()
-
-            def _json(self, payload: Any, status: int = 200):
-                data = json.dumps(payload).encode("utf-8")
-                self.send_response(status)
-                self.send_header("Content-Type", "application/json")
-                self.send_header("Content-Length", str(len(data)))
-                self.end_headers()
-                try: self.wfile.write(data)
-                except (BrokenPipeError, ConnectionResetError, ssl.SSLError): pass
-
-            def _session(self):
-                return globals().get("SESSION")
-
-            def _read_json_body(self) -> dict[str, Any]:
-                try:
-                    length = int(self.headers.get("Content-Length") or "0")
-                except ValueError:
-                    length = 0
-                if length <= 0:
-                    return {}
-                raw = self.rfile.read(length)
-                try:
-                    return json.loads(raw.decode("utf-8")) or {}
-                except Exception:
-                    return {}
-
-            def _serve_mjpeg(self, cam_id: str):
-                if _cameras.find_camera(cam_id) is None:
-                    self.send_error(404); return
-                self.send_response(200)
-                self.send_header("Content-Type", "multipart/x-mixed-replace; boundary=frame")
-                self.send_header("Cache-Control", "no-store, no-cache, must-revalidate")
-                self.send_header("Pragma", "no-cache")
-                self.send_header("X-Accel-Buffering", "no")
-                self.end_headers()
-                try:
-                    for chunk in _cameras.mjpeg_iter(cam_id):
-                        self.wfile.write(chunk)
-                        self.wfile.flush()
-                except (BrokenPipeError, ConnectionResetError, ssl.SSLError):
-                    return
-
-            def _serve(self, relpath: str, content_type: str):
-                path = (web_root / relpath).resolve()
-                # Disallow escape from web_root.
-                try:
-                    path.relative_to(web_root)
-                except ValueError:
-                    self.send_error(403); return
-                if not path.is_file():
-                    self.send_error(404); return
-                try:
-                    data = path.read_bytes()
-                except OSError:
-                    self.send_error(500); return
-                # Rewrite the hardcoded WebSocket port in vr_app.js if the user
-                # moved the WSS server (e.g. to dodge a router-level port block).
-                if relpath.endswith("vr_app.js") and ws_port != 8442:
-                    import re
-                    text = data.decode("utf-8", errors="replace")
-                    text = re.sub(
-                        r"(const\s+websocketPort\s*=\s*)\d+\s*;",
-                        f"\\g<1>{ws_port};",
-                        text,
-                    )
-                    data = text.encode("utf-8")
-                self.send_response(200)
-                self.send_header("Content-Type", content_type)
-                self.send_header("Content-Length", str(len(data)))
-                self.send_header("Cache-Control", "no-store, no-cache, must-revalidate")
-                self.send_header("Pragma", "no-cache")
-                self.end_headers()
-                try: self.wfile.write(data)
-                except (BrokenPipeError, ConnectionResetError, ssl.SSLError): pass
-
-            def do_GET(self):
-                p = self.path.split("?", 1)[0]
-                if p == "/api/vr/status":
-                    session = self._session()
-                    if session is None:
-                        return self._json({"error": "VR session unavailable"}, status=503)
-                    return self._json(session.status())
-                if p.startswith("/camera/") and p.endswith("/stream"):
-                    cam_id = p[len("/camera/"):-len("/stream")]
-                    return self._serve_mjpeg(cam_id)
-                if p in ("/", "/index.html"): return self._serve("index.html", "text/html")
-                if p.endswith(".css"):  return self._serve(p.lstrip("/"), "text/css")
-                if p.endswith(".js"):   return self._serve(p.lstrip("/"), "application/javascript")
-                if p.endswith(".ico"):  return self._serve(p.lstrip("/"), "image/x-icon")
-                if p.endswith((".jpg", ".jpeg")): return self._serve(p.lstrip("/"), "image/jpeg")
-                if p.endswith(".png"):  return self._serve(p.lstrip("/"), "image/png")
-                if p.endswith(".gif"):  return self._serve(p.lstrip("/"), "image/gif")
-                self.send_error(404)
-
-            def do_POST(self):
-                p = self.path.split("?", 1)[0]
-                session = self._session()
-                if session is None:
-                    return self._json({"error": "VR session unavailable"}, status=503)
-                payload = self._read_json_body()
-                try:
-                    if p == "/api/vr/engage":
-                        active_arm = payload.get("active_arm")
-                        scale = payload.get("scale")
-                        return self._json(session.engage(
-                            bool(payload.get("engaged")),
-                            scale=float(scale) if scale is not None else None,
-                            active_arm=active_arm if active_arm in ("left", "right") else None,
-                        ))
-                    if p == "/api/vr/emergency_stop":
-                        return self._json(session.emergency_stop())
-                    if p == "/api/vr/recording":
-                        if "enabled" in payload:
-                            session.set_recording(
-                                bool(payload.get("enabled")),
-                                task=str(payload.get("task") or ""),
-                                root=str(payload.get("root") or ""),
-                            )
-                        return self._json(session.status())
-                    if p == "/api/vr/recording/task":
-                        return self._json(session.set_recording_task(str(payload.get("task") or "")))
-                except Exception as e:
-                    return self._json({"error": str(e)}, status=409)
-                self.send_error(404)
-
-        self._httpd = http.server.ThreadingHTTPServer((self.host, self.port), Handler)
-        self._httpd.daemon_threads = True
-        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-        ctx.load_cert_chain(str(self.cert), str(self.key))
-        self._httpd.socket = ctx.wrap_socket(self._httpd.socket, server_side=True)
-        self._thread = threading.Thread(
-            target=self._httpd.serve_forever, daemon=True, name="vr-https"
-        )
-        self._thread.start()
-        log.info("VR HTTPS server listening on https://%s:%d (web_root=%s)",
-                 self.host, self.port, self.web_root)
-
-    def stop(self) -> None:
-        if self._httpd is not None:
-            try: self._httpd.shutdown()
-            except Exception: pass
-            try: self._httpd.server_close()
-            except Exception: pass
-        if self._thread is not None and self._thread.is_alive():
-            self._thread.join(timeout=3)
-        self._httpd = None
-        self._thread = None
-
-
 # --- the session ---------------------------------------------------------------
 
 @dataclass
@@ -1008,9 +807,9 @@ class _PerArm:
     # allow hidden offset to grow past workspace limits; that stored "debt" can
     # release later as a sudden jump.
     offset_robot: tuple[float, float, float] = (0.0, 0.0, 0.0)
-    # Reset-relative VR-controller displacement, integrated from XLeVR's
-    # per-frame rel_position stream. `pending_rel_position` is filled by the
-    # WSS drain loop so drive ticks do not drop high-rate controller packets.
+    # Reset-relative VR-controller displacement, integrated from the native
+    # Quest app's per-frame relative-position stream. `pending_rel_position` is
+    # filled by packet ingest so drive ticks do not drop high-rate controller packets.
     vr_offset_accum: tuple[float, float, float] = (0.0, 0.0, 0.0)
     pending_rel_position: tuple[float, float, float] = (0.0, 0.0, 0.0)
     anchor: _AnchorPose = field(default_factory=_AnchorPose)
@@ -1043,12 +842,12 @@ class _PerArm:
     cal_wrist_pitch_verify_deg: float = 0.0
     cal_wrist_roll_verify_deg: float = 0.0
     # Per-arm raw controller-anchor-local rotvec (unit vector) the user's wrist
-    # rotates around when pitching UP. None = use the WebXR analytical default
+    # rotates around when pitching UP. None = use the Quest analytical default
     # (±x_anchor_local depending on side). Captured by the wrist-verify wizard
     # step; persisted in `vr_calibration.yaml` as `wrist_pitch_anchor_local`.
     wrist_pitch_canonical: Optional[tuple[float, float, float]] = None
     # Empirical anchor-local rotvec for user's roll-right motion. None = use
-    # WebXR analytical default (±z_anchor_local depending on side).
+    # Quest analytical default (±z_anchor_local depending on side).
     wrist_roll_canonical: Optional[tuple[float, float, float]] = None
     # Last completion-time motion magnitudes (m) — for UI to show "calibrated to N cm"
     cal_last_fwd_m:  float = 0.0
@@ -1143,10 +942,12 @@ class VRTeleopSession:
         self._dual_mode: bool = False
 
         # VR pipeline (process-global, persists across motor reconnects).
-        self._https: Optional[_StaticHTTPSServer] = None
-        self._ws_server = None
-        self._asyncio_loop: Optional[asyncio.AbstractEventLoop] = None
-        self._asyncio_thread: Optional[threading.Thread] = None
+        self._native_quest = NativeQuestAdapter(coordinate_frame="unity_openxr")
+        self._native_quest_clients = 0
+        self._native_quest_last_seen: float | None = None
+        self._native_quest_pairing_token = (
+            os.environ.get("XLE_QUEST_PAIRING_TOKEN") or secrets.token_urlsafe(18)
+        )
 
         # Drive loop (process-global).
         self._drive_thread: Optional[threading.Thread] = None
@@ -1304,6 +1105,13 @@ class VRTeleopSession:
         arm = self._arms[side]
         arm.invert_lateral_override = overrides.get(side, False)
         data = _vrcal.read_for_arm(side) or {}
+        if data and data.get("teleop_source") != "native_quest":
+            log.warning(
+                "[%s] ignoring stale VR calibration profile from teleop_source=%r",
+                side,
+                data.get("teleop_source", "legacy"),
+            )
+            data = {}
         arm.session_vr_to_robot = _VR_TO_ROBOT.copy()
         arm.base_vr_direction_matrix = None
         arm.translation_vr_to_robot = None
@@ -1324,23 +1132,24 @@ class VRTeleopSession:
         arm.cal_last_fwd_m = float(data.get("forward_motion_m", 0.0))
         arm.cal_last_up_m = float(data.get("up_motion_m", 0.0))
         arm.cal_last_left_m = float(data.get("left_motion_m", 0.0))
+        robot_data = _vrcal.robot_verification_entry(data)
         arm.translation_scale = _vrcal.translation_scale_for_arm(side)
-        arm.robot_verify_samples = list(data.get("robot_verified_samples") or [])
-        fit_error = data.get("fit_error_cm")
+        arm.robot_verify_samples = list(robot_data.get("robot_verified_samples") or [])
+        fit_error = robot_data.get("fit_error_cm")
         try:
             arm.robot_verify_fit_error_cm = float(fit_error) if fit_error is not None else None
         except (TypeError, ValueError):
             arm.robot_verify_fit_error_cm = None
-        arm.robot_verify_quality = str(data.get("calibration_quality") or (
-            "good" if data.get("calibration_mode") == "robot_verified" else "unverified"
+        arm.robot_verify_quality = str(robot_data.get("calibration_quality") or (
+            "good" if robot_data.get("calibration_mode") == "robot_verified" else "unverified"
         ))
-        arm.robot_verified_at = data.get("verified_at")
-        arm.robot_verify_sample_residuals = list(data.get("robot_verified_sample_residuals") or [])
+        arm.robot_verified_at = robot_data.get("verified_at")
+        arm.robot_verify_sample_residuals = list(robot_data.get("robot_verified_sample_residuals") or [])
         robot_verification_good = arm.robot_verify_quality == "good"
         if not robot_verification_good:
             arm.translation_scale = 1.0
         arm.robot_verify_test_completed = False
-        base_raw = data.get("base_vr_direction_matrix")
+        base_raw = robot_data.get("base_vr_direction_matrix")
         if base_raw is not None:
             try:
                 base = _np.array(base_raw, dtype=float)
@@ -1348,7 +1157,7 @@ class VRTeleopSession:
                     arm.base_vr_direction_matrix = _project_to_rotation_matrix(base)
             except Exception:
                 arm.base_vr_direction_matrix = None
-        translation_raw = data.get("translation_vr_to_robot_matrix")
+        translation_raw = robot_data.get("translation_vr_to_robot_matrix")
         if robot_verification_good and translation_raw is not None:
             try:
                 translation = _np.array(translation_raw, dtype=float)
@@ -1382,6 +1191,8 @@ class VRTeleopSession:
                 arm.wrist_pitch_canonical = tuple(float(-v) for v in arm.wrist_pitch_canonical)
             if arm.wrist_roll_canonical is not None:
                 arm.wrist_roll_canonical = tuple(float(-v) for v in arm.wrist_roll_canonical)
+        if not data:
+            return
         saved_M = _vrcal.matrix_for_arm(side)
         if saved_M is None:
             return
@@ -1392,7 +1203,7 @@ class VRTeleopSession:
         # Keep wrist/orientation on the stage-1 VR direction matrix; use the
         # verified matrix only for position via `translation_vr_to_robot`.
         using_base_frame = (
-            data.get("calibration_mode") == "robot_verified"
+            robot_data.get("calibration_mode") == "robot_verified"
             and arm.base_vr_direction_matrix is not None
         )
         if using_base_frame:
@@ -1482,12 +1293,6 @@ class VRTeleopSession:
             try:
                 MOTORS.connect(side)
                 self._seed_targets_from_present(side)
-                # VR pipeline + drive loop are started ONCE and persist across
-                # motor connect/disconnect cycles so the Quest browser's WS stays
-                # connected when switching arms.
-                if self._https is None:
-                    self._stop_evt.clear()
-                    self._start_vr_pipeline()
                 if self._drive_thread is None or not self._drive_thread.is_alive():
                     self._stop_evt.clear()
                     self._start_drive_loop()
@@ -1713,10 +1518,9 @@ class VRTeleopSession:
         ready_blockers: list[str] = []
         if not connected:
             ready_blockers.append("connect at least one arm")
-        if self._https is None:
-            ready_blockers.append("VR HTTPS endpoint is not running")
-        if self._ws_server is None or not bool(getattr(self._ws_server, "is_running", False)):
-            ready_blockers.append("VR websocket is not running")
+        native_ready = self._native_quest_clients > 0
+        if not native_ready:
+            ready_blockers.append("Quest app is not connected")
         if not head_camera:
             ready_blockers.append("head camera role is not configured")
         for side in connected:
@@ -1770,11 +1574,10 @@ class VRTeleopSession:
                 "recording_readiness": robot_verify.get("readiness", "stage1_only"),
             }
 
-        client_count = 0
-        try:
-            client_count = len(getattr(self._ws_server, "clients", []) or [])
-        except Exception:
-            client_count = 0
+        native_age_ms = (
+            int(1000 * (now - self._native_quest_last_seen))
+            if self._native_quest_last_seen is not None else None
+        )
         return {
             "stage": stage,
             "guidance": guidance,
@@ -1782,9 +1585,12 @@ class VRTeleopSession:
             "recording_blockers": list(recording_info.get("calibration_blockers") or []),
             "connection": {
                 "backend_ready": True,
-                "https_ready": self._https is not None,
-                "websocket_ready": self._ws_server is not None and bool(getattr(self._ws_server, "is_running", False)),
-                "websocket_clients": client_count,
+                "https_ready": False,
+                "websocket_ready": native_ready,
+                "websocket_clients": self._native_quest_clients,
+                "native_quest_ready": native_ready,
+                "native_quest_clients": self._native_quest_clients,
+                "native_quest_last_seen_ms": native_age_ms,
                 "connected_arms": connected,
             },
             "camera_roles": camera_roles,
@@ -1799,6 +1605,258 @@ class VRTeleopSession:
             },
             "updated_at": now,
         }
+
+    def quest_bridge_status(self, *, public_base_url: str | None = None) -> dict[str, Any]:
+        with self._lock:
+            now = time.time()
+            age_ms = (
+                int(1000 * (now - self._native_quest_last_seen))
+                if self._native_quest_last_seen is not None else None
+            )
+            return {
+                "clients": self._native_quest_clients,
+                "last_seen_ms": age_ms,
+                "endpoint": "/api/vr/quest/ws",
+                "ws_url": self._native_quest_ws_url(public_base_url=public_base_url),
+                "coordinate_frame": self._native_quest.coordinate_frame,
+                "pairing_required": True,
+                "max_packet_bytes": MAX_NATIVE_QUEST_PACKET_BYTES,
+            }
+
+    def quest_operator_status(self, *, public_base_url: str | None = None) -> dict[str, Any]:
+        operator = self._quest_operator_status_snapshot()
+        connection = operator.get("connection") or {}
+        recording = operator.get("recording") or {}
+        calibration = operator.get("calibration") or {}
+        robot_verification = operator.get("robot_verification") or {}
+        video = _quest_video_bridge.bridge_status()
+        with self._lock:
+            last_error = self._last_error
+            active_arm = self._active_arm
+            dual_mode = self._dual_mode
+            engaged = self._engaged
+        return {
+            "stage": str(operator.get("stage") or "connect_required"),
+            "guidance": str(operator.get("guidance") or ""),
+            "last_error": str(last_error or ""),
+            "ready_blockers": list(operator.get("ready_blockers") or []),
+            "recording_blockers": list(operator.get("recording_blockers") or []),
+            "native_quest_ready": bool(connection.get("native_quest_ready", False)),
+            "native_quest_clients": int(connection.get("native_quest_clients") or 0),
+            "native_quest_last_seen_ms": connection.get("native_quest_last_seen_ms"),
+            "connected_arms": list(connection.get("connected_arms") or []),
+            "recording_active": bool(recording.get("active", False)),
+            "recording_ready": bool(recording.get("ready", False)),
+            "recording_frames": int(recording.get("frames") or 0),
+            "recording_episodes_saved": int(recording.get("episodes_saved") or 0),
+            "active_arm": active_arm,
+            "dual_mode": bool(dual_mode),
+            "engaged": bool(engaged),
+            "calibration_active": bool(calibration.get("active", False)),
+            "calibration_side": str(calibration.get("side") or ""),
+            "calibration_state": str(calibration.get("state") or "idle"),
+            "calibration_motion_m": float(calibration.get("motion_m") or 0.0),
+            "calibration_target_m": float(calibration.get("target_m") or CALIBRATION_TARGET_MOTION_M),
+            "calibration_min_m": float(calibration.get("min_m") or CALIBRATION_MIN_MOTION_M),
+            "calibration_wrist_pitch_deg": float(calibration.get("wrist_pitch_deg") or 0.0),
+            "calibration_wrist_roll_deg": float(calibration.get("wrist_roll_deg") or 0.0),
+            "calibration_wrist_target_deg": float(calibration.get("wrist_target_deg") or WRIST_VERIFY_TARGET_DEG),
+            "calibration_wrist_min_deg": float(calibration.get("wrist_min_deg") or WRIST_VERIFY_MIN_DEG),
+            "calibration_confidence": str(calibration.get("confidence") or ""),
+            "robot_verification_active": bool(robot_verification.get("active", False)),
+            "robot_verification_side": str(robot_verification.get("side") or ""),
+            "robot_verification_state": str(robot_verification.get("state") or "idle"),
+            "robot_verification_label": str(robot_verification.get("label") or ""),
+            "robot_verification_sample_count": int(robot_verification.get("sample_count") or 0),
+            "robot_verification_min_samples": int(robot_verification.get("min_samples") or ROBOT_VERIFY_MIN_SAMPLES),
+            "robot_verification_quality": str(robot_verification.get("quality") or "unverified"),
+            "robot_verification_message": str(robot_verification.get("message") or ""),
+            "robot_verification_live_state": str(robot_verification.get("live_state") or ""),
+            "robot_verification_ready": bool(robot_verification.get("ready", False)),
+            "robot_verification_direction_error_deg": robot_verification.get("direction_error_deg"),
+            "robot_verification_magnitude_ratio": robot_verification.get("magnitude_ratio"),
+            "robot_verification_position_error_cm": robot_verification.get("position_error_cm"),
+            "robot_verification_vr_motion_m": robot_verification.get("vr_motion_m"),
+            "robot_verification_target_motion_m": robot_verification.get("target_motion_m"),
+            "robot_verification_target_robot_delta": robot_verification.get("target_robot_delta"),
+            "robot_verification_predicted_robot_delta": robot_verification.get("predicted_robot_delta"),
+            "robot_verification_vr_delta": robot_verification.get("vr_delta"),
+            "robot_verification_fit_error_cm": robot_verification.get("fit_error_cm"),
+            "robot_verification_residual_hint": str(robot_verification.get("residual_hint") or ""),
+            "robot_verification_controls": str(robot_verification.get("controls") or ""),
+            "ws_url": self._native_quest_ws_url(public_base_url=public_base_url),
+            "coordinate_frame": self._native_quest.coordinate_frame,
+            "video_ready": bool(video.get("ready", False)),
+            "video_running": bool(video.get("running", False)),
+            "video_transport": str(video.get("transport") or ""),
+            "video_base_port": int(video.get("base_port") or 5600),
+            "video_bitrate_kbps": int(video.get("bitrate_kbps") or 0),
+            "video_running_roles": list(video.get("running_roles") or []),
+            "video_receive_health": dict(video.get("receive_health") or {}),
+        }
+
+    def _quest_operator_status_snapshot(self) -> dict[str, Any]:
+        """Readless status for the in-headset UI.
+
+        The Quest app asks for this while streaming controller poses. Avoid
+        motor bus reads here so headset traffic cannot starve dashboard actions
+        such as robot connect, calibration, and recording controls.
+        """
+        now = time.time()
+        with self._lock:
+            arms_status: dict[str, Any] = {}
+            calibration_summary: dict[str, Any] = {
+                "active": False,
+                "side": "",
+                "state": "idle",
+                "motion_m": 0.0,
+                "target_m": CALIBRATION_TARGET_MOTION_M,
+                "min_m": CALIBRATION_MIN_MOTION_M,
+                "wrist_pitch_deg": 0.0,
+                "wrist_roll_deg": 0.0,
+                "wrist_target_deg": WRIST_VERIFY_TARGET_DEG,
+                "wrist_min_deg": WRIST_VERIFY_MIN_DEG,
+                "confidence": "",
+            }
+            robot_verification_summary: dict[str, Any] = {
+                "active": False,
+                "side": "",
+                "state": "idle",
+                "label": "",
+                "sample_count": 0,
+                "min_samples": ROBOT_VERIFY_MIN_SAMPLES,
+                "quality": "unverified",
+                "message": "",
+                "live_state": "",
+                "ready": False,
+                "direction_error_deg": None,
+                "magnitude_ratio": None,
+                "position_error_cm": None,
+                "vr_motion_m": None,
+                "target_motion_m": None,
+                "target_robot_delta": None,
+                "predicted_robot_delta": None,
+                "vr_delta": None,
+                "fit_error_cm": None,
+                "residual_hint": "",
+                "controls": "",
+            }
+            for side in ("left", "right"):
+                arm = self._arms[side]
+                controller_age_ms = (
+                    int(1000 * (now - arm.latest.received_at))
+                    if arm.latest.has_data else None
+                )
+                ik_reject_fraction = (
+                    float(arm.quality_ik_rejects) / float(arm.quality_ticks)
+                    if arm.quality_ticks else 0.0
+                )
+                arms_status[side] = {
+                    "connected": MOTORS.is_connected(side),
+                    "torque_enabled": MOTORS.is_torque_enabled(side),
+                    "calibrated": arm.calibrated,
+                    "controller": {
+                        "age_ms": controller_age_ms,
+                    },
+                    "calibration": {
+                        "vr_ctrl_to_ee_ready": arm.vr_ctrl_to_ee is not None,
+                        "quality": {
+                            "offset_speed_ema_mps": float(arm.quality_offset_speed_ema_mps),
+                            "ik_reject_fraction": ik_reject_fraction,
+                        },
+                        "robot_verification": {
+                            "readiness": (
+                                "ready_to_record"
+                                if (
+                                    arm.robot_verify_quality == "good"
+                                    and arm.robot_verify_fit_error_cm is not None
+                                    and arm.robot_verify_fit_error_cm <= ROBOT_VERIFY_PASS_ERROR_CM
+                                    and arm.robot_verify_test_completed
+                                )
+                                else "verified_test_pending"
+                                if arm.robot_verify_quality == "good"
+                                else "stage1_only"
+                            ),
+                        },
+                    },
+                }
+                if not calibration_summary["active"] and arm.cal_state != "idle":
+                    calibration_summary = {
+                        "active": True,
+                        "side": side,
+                        "state": arm.cal_state,
+                        "motion_m": math.sqrt(sum(v * v for v in arm.cal_motion_acc)),
+                        "target_m": CALIBRATION_TARGET_MOTION_M,
+                        "min_m": CALIBRATION_MIN_MOTION_M,
+                        "wrist_pitch_deg": float(arm.cal_wrist_pitch_verify_deg),
+                        "wrist_roll_deg": float(arm.cal_wrist_roll_verify_deg),
+                        "wrist_target_deg": WRIST_VERIFY_TARGET_DEG,
+                        "wrist_min_deg": WRIST_VERIFY_MIN_DEG,
+                        "confidence": arm.cal_confidence,
+                    }
+                if not robot_verification_summary["active"] and arm.robot_verify_state != "idle":
+                    live = self._robot_verification_live_status(arm, now)
+                    engage_button = ENGAGE_BUTTON_BY_SIDE.get(side, "A" if side == "right" else "X")
+                    controls = (
+                        f"Keep grip held; press {engage_button} to capture VR end"
+                        if arm.robot_verify_vr_start is not None
+                        else f"Hold grip; press {engage_button} to capture VR start"
+                    )
+                    robot_verification_summary = {
+                        "active": True,
+                        "side": side,
+                        "state": arm.robot_verify_state,
+                        "label": arm.robot_verify_label,
+                        "sample_count": len(arm.robot_verify_samples),
+                        "min_samples": ROBOT_VERIFY_MIN_SAMPLES,
+                        "quality": arm.robot_verify_quality,
+                        "message": str(live.get("message") or ""),
+                        "live_state": str(live.get("state") or ""),
+                        "ready": bool(live.get("ready", False)),
+                        "direction_error_deg": live.get("direction_error_deg"),
+                        "magnitude_ratio": live.get("magnitude_ratio"),
+                        "position_error_cm": live.get("position_error_cm"),
+                        "vr_motion_m": live.get("vr_motion_m"),
+                        "target_motion_m": live.get("target_motion_m"),
+                        "target_robot_delta": live.get("target_robot_delta"),
+                        "predicted_robot_delta": live.get("predicted_robot_delta"),
+                        "vr_delta": live.get("vr_delta"),
+                        "fit_error_cm": arm.robot_verify_fit_error_cm,
+                        "residual_hint": self._robot_verification_residual_hint(
+                            arm.robot_verify_sample_residuals
+                        ),
+                        "controls": controls,
+                    }
+
+            rec = self._recorder
+            recording_blockers = self._recording_calibration_blockers()
+            recording_info = {
+                "active": self._recording,
+                "episodes_saved": (rec.episode_count if rec else self._episodes_saved),
+                "frames_in_current_episode": rec.frame_count_in_episode if rec else 0,
+                "last_task": self._last_task,
+                "calibration_ready": not recording_blockers,
+                "calibration_blockers": recording_blockers,
+            }
+            operator = self._operator_status(arms_status, recording_info, now)
+            operator["calibration"] = calibration_summary
+            operator["robot_verification"] = robot_verification_summary
+            return operator
+
+    def verify_native_quest_pairing_token(self, token: str | None) -> bool:
+        expected = self._native_quest_pairing_token
+        return bool(token) and secrets.compare_digest(str(token), expected)
+
+    def _native_quest_ws_url(self, *, public_base_url: str | None = None) -> str:
+        if public_base_url:
+            parsed = urlparse(public_base_url)
+            scheme = "wss" if parsed.scheme == "https" else "ws"
+            if parsed.netloc:
+                return f"{scheme}://{parsed.netloc}/api/vr/quest/ws"
+        host = os.environ.get("OPENPIBOT_PUBLIC_HOST") or self._local_ip()
+        port = int(os.environ.get("OPENPIBOT_PORT") or "5000")
+        scheme = "wss" if os.environ.get("OPENPIBOT_TLS", "").lower() in {"1", "true", "yes"} else "ws"
+        return f"{scheme}://{host}:{port}/api/vr/quest/ws"
 
     def status(self) -> dict:
         now = time.time()
@@ -1922,6 +1980,12 @@ class VRTeleopSession:
                             "translation_scale": arm.translation_scale,
                             "fit_error_cm": arm.robot_verify_fit_error_cm,
                             "sample_residuals": list(arm.robot_verify_sample_residuals),
+                            "worst_residuals": self._robot_verification_worst_residuals(
+                                arm.robot_verify_sample_residuals
+                            ),
+                            "residual_hint": self._robot_verification_residual_hint(
+                                arm.robot_verify_sample_residuals
+                            ),
                             "quality": arm.robot_verify_quality,
                             "verified_at": arm.robot_verified_at,
                             "min_samples": ROBOT_VERIFY_MIN_SAMPLES,
@@ -2066,37 +2130,15 @@ class VRTeleopSession:
         return max(0.05, min(5.0, float(arm.translation_scale or 1.0)))
 
     def _robot_verification_preview_matrix(self, arm: _PerArm) -> tuple[_np.ndarray, str]:
-        """Best available translation preview for robot verification UI.
+        """Translation preview used by robot verification UI.
 
-        With three or more spanning samples, show the same least-squares mapping
-        the final solve will use. Before that, fall back to the stage-1 frame
-        and median scale estimate so the first samples still get guidance.
+        This must match the model used by final solve and live teleop:
+        calibrated stage-1 direction frame plus one scalar reach scale. Do not
+        guide the user with a provisional 3x3 least-squares matrix here. That
+        matrix can cross-couple axes from partial/noisy samples, causing prompts
+        like "up" to require a twist, while solve later rejects the same data
+        against the stable runtime model.
         """
-        vr_deltas: list[_np.ndarray] = []
-        robot_deltas: list[_np.ndarray] = []
-        for sample in arm.robot_verify_samples:
-            try:
-                vr_delta = _np.array(sample.get("vr_delta"), dtype=float)
-                robot_delta = _np.array(sample.get("robot_delta"), dtype=float)
-            except Exception:
-                continue
-            if vr_delta.shape != (3,) or robot_delta.shape != (3,):
-                continue
-            if (
-                float(_np.linalg.norm(vr_delta)) >= ROBOT_VERIFY_MIN_MOTION_M
-                and float(_np.linalg.norm(robot_delta)) >= ROBOT_VERIFY_MIN_MOTION_M
-            ):
-                vr_deltas.append(vr_delta)
-                robot_deltas.append(robot_delta)
-        if len(vr_deltas) >= 3:
-            V = _np.stack(vr_deltas, axis=0)
-            R = _np.stack(robot_deltas, axis=0)
-            if _np.linalg.matrix_rank(V, tol=0.015) >= 3:
-                translation_T, *_ = _np.linalg.lstsq(V, R, rcond=None)
-                translation = translation_T.T
-                if _np.all(_np.isfinite(translation)):
-                    return translation, "provisional_lstsq"
-
         matrix = (
             arm.base_vr_direction_matrix
             if arm.robot_verify_state != "idle" and arm.base_vr_direction_matrix is not None
@@ -2104,9 +2146,107 @@ class VRTeleopSession:
         )
         return self._robot_verification_preview_scale(arm) * self._effective_translation_matrix(arm, matrix), "stage1_scaled"
 
+    @staticmethod
+    def _normalize_robot_verification_label(label: str) -> str:
+        return str(label or "").strip().lower().replace("_", "-").replace(" ", "-")
+
+    def _effective_robot_verification_label(
+        self,
+        samples: list[dict[str, Any]],
+        index: int,
+    ) -> str:
+        raw = self._normalize_robot_verification_label(samples[index].get("label", ""))
+        if raw in ROBOT_VERIFY_REQUIRED_LABELS:
+            return raw
+        # Compatibility for samples captured by the Quest A/X button before the
+        # dashboard sent the selected direction into backend state. Those samples
+        # were stored as sample-1..sample-6 even though the UI directed the user
+        # through the required directions in order.
+        if (
+            0 <= index < len(ROBOT_VERIFY_REQUIRED_LABELS)
+            and raw == f"sample-{index + 1}"
+            and len(samples) >= len(ROBOT_VERIFY_REQUIRED_LABELS)
+        ):
+            first_labels = [
+                self._normalize_robot_verification_label(sample.get("label", ""))
+                for sample in samples[:len(ROBOT_VERIFY_REQUIRED_LABELS)]
+            ]
+            if all(label == f"sample-{i + 1}" for i, label in enumerate(first_labels)):
+                return ROBOT_VERIFY_REQUIRED_LABELS[index]
+        return raw
+
+    def _robot_verification_sample_motion_valid(self, sample: dict[str, Any]) -> bool:
+        try:
+            vr = _np.array(sample.get("vr_delta"), dtype=float)
+            robot = _np.array(sample.get("robot_delta"), dtype=float)
+        except Exception:
+            return False
+        if vr.shape != (3,) or robot.shape != (3,):
+            return False
+        if not _np.all(_np.isfinite(vr)) or not _np.all(_np.isfinite(robot)):
+            return False
+        return (
+            float(_np.linalg.norm(vr)) >= ROBOT_VERIFY_MIN_MOTION_M
+            and float(_np.linalg.norm(robot)) >= ROBOT_VERIFY_MIN_MOTION_M
+        )
+
     def _missing_robot_verification_labels(self, arm: _PerArm) -> list[str]:
-        captured = {str(sample.get("label") or "").strip().lower() for sample in arm.robot_verify_samples}
+        samples = list(arm.robot_verify_samples)
+        captured = {
+            self._effective_robot_verification_label(samples, idx)
+            for idx in range(len(samples))
+            if self._robot_verification_sample_motion_valid(samples[idx])
+        }
         return [label for label in ROBOT_VERIFY_REQUIRED_LABELS if label not in captured]
+
+    @staticmethod
+    def _robot_verification_worst_residuals(
+        residuals: list[dict[str, Any]],
+        *,
+        limit: int = 3,
+    ) -> list[dict[str, Any]]:
+        cleaned: list[dict[str, Any]] = []
+        for item in residuals or []:
+            if not isinstance(item, dict):
+                continue
+            try:
+                residual_cm = float(item.get("residual_cm"))
+            except (TypeError, ValueError):
+                continue
+            if not math.isfinite(residual_cm):
+                continue
+            normalized = dict(item)
+            normalized["residual_cm"] = residual_cm
+            cleaned.append(normalized)
+        cleaned.sort(key=lambda item: float(item["residual_cm"]), reverse=True)
+        return cleaned[:max(0, limit)]
+
+    def _robot_verification_residual_hint(self, residuals: list[dict[str, Any]]) -> str:
+        worst = self._robot_verification_worst_residuals(residuals, limit=6)
+        if not worst:
+            return ""
+
+        def label_for(item: dict[str, Any]) -> str:
+            return str(item.get("label") or f"sample-{int(item.get('index', 0)) + 1}")
+
+        worst_text = ", ".join(
+            f"{label_for(item)} {float(item['residual_cm']):.1f} cm"
+            for item in worst[:3]
+        )
+        recapture = [item for item in worst if float(item["residual_cm"]) > ROBOT_VERIFY_PASS_ERROR_CM]
+        if not recapture:
+            recapture = worst[:1]
+        recapture_labels: list[str] = []
+        for item in recapture:
+            label = label_for(item)
+            if label not in recapture_labels:
+                recapture_labels.append(label)
+            if len(recapture_labels) >= 3:
+                break
+        return (
+            f"Worst residuals: {worst_text}. "
+            f"Recapture {', '.join(recapture_labels)} first near the grasp workspace."
+        )
 
     def _effective_translation_matrix(self, arm: _PerArm, matrix: _np.ndarray) -> _np.ndarray:
         M = _np.asarray(matrix, dtype=float)
@@ -2164,7 +2304,8 @@ class VRTeleopSession:
             if arm.robot_verify_quality == "good":
                 out["message"] = "Verified calibration is saved. Use low-scale test before recording."
             elif arm.robot_verify_quality in ("warn", "needs_recapture", "poor"):
-                out["message"] = "Robot verification residual is too high. Recapture all six directions."
+                hint = self._robot_verification_residual_hint(arm.robot_verify_sample_residuals)
+                out["message"] = hint or "Robot verification residual is too high. Recapture all six directions."
             else:
                 out["message"] = "Start robot verification to refine the VR-only mapping."
             return out
@@ -2208,14 +2349,6 @@ class VRTeleopSession:
         vr_motion = float(_np.linalg.norm(vr_delta))
         out["vr_delta"] = [float(v) for v in vr_delta]
         out["vr_motion_m"] = vr_motion
-        if vr_motion < ROBOT_VERIFY_MIN_MOTION_M:
-            out["state"] = "move_vr"
-            out["message"] = (
-                f"Hold grip while moving the controller in the same direction as "
-                f"the robot target ({ROBOT_VERIFY_MIN_MOTION_M * 100:.1f}+ cm)."
-            )
-            return out
-
         if arm.robot_verify_quality == "good" and arm.translation_vr_to_robot is not None:
             effective_M = self._runtime_translation_matrix(arm)
             preview_source = "verified"
@@ -2227,6 +2360,14 @@ class VRTeleopSession:
         out["predicted_motion_m"] = predicted_motion
         out["scale_estimate"] = self._robot_verification_preview_scale(arm)
         out["preview_source"] = preview_source
+        if vr_motion < ROBOT_VERIFY_MIN_MOTION_M:
+            out["state"] = "move_vr"
+            out["message"] = (
+                f"Hold grip while moving the controller in the same direction as "
+                f"the robot target ({ROBOT_VERIFY_MIN_MOTION_M * 100:.1f}+ cm)."
+            )
+            return out
+
         if predicted_motion < 1e-9:
             out["state"] = "move_vr"
             out["message"] = "Controller movement is too small to evaluate."
@@ -2240,6 +2381,7 @@ class VRTeleopSession:
         ready = (
             direction_error_deg <= ROBOT_VERIFY_LIVE_GOOD_ANGLE_DEG
             and ROBOT_VERIFY_LIVE_GOOD_RATIO_MIN <= magnitude_ratio <= ROBOT_VERIFY_LIVE_GOOD_RATIO_MAX
+            and err_cm <= ROBOT_VERIFY_PASS_ERROR_CM
         )
         out.update({
             "ready": ready,
@@ -2256,59 +2398,9 @@ class VRTeleopSession:
         })
         return out
 
-    # ── VR pipeline (HTTPS + WSS in an asyncio thread) ──────────────────────
+    # ── Native Quest packet pipeline ────────────────────────────────────────
     def _vr_endpoint_url(self) -> Optional[str]:
-        if self._https is None:
-            return None
-        host = self._local_ip() if self._https.host == "0.0.0.0" else self._https.host
-        return f"https://{host}:{self._https.port}"
-
-    def _ensure_cert_matches_lan_ip(self, cert: pathlib.Path, key: pathlib.Path) -> None:
-        """If `cert` exists and already covers our current LAN IP in subjectAltName,
-        leave it alone (preserves the cert fingerprint the user already accepted on
-        the Quest). Otherwise (cert missing, or SAN mismatch), generate a fresh pair
-        with the current LAN IP baked in."""
-        ip = self._local_ip()
-        if cert.is_file() and key.is_file() and self._cert_has_ip(cert, ip):
-            log.info("VR cert at %s already covers LAN IP %s; reusing", cert, ip)
-            return
-
-        log.info("regenerating VR cert with CN=%s (was %s)", ip,
-                 "missing" if not cert.is_file() else "stale SAN")
-        if shutil_which := getattr(__import__("shutil"), "which"):
-            if shutil_which("openssl") is None:
-                raise RuntimeError("openssl binary not found in PATH")
-        cmd = [
-            "openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes",
-            "-days", "365",
-            "-subj", f"/CN={ip}",
-            "-addext", f"subjectAltName=IP:{ip},IP:127.0.0.1,DNS:localhost",
-            "-keyout", str(key),
-            "-out", str(cert),
-        ]
-        # Write atomically: openssl will overwrite the existing files in place,
-        # which is fine because we hold no open handles to them right now.
-        result = subprocess.run(cmd, capture_output=True, timeout=15)
-        if result.returncode != 0:
-            raise RuntimeError(
-                f"openssl failed (rc={result.returncode}): {result.stderr.decode(errors='replace')}"
-            )
-        # Verify the new cert actually contains the IP.
-        if not self._cert_has_ip(cert, ip):
-            raise RuntimeError(f"new cert at {cert} still doesn't contain IP {ip}")
-
-    @staticmethod
-    def _cert_has_ip(cert_path: pathlib.Path, ip: str) -> bool:
-        """Return True iff `cert_path` has `ip` listed in its subjectAltName."""
-        try:
-            out = subprocess.check_output(
-                ["openssl", "x509", "-in", str(cert_path), "-noout", "-text"],
-                timeout=5,
-            ).decode(errors="replace")
-        except Exception:
-            return False
-        # X509v3 SAN section will contain a line like `IP Address:192.168.0.113`.
-        return f"IP Address:{ip}" in out
+        return None
 
     @staticmethod
     def _local_ip() -> str:
@@ -2368,179 +2460,104 @@ class VRTeleopSession:
         candidates.sort(key=_classify)
         return candidates[0] if _classify(candidates[0]) < 90 else candidates[0]
 
-    def _start_vr_pipeline(self) -> None:
-        # Late import: xlevr only resolves after sys.path was patched at module load.
-        from xlevr.config import XLeVRConfig
-        from xlevr.inputs.vr_ws_server import VRWebSocketServer
+    def ingest_native_quest_packet(self, packet: dict[str, Any]) -> dict[str, Any]:
+        """Ingest one native Unity/OpenXR packet and update per-arm goals.
 
-        cfg = XLeVRConfig()
-        cfg.enable_vr = True
-        cfg.enable_keyboard = False
-        cfg.enable_https = True
-
-        # Honour user overrides from config/xlerobot.yaml's `vr:` section. Some ISP
-        # routers block 8443/8442 specifically (alt-HTTPS port heuristic), so the
-        # user can move both to e.g. 5443/5442 if 5000 reaches them.
-        import yaml
+        This is intentionally synchronous so REST handlers, WebSocket handlers,
+        and tests can share the exact same adapter path.
+        """
+        if not isinstance(packet, dict):
+            raise NativeQuestProtocolError("packet must be a JSON object")
         try:
-            yaml_cfg = yaml.safe_load(
-                (REPO_ROOT / "config" / "xlerobot.yaml").read_text()
-            ) or {}
-            vr_section = yaml_cfg.get("vr") or {}
-        except Exception:
-            vr_section = {}
-        cfg.host_ip = str(vr_section.get("host_ip", getattr(cfg, "host_ip", "0.0.0.0")))
-        cfg.https_port = int(vr_section.get("https_port", getattr(cfg, "https_port", 8443)))
-        cfg.websocket_port = int(vr_section.get("websocket_port",
-                                                getattr(cfg, "websocket_port", 8442)))
-        log.info("VR using https_port=%s websocket_port=%s host=%s",
-                 cfg.https_port, cfg.websocket_port, cfg.host_ip)
+            packet_bytes = len(json.dumps(packet, separators=(",", ":")).encode("utf-8"))
+        except (TypeError, ValueError) as exc:
+            raise NativeQuestProtocolError("packet must be JSON serializable") from exc
+        if packet_bytes > MAX_NATIVE_QUEST_PACKET_BYTES:
+            raise NativeQuestProtocolError(
+                f"packet exceeds {MAX_NATIVE_QUEST_PACKET_BYTES} byte limit"
+            )
+        goals = self._native_quest.process_packet(packet)
+        with self._lock:
+            self._native_quest_last_seen = time.time()
+        for goal in goals:
+            self._apply_control_goal(goal)
+        return {"ok": True, "goals": len(goals)}
 
-        # Resolve our absolute paths (the upstream relies on cwd; we won't touch it).
-        # IMPORTANT: the static HTML/JS/CSS the Quest browser fetches live under
-        # XLeVR/web-ui/, not under XLeVR/ itself. The upstream's handler prepends
-        # "web-ui/" to every request path; our _StaticHTTPSServer treats web_root as
-        # the actual static-asset root, so point it at the right subdirectory.
-        web_root = XLEVR_DIR / "web-ui"
-        cert = XLEVR_DIR / "cert.pem"
-        key = XLEVR_DIR / "key.pem"
+    def note_native_quest_client(self, connected: bool) -> None:
+        with self._lock:
+            if connected:
+                self._native_quest_clients += 1
+                self._native_quest_last_seen = time.time()
+            else:
+                self._native_quest_clients = max(0, self._native_quest_clients - 1)
 
-        # Auto-regenerate the cert if it doesn't list this workstation's current LAN IP
-        # in its subjectAltName. Without this, Meta Browser silently refuses the TLS
-        # handshake when the URL's IP doesn't appear in the cert (no "Proceed unsafe"
-        # button is shown in that case).
-        try:
-            self._ensure_cert_matches_lan_ip(cert, key)
-        except Exception as e:
-            raise RuntimeError(
-                f"could not prepare HTTPS cert at {cert}: {e}\n"
-                f"You can regenerate manually:\n"
-                f"  IP=$(hostname -I | awk '{{print $1}}')\n"
-                f"  openssl req -x509 -newkey rsa:2048 -nodes -days 365 \\\n"
-                f"    -subj \"/CN=$IP\" -addext \"subjectAltName=IP:$IP,IP:127.0.0.1,DNS:localhost\" \\\n"
-                f"    -keyout {key} -out {cert}"
-            ) from e
-
-        # HTTPS server (serves the web-ui static assets). Pass the configured WSS
-        # port so the on-the-fly rewrite of vr_app.js makes the Quest connect to
-        # the right WSS endpoint.
-        self._https = _StaticHTTPSServer(
-            host=cfg.host_ip,
-            port=cfg.https_port,
-            web_root=web_root, cert=cert, key=key,
-            ws_port=cfg.websocket_port,
-        )
-        self._https.start()
-
-        # WSS server (receives VR controller pose messages) runs in an asyncio loop
-        # on its own thread. The xuweiwu VRWebSocketServer needs an asyncio.Queue.
-        ready = threading.Event()
-        thread_err: dict[str, Any] = {}
-
-        def _run():
-            try:
-                loop = asyncio.new_event_loop()
-                asyncio.set_event_loop(loop)
-                self._asyncio_loop = loop
-
-                queue: asyncio.Queue = asyncio.Queue()
-                self._ws_server = VRWebSocketServer(
-                    command_queue=queue, config=cfg, print_only=False
-                )
-                loop.create_task(self._ws_server.start())
-                loop.create_task(self._drain_goals(queue))
-                ready.set()
-                loop.run_forever()
-            except Exception as e:
-                thread_err["e"] = e
-                ready.set()
-
-        self._asyncio_thread = threading.Thread(target=_run, daemon=True, name="vr-wss")
-        self._asyncio_thread.start()
-        ready.wait(timeout=8)
-        if "e" in thread_err:
-            self._https.stop(); self._https = None
-            raise RuntimeError(f"VR WebSocket server failed to start: {thread_err['e']}")
-
-    async def _drain_goals(self, queue: "asyncio.Queue") -> None:
-        """Consume ControlGoals from the WSS server and route each to the matching
-        per-arm `_PerArm`. Headset goals are ignored. Goals for an arm that isn't
-        currently connected are still accepted into _PerArm state — that way, if
-        the user squeezes grip BEFORE connecting that arm in the UI, the latest
-        goal is already there when they do connect."""
-        try:
-            from xlevr.inputs.base import ControlMode  # noqa: F401
-        except Exception:
-            pass
-        while not self._stop_evt.is_set():
-            try:
-                goal = await asyncio.wait_for(queue.get(), timeout=0.5)
-            except asyncio.TimeoutError:
-                continue
-            try:
-                side = getattr(goal, "arm", None)
-                if side not in ("left", "right"):
-                    continue  # headset / unknown
-                arm = self._arms[side]
-                mode_obj = getattr(goal, "mode", None)
-                mode = getattr(mode_obj, "value", mode_obj) or "idle"
-                rp = getattr(goal, "relative_position", None)
-                rr = getattr(goal, "relative_rotvec", None)
-                cp = getattr(goal, "vr_ctrl_position", None)
-                rot = getattr(goal, "vr_ctrl_rotation", None)
-                trig = bool(getattr(goal, "trigger", False))
-                thumb = getattr(goal, "thumbstick", None) or {}
-                btn  = getattr(goal, "buttons", None) or {}
-                with self._lock:
-                    cur_buttons = {str(k): bool(v) for k, v in btn.items()}
-                    prev_buttons = arm.prev_buttons
-                    arm.prev_buttons = dict(cur_buttons)
-                    # Latch reset edges so a fast-following 'position' goal can't
-                    # overwrite the calibration trigger before the drive loop ticks.
-                    if str(mode) == "reset":
-                        arm.reset_pending = True
-                        arm.pending_rel_position = (0.0, 0.0, 0.0)
-                    arm.latest = _LatestGoal(
-                        received_at=time.time(),
-                        has_data=True,
-                        mode=str(mode),
-                        rel_position=tuple(float(v) for v in (rp if rp is not None else (0, 0, 0))),
-                        rel_rotvec=tuple(float(v) for v in (rr if rr is not None else (0, 0, 0))),
-                        controller_position=(tuple(float(v) for v in cp) if cp is not None else None),
-                        rotation_quat=(tuple(float(v) for v in rot.as_quat()) if rot is not None and hasattr(rot, "as_quat") else None),
-                        trigger=trig,
-                        thumbstick=(float(thumb.get("x", 0)), float(thumb.get("y", 0))),
-                        buttons=cur_buttons,
+    def _apply_control_goal(self, goal: Any) -> None:
+        side = getattr(goal, "arm", None)
+        if side not in ("left", "right"):
+            return  # headset / unknown
+        arm = self._arms[side]
+        mode_obj = getattr(goal, "mode", None)
+        mode = getattr(mode_obj, "value", mode_obj) or "idle"
+        rp = getattr(goal, "relative_position", None)
+        rr = getattr(goal, "relative_rotvec", None)
+        cp = getattr(goal, "vr_ctrl_position", None)
+        rot = getattr(goal, "vr_ctrl_rotation", None)
+        trig = bool(getattr(goal, "trigger", False))
+        thumb = getattr(goal, "thumbstick", None) or {}
+        btn = getattr(goal, "buttons", None) or {}
+        with self._lock:
+            cur_buttons = {str(k): bool(v) for k, v in btn.items()}
+            prev_buttons = arm.prev_buttons
+            arm.prev_buttons = dict(cur_buttons)
+            if str(mode) == "reset":
+                arm.reset_pending = True
+                arm.pending_rel_position = (0.0, 0.0, 0.0)
+            arm.latest = _LatestGoal(
+                received_at=time.time(),
+                has_data=True,
+                mode=str(mode),
+                rel_position=tuple(float(v) for v in (rp if rp is not None else (0, 0, 0))),
+                rel_rotvec=tuple(float(v) for v in (rr if rr is not None else (0, 0, 0))),
+                controller_position=(tuple(float(v) for v in cp) if cp is not None else None),
+                rotation_quat=(tuple(float(v) for v in rot.as_quat()) if rot is not None and hasattr(rot, "as_quat") else None),
+                trigger=trig,
+                thumbstick=(float(thumb.get("x", 0)), float(thumb.get("y", 0))),
+                buttons=cur_buttons,
+            )
+            if str(mode) == "position":
+                rel = _np.array(rp if rp is not None else (0.0, 0.0, 0.0), dtype=float)
+                if _np.all(_np.isfinite(rel)):
+                    driving_this_arm = self._engaged and (
+                        self._dual_mode or self._active_arm == side
                     )
-                    if str(mode) == "position":
-                        rel = _np.array(rp if rp is not None else (0.0, 0.0, 0.0), dtype=float)
-                        if _np.all(_np.isfinite(rel)):
-                            driving_this_arm = self._engaged and (
-                                self._dual_mode or self._active_arm == side
-                            )
-                            if driving_this_arm:
-                                pending = _np.array(arm.pending_rel_position, dtype=float) + rel
-                                arm.pending_rel_position = (
-                                    float(pending[0]), float(pending[1]), float(pending[2])
-                                )
-                            if (
-                                arm.robot_verify_state == "vr_start_captured"
-                                and arm.robot_verify_vr_start is not None
-                            ):
-                                verify_delta = _np.array(arm.robot_verify_vr_delta_accum, dtype=float) + rel
-                                arm.robot_verify_vr_delta_accum = (
-                                    float(verify_delta[0]),
-                                    float(verify_delta[1]),
-                                    float(verify_delta[2]),
-                                )
-                    # Advance the calibration state machine if active for this arm.
-                    # Must hold `self._lock` (still held inside this `with` block).
-                    if arm.cal_state != "idle":
-                        self._advance_calibration(side, arm.latest)
-                    if self._controller_buttons_enabled:
-                        self._handle_button_edges(side, cur_buttons, prev_buttons)
-            except Exception as e:
-                log.warning("goal-drain: %s", e)
+                    if driving_this_arm:
+                        pending = _np.array(arm.pending_rel_position, dtype=float) + rel
+                        arm.pending_rel_position = (
+                            float(pending[0]), float(pending[1]), float(pending[2])
+                        )
+                    if (
+                        arm.robot_verify_state == "vr_start_captured"
+                        and arm.robot_verify_vr_start is not None
+                    ):
+                        verify_delta = _np.array(arm.robot_verify_vr_delta_accum, dtype=float) + rel
+                        arm.robot_verify_vr_delta_accum = (
+                            float(verify_delta[0]),
+                            float(verify_delta[1]),
+                            float(verify_delta[2]),
+                        )
+            elif str(mode) == "idle":
+                if (
+                    arm.robot_verify_state == "vr_start_captured"
+                    and arm.robot_verify_vr_start is not None
+                ):
+                    self._reset_robot_verification_vr_capture(
+                        arm,
+                        reason="grip released before VR end capture",
+                    )
+            if arm.cal_state != "idle":
+                self._advance_calibration(side, arm.latest)
+            if self._controller_buttons_enabled or arm.robot_verify_state != "idle":
+                self._handle_button_edges(side, cur_buttons, prev_buttons)
 
     # ── drive loop ──────────────────────────────────────────────────────────
     def _start_drive_loop(self) -> None:
@@ -2984,7 +3001,7 @@ class VRTeleopSession:
             arm.cal_wrist_roll_verify_deg = 0.0
             # Discard any prior empirical wrist pitch canonical — the user
             # is re-running the wizard. They can either re-capture in step 4
-            # or press 'Skip wrist verify' to fall back to the WebXR default.
+            # or press 'Skip wrist verify' to fall back to the Quest default.
             arm.wrist_pitch_canonical = None
             arm.wrist_roll_canonical = None
             arm.cal_validation = {}
@@ -3213,7 +3230,7 @@ class VRTeleopSession:
                 log.info(
                     "[%s] cal: wrist-pitch anchor captured. KEEP GRIP HELD and pitch "
                     "your wrist clearly UP ~20-45°, "
-                    "then release. Or press 'Skip wrist verify' to use the WebXR default.",
+                    "then release. Or press 'Skip wrist verify' to use the Quest default.",
                     side,
                 )
             elif state == "awaiting_anchor_wrist_roll":
@@ -3233,7 +3250,7 @@ class VRTeleopSession:
                 log.info(
                     "[%s] cal: wrist-roll anchor captured. KEEP GRIP HELD and roll "
                     "your wrist clearly RIGHT ~20-45°, then release. Or press "
-                    "'Skip wrist verify' to keep roll on the WebXR default.",
+                    "'Skip wrist verify' to keep roll on the Quest default.",
                     side,
                 )
             return
@@ -3378,14 +3395,14 @@ class VRTeleopSession:
 
         # Hand off to wrist calibration steps. The user can either do clean
         # pitch + roll motions to capture empirical canonicals (most robust),
-        # or skip via the UI button (analytical canonical from WebXR is then
+        # or skip via the UI button (Quest analytical canonical is then
         # used; works for standard Quest controllers).
         arm.cal_anchor_quat_for_wrist = None
         arm.cal_state = "awaiting_anchor_wrist_pitch"
         log.info(
             "[%s] Translation done. Next (OPTIONAL): squeeze grip, pitch wrist UP, "
             "release, then roll wrist RIGHT. Or press 'Skip wrist verify' "
-            "to finish with WebXR analytical wrist axes.",
+            "to finish with Quest analytical wrist axes.",
             side,
         )
 
@@ -3417,7 +3434,7 @@ class VRTeleopSession:
             log.warning(
                 "[%s] cal: wrist-%s motion too small (%.1f°, need ≥%.0f°). "
                 "Re-grip and rotate wrist further, or press 'Skip wrist verify' "
-                "to use the WebXR analytical default for this axis.",
+                "to use the Quest analytical default for this axis.",
                 side, axis, deg, WRIST_VERIFY_MIN_DEG,
             )
             arm.cal_state = f"awaiting_anchor_wrist_{axis}"
@@ -3449,10 +3466,10 @@ class VRTeleopSession:
         cos = float(_np.dot(_np.asarray(canonical), analytical))
         cos_clamped = max(-1.0, min(1.0, cos))
         off_deg = math.degrees(math.acos(cos_clamped))
-        arm.cal_validation[f"wrist_{axis}_off_from_webxr_default_deg"] = off_deg
+        arm.cal_validation[f"wrist_{axis}_off_from_quest_default_deg"] = off_deg
         msg = "matches" if cos >= 0.85 else "differs from"
         log.info(
-            "[%s] wrist-%s captured: canonical=%s, %.1f° motion, %s WebXR default by %.0f°%s",
+            "[%s] wrist-%s captured: canonical=%s, %.1f° motion, %s Quest default by %.0f°%s",
             side, axis, tuple(f"{v:+.3f}" for v in canonical), deg, msg, off_deg,
             " (flipped to main roll-right sign)" if flipped_to_default else "",
         )
@@ -3490,7 +3507,7 @@ class VRTeleopSession:
             ):
                 arm.wrist_pitch_canonical = None
                 arm.wrist_roll_canonical = None
-                log.info("[%s] wrist pitch+roll skipped — using WebXR analytical defaults", side)
+                log.info("[%s] wrist pitch+roll skipped — using Quest analytical defaults", side)
             else:
                 arm.wrist_roll_canonical = None
                 log.info("[%s] wrist roll skipped — keeping pitch capture and using roll default", side)
@@ -3576,7 +3593,7 @@ class VRTeleopSession:
             log.info("[%s] robot verification cancelled", side)
         return self.status()
 
-    def capture_robot_verification_pose(self, side: ArmSide, point: str) -> dict:
+    def capture_robot_verification_pose(self, side: ArmSide, point: str, label: str = "") -> dict:
         """Capture robot EE start/end pose for the current verification sample."""
         if point not in ("start", "end"):
             raise ValueError("point must be 'start' or 'end'")
@@ -3584,17 +3601,23 @@ class VRTeleopSession:
             arm = self._arms[side]
             if arm.robot_verify_state == "idle":
                 raise RuntimeError("start robot verification first")
+            label_text = self._normalize_robot_verification_label(label or arm.robot_verify_label)
+            if label_text:
+                arm.robot_verify_label = label_text
             T = self._current_ee_transform(side)
             pos = (float(T[0, 3]), float(T[1, 3]), float(T[2, 3]))
             if point == "start":
                 arm.robot_verify_robot_start = pos
                 arm.robot_verify_robot_end = None
                 arm.robot_verify_vr_start = None
+                arm.robot_verify_vr_delta_accum = (0.0, 0.0, 0.0)
                 arm.robot_verify_state = "robot_start_captured"
             else:
                 if arm.robot_verify_robot_start is None:
                     raise RuntimeError("capture robot start before robot end")
                 arm.robot_verify_robot_end = pos
+                arm.robot_verify_vr_start = None
+                arm.robot_verify_vr_delta_accum = (0.0, 0.0, 0.0)
                 arm.robot_verify_state = "robot_end_captured"
                 if not MOTORS.is_torque_enabled(side):
                     # The user has just placed the robot at the end pose. Lock
@@ -3602,7 +3625,7 @@ class VRTeleopSession:
                     # start/end motion for this sample.
                     MOTORS.lock_at_current(side)
                     self._seed_targets_from_present(side)
-            log.info("[%s] robot verification %s pose: %s", side, point, pos)
+            log.info("[%s] robot verification %s pose (%s): %s", side, point, arm.robot_verify_label, pos)
         return self.status()
 
     def capture_robot_verification_vr(self, side: ArmSide, point: str, label: str = "") -> dict:
@@ -3626,17 +3649,24 @@ class VRTeleopSession:
                     f"VR controller pose is stale ({age_s:.1f}s old); move the selected controller "
                     "and hold its grip briefly, then click Capture VR again"
                 )
+            if arm.latest.mode not in ("reset", "position"):
+                raise RuntimeError("hold grip while capturing VR start/end for one continuous sample")
             pos = tuple(float(v) for v in arm.latest.controller_position)
             if point == "start":
                 arm.robot_verify_vr_start = pos
                 arm.robot_verify_vr_delta_accum = (0.0, 0.0, 0.0)
-                arm.robot_verify_label = str(label or arm.robot_verify_label or f"sample-{len(arm.robot_verify_samples)+1}")
+                arm.robot_verify_label = (
+                    self._normalize_robot_verification_label(label or arm.robot_verify_label)
+                    or f"sample-{len(arm.robot_verify_samples)+1}"
+                )
                 arm.robot_verify_state = "vr_start_captured"
                 log.info("[%s] robot verification VR start: %s", side, pos)
                 return self.status()
 
             if arm.robot_verify_vr_start is None:
                 raise RuntimeError("capture VR start before VR end")
+            if arm.latest.mode != "position":
+                raise RuntimeError("keep grip held while moving, then capture VR end before releasing")
             robot_start = _np.array(arm.robot_verify_robot_start, dtype=float)
             robot_end = _np.array(arm.robot_verify_robot_end, dtype=float)
             vr_start = _np.array(arm.robot_verify_vr_start, dtype=float)
@@ -3655,7 +3685,10 @@ class VRTeleopSession:
                     f"VR relative motion too small ({vr_mag*100:.1f} cm); hold grip while "
                     f"moving at least {ROBOT_VERIFY_MIN_MOTION_M*100:.1f} cm"
                 )
-            label_text = str(label or arm.robot_verify_label or f"sample-{len(arm.robot_verify_samples)+1}")
+            label_text = (
+                self._normalize_robot_verification_label(label or arm.robot_verify_label)
+                or f"sample-{len(arm.robot_verify_samples)+1}"
+            )
             sample = {
                 "label": label_text,
                 "robot_start": [float(v) for v in robot_start],
@@ -3675,24 +3708,30 @@ class VRTeleopSession:
             arm.robot_verify_vr_delta_accum = (0.0, 0.0, 0.0)
             arm.robot_verify_label = ""
             arm.robot_verify_state = "collecting"
-            if MOTORS.is_connected(side):
-                if self._active_arm == side:
-                    self._engaged = False
-                    self._active_arm = None
-                if arm.homing:
-                    arm.homing = False
-                    arm.home_target = {}
-                try:
-                    MOTORS.release_torque_for_posing(side)
-                    arm.calibrated = False
-                except Exception as e:
-                    self._last_error = f"{side} release torque for next verification sample: {e}"
-                    log.warning("[%s] could not release torque for next verification sample: %s", side, e)
             log.info(
-                "[%s] robot verification sample %d captured (%s): robot %.1f cm, VR %.1f cm; torque released for next sample",
+                "[%s] robot verification sample %d captured (%s): robot %.1f cm, VR %.1f cm; torque held",
                 side, len(arm.robot_verify_samples), label_text, robot_mag * 100, vr_mag * 100,
             )
         return self.status()
+
+    def _reset_robot_verification_vr_capture(self, arm: _PerArm, *, reason: str) -> None:
+        """Clear an in-progress VR sample but keep robot start/end for retry.
+
+        Robot verification samples must be one continuous grip-held motion:
+        A/X captures VR start, the user moves while holding grip, then A/X
+        captures VR end before grip release. Releasing grip cancels only the VR
+        half of the current sample so stale deltas cannot affect the next try.
+        Caller must hold `self._lock`.
+        """
+        arm.robot_verify_vr_start = None
+        arm.robot_verify_vr_delta_accum = (0.0, 0.0, 0.0)
+        if arm.robot_verify_robot_start is not None and arm.robot_verify_robot_end is not None:
+            arm.robot_verify_state = "robot_end_captured"
+        elif arm.robot_verify_robot_start is not None:
+            arm.robot_verify_state = "robot_start_captured"
+        elif arm.robot_verify_state != "idle":
+            arm.robot_verify_state = "collecting"
+        log.info("[%s] robot verification VR capture reset: %s", arm.side, reason)
 
     def discard_last_robot_verification_sample(self, side: ArmSide) -> dict:
         with self._lock:
@@ -3724,10 +3763,11 @@ class VRTeleopSession:
                 arm.translation_vr_to_robot = None
                 arm.translation_scale = 1.0
                 arm.robot_verify_test_completed = False
+                hint = self._robot_verification_residual_hint(residuals)
                 self._last_error = (
                     f"{side} robot verification residual {fit_error_cm:.1f} cm is too high "
                     f"(must be <= {ROBOT_VERIFY_PASS_ERROR_CM:.1f} cm RMS); "
-                    "recapture all six directions near the grasp workspace"
+                    f"{hint or 'recapture all six directions near the grasp workspace'}"
                 )
                 raise RuntimeError(self._last_error)
 
@@ -3857,10 +3897,13 @@ class VRTeleopSession:
         vr_deltas: list[_np.ndarray] = []
         robot_deltas: list[_np.ndarray] = []
         valid_samples: list[dict[str, Any]] = []
-        for sample in samples:
+        valid_labels: list[str] = []
+        for idx, sample in enumerate(samples):
             vr = _np.array(sample.get("vr_delta"), dtype=float)
             robot = _np.array(sample.get("robot_delta"), dtype=float)
             if vr.shape != (3,) or robot.shape != (3,):
+                continue
+            if not _np.all(_np.isfinite(vr)) or not _np.all(_np.isfinite(robot)):
                 continue
             vn = float(_np.linalg.norm(vr))
             rn = float(_np.linalg.norm(robot))
@@ -3869,9 +3912,20 @@ class VRTeleopSession:
             vr_deltas.append(vr)
             robot_deltas.append(robot)
             valid_samples.append(sample)
+            valid_labels.append(self._effective_robot_verification_label(samples, idx))
         if len(vr_deltas) < ROBOT_VERIFY_MIN_SAMPLES:
             raise RuntimeError(
                 f"need {ROBOT_VERIFY_MIN_SAMPLES} valid samples after filtering; got {len(vr_deltas)}"
+            )
+        captured_valid = set(valid_labels)
+        missing_valid = [
+            label for label in ROBOT_VERIFY_REQUIRED_LABELS
+            if label not in captured_valid
+        ]
+        if missing_valid:
+            raise RuntimeError(
+                "valid verification samples missing required directions: "
+                + ", ".join(missing_valid)
             )
 
         V = _np.stack(vr_deltas, axis=0)
@@ -3908,7 +3962,9 @@ class VRTeleopSession:
 
         residual_norms = []
         residual_details: list[dict[str, Any]] = []
-        for idx, (base_pred, robot, sample) in enumerate(zip(base_predictions, robot_deltas, valid_samples)):
+        for idx, (base_pred, robot, vr_delta, sample, label) in enumerate(
+            zip(base_predictions, robot_deltas, vr_deltas, valid_samples, valid_labels)
+        ):
             pred = scale * base_pred
             residual_m = float(_np.linalg.norm(pred - robot))
             residual_norms.append(residual_m)
@@ -3922,12 +3978,14 @@ class VRTeleopSession:
                 direction_error_deg = None
             residual_details.append({
                 "index": idx,
-                "label": str(sample.get("label") or f"sample-{idx + 1}"),
+                "label": label or f"sample-{idx + 1}",
                 "residual_cm": residual_m * 100.0,
                 "direction_error_deg": direction_error_deg,
                 "robot_motion_cm": robot_norm * 100.0,
-                "vr_motion_cm": float(_np.linalg.norm(vr)) * 100.0,
+                "vr_motion_cm": float(_np.linalg.norm(vr_delta)) * 100.0,
+                "target_robot_delta": [float(v) for v in robot],
                 "predicted_robot_delta": [float(v) for v in pred],
+                "error_vector_cm": [float(v) * 100.0 for v in (pred - robot)],
             })
         fit_error_cm = 100.0 * math.sqrt(sum(r * r for r in residual_norms) / len(residual_norms))
         if fit_error_cm <= ROBOT_VERIFY_PASS_ERROR_CM:
@@ -4043,6 +4101,16 @@ class VRTeleopSession:
         if not pressed_edges:
             return
 
+        verify_capture_btn = ENGAGE_BUTTON_BY_SIDE.get(side)
+        if verify_capture_btn and verify_capture_btn in pressed_edges:
+            arm = self._arms[side]
+            if arm.robot_verify_state != "idle":
+                self._handle_robot_verification_vr_button(side)
+                return
+
+        if not self._controller_buttons_enabled:
+            return
+
         dual_btn = DUAL_MODE_BUTTON_BY_SIDE.get(side)
         if dual_btn and dual_btn in pressed_edges:
             other_face_held = any(
@@ -4071,6 +4139,20 @@ class VRTeleopSession:
                 log.info("[%s] %s ignored for engage during calibration", side, engage_btn)
                 return
             self._handle_engage_button(side)
+
+    def _handle_robot_verification_vr_button(self, side: ArmSide) -> None:
+        arm = self._arms[side]
+        if arm.robot_verify_robot_start is None or arm.robot_verify_robot_end is None:
+            log.info("[%s] robot verification button ignored until robot start/end are captured", side)
+            return
+        try:
+            point = "end" if arm.robot_verify_vr_start is not None else "start"
+            label = arm.robot_verify_label or ""
+            self.capture_robot_verification_vr(side, point, label)
+            log.info("[%s] robot verification button captured VR %s", side, point)
+        except Exception as exc:
+            self._last_error = f"{side} robot verification VR button: {exc}"
+            log.warning("[%s] robot verification VR button failed: %s", side, exc)
 
     def _handle_dual_mode_button(self, side: ArmSide) -> None:
         """Y button on the left controller toggles dual-arm drive mode.
@@ -4382,8 +4464,9 @@ class VRTeleopSession:
         """Convert the latest VR controller pose -> SO101 joint targets.
 
         Pipeline (per-tick):
-          1. Consume XLeVR's per-frame relative_position stream accumulated by
-             `_drain_goals`, with a small input deadzone to reject tracking noise.
+          1. Consume the native Quest app's per-frame relative_position stream
+             accumulated by packet ingest, with a small input deadzone to reject
+             tracking noise.
           2. Map the integrated reset-relative VR displacement through the
              runtime translation matrix, then LERP-smooth and cap the Cartesian
              target step before IK.
@@ -4437,7 +4520,7 @@ class VRTeleopSession:
         rel_step = pending_rel
         if float(_np.linalg.norm(rel_step)) < 1e-12:
             # Direct unit tests call this method without going through
-            # `_drain_goals`; keep that path representative of one WSS packet.
+            # native packet ingest; keep that path representative of one packet.
             rel_step = _np.array(goal.rel_position, dtype=float)
         if not _np.all(_np.isfinite(rel_step)) or float(_np.linalg.norm(rel_step)) < POS_DEADZONE_M:
             rel_step = _np.zeros(3, dtype=float)
@@ -4526,8 +4609,9 @@ class VRTeleopSession:
         arm.target_T[:3, 3] = (tx, ty, tz)
         arm.target_T[:3, :3] = arm.target_R_robot
 
-        # Position IK in calibrated SO101 joint space. Prefer the URDF solver so
-        # RESET anchors, target pose, and viewer use the same gripper frame.
+        # Position IK in calibrated SO101 joint space. Prefer the per-arm URDF
+        # solver so RESET anchors and target pose use the same motor-degree
+        # convention sent to the SOFollower.
         ik_mode = "urdf" if arm.kinematics is not None else "analytical"
         ik_rejected = False
         try:
@@ -4689,33 +4773,9 @@ class VRTeleopSession:
     # ── teardown ────────────────────────────────────────────────────────────
     def _stop_threads_and_servers(self) -> None:
         self._stop_evt.set()
-        # Stop drive thread
         if self._drive_thread is not None and self._drive_thread.is_alive():
             self._drive_thread.join(timeout=2)
         self._drive_thread = None
-        # Stop asyncio loop + WSS server
-        if self._asyncio_loop is not None:
-            try:
-                async def _shutdown():
-                    if self._ws_server is not None:
-                        try: await self._ws_server.stop()
-                        except Exception: pass
-                fut = asyncio.run_coroutine_threadsafe(_shutdown(), self._asyncio_loop)
-                try: fut.result(timeout=3)
-                except Exception: pass
-                self._asyncio_loop.call_soon_threadsafe(self._asyncio_loop.stop)
-            except Exception as e:
-                log.warning("asyncio teardown: %s", e)
-        if self._asyncio_thread is not None and self._asyncio_thread.is_alive():
-            self._asyncio_thread.join(timeout=3)
-        self._asyncio_loop = None
-        self._asyncio_thread = None
-        self._ws_server = None
-        # Stop HTTPS server
-        if self._https is not None:
-            try: self._https.stop()
-            except Exception as e: log.warning("https stop: %s", e)
-            self._https = None
 
 
 SESSION = VRTeleopSession()

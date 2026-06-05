@@ -1,21 +1,141 @@
 from __future__ import annotations
 
+import json
+import time
 from typing import Any
 
-from fastapi import APIRouter, Body, HTTPException
+from fastapi import APIRouter, Body, Header, HTTPException, Request, WebSocket, WebSocketDisconnect, status
+from starlette.concurrency import run_in_threadpool
 
 from openpibot.server.runtime import vr_teleop as vr_mod
+from openpibot.server.runtime.native_quest import MAX_NATIVE_QUEST_PACKET_BYTES, NativeQuestProtocolError
+from openpibot.server.runtime import quest_video_bridge
 
 router = APIRouter(prefix="/api/vr", tags=["vr"])
+
+QUEST_WS_OPERATOR_STATUS_INTERVAL_S = 0.5
 
 
 def _runtime_error(exc: Exception) -> HTTPException:
     return HTTPException(status_code=409, detail=str(exc))
 
 
+def _require_quest_pairing_token(token: str | None) -> None:
+    if not vr_mod.SESSION.verify_native_quest_pairing_token(token):
+        raise HTTPException(status_code=401, detail="invalid Quest pairing token")
+
+
 @router.get("/status")
 def status() -> dict[str, Any]:
     return vr_mod.SESSION.status()
+
+
+@router.get("/quest/status")
+def quest_status(request: Request) -> dict[str, Any]:
+    return vr_mod.SESSION.quest_bridge_status(public_base_url=str(request.base_url))
+
+
+@router.get("/quest/operator")
+def quest_operator(
+    request: Request,
+    x_quest_pairing_token: str | None = Header(default=None),
+) -> dict[str, Any]:
+    _require_quest_pairing_token(x_quest_pairing_token)
+    return vr_mod.SESSION.quest_operator_status(public_base_url=str(request.base_url))
+
+
+@router.get("/quest/video/status")
+def quest_video_status() -> dict[str, Any]:
+    return quest_video_bridge.bridge_status()
+
+
+@router.post("/quest/video/start")
+def quest_video_start(
+    request: Request,
+    body: dict[str, Any] | None = Body(default=None),
+    x_quest_pairing_token: str | None = Header(default=None),
+) -> dict[str, Any]:
+    _require_quest_pairing_token(x_quest_pairing_token)
+    payload = body or {}
+    try:
+        roles = payload.get("roles")
+        if roles is not None and not isinstance(roles, list):
+            raise ValueError("roles must be a list")
+        quest_host = str(payload.get("quest_host") or "").strip()
+        if not quest_host and request.client is not None:
+            quest_host = request.client.host
+        return quest_video_bridge.start_bridge(
+            quest_host=quest_host,
+            roles=roles,
+        )
+    except (RuntimeError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.post("/quest/video/stop")
+def quest_video_stop(
+    x_quest_pairing_token: str | None = Header(default=None),
+) -> dict[str, Any]:
+    _require_quest_pairing_token(x_quest_pairing_token)
+    return quest_video_bridge.stop_bridge()
+
+
+@router.post("/quest/video/health")
+def quest_video_health(
+    body: dict[str, Any] | None = Body(default=None),
+    x_quest_pairing_token: str | None = Header(default=None),
+) -> dict[str, Any]:
+    _require_quest_pairing_token(x_quest_pairing_token)
+    try:
+        return quest_video_bridge.report_receive_health(body or {})
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.post("/quest/ingest")
+def quest_ingest(
+    body: dict[str, Any] | None = Body(default=None),
+    x_quest_pairing_token: str | None = Header(default=None),
+) -> dict[str, Any]:
+    _require_quest_pairing_token(x_quest_pairing_token)
+    try:
+        return vr_mod.SESSION.ingest_native_quest_packet(body or {})
+    except NativeQuestProtocolError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.websocket("/quest/ws")
+async def quest_ws(websocket: WebSocket) -> None:
+    token = websocket.query_params.get("token") or websocket.headers.get("x-quest-pairing-token")
+    if not vr_mod.SESSION.verify_native_quest_pairing_token(token):
+        await websocket.close(code=status.WS_1008_POLICY_VIOLATION, reason="invalid Quest pairing token")
+        return
+    await websocket.accept()
+    vr_mod.SESSION.note_native_quest_client(True)
+    next_operator_status_at = 0.0
+    ws_public_url = str(websocket.url)
+    try:
+        while True:
+            raw = await websocket.receive_text()
+            if len(raw.encode("utf-8")) > MAX_NATIVE_QUEST_PACKET_BYTES:
+                await websocket.send_json({"ok": False, "error": f"packet exceeds {MAX_NATIVE_QUEST_PACKET_BYTES} byte limit"})
+                continue
+            try:
+                payload = json.loads(raw)
+                result = await run_in_threadpool(vr_mod.SESSION.ingest_native_quest_packet, payload)
+                now = time.monotonic()
+                if now >= next_operator_status_at:
+                    result["operator"] = await run_in_threadpool(
+                        lambda: vr_mod.SESSION.quest_operator_status(public_base_url=ws_public_url)
+                    )
+                    next_operator_status_at = now + QUEST_WS_OPERATOR_STATUS_INTERVAL_S
+                await websocket.send_json(result)
+            except (json.JSONDecodeError, NativeQuestProtocolError) as exc:
+                await websocket.send_json({"ok": False, "error": str(exc)})
+    except WebSocketDisconnect:
+        pass
+    finally:
+        vr_mod.SESSION.note_native_quest_client(False)
 
 
 @router.post("/connect")
@@ -202,7 +322,7 @@ def robot_verify_robot_pose(body: dict[str, Any] | None = Body(default=None)) ->
     if point not in ("start", "end"):
         raise HTTPException(status_code=400, detail="point must be 'start' or 'end'")
     try:
-        return vr_mod.SESSION.capture_robot_verification_pose(arm, point)
+        return vr_mod.SESSION.capture_robot_verification_pose(arm, point, label=str(payload.get("label") or ""))
     except (RuntimeError, ValueError) as exc:
         raise _runtime_error(exc) from exc
 
@@ -288,4 +408,3 @@ def recording_task(body: dict[str, Any] | None = Body(default=None)) -> dict[str
 @router.post("/recording/delete_last")
 def recording_delete_last() -> dict[str, Any]:
     return vr_mod.SESSION.delete_last_recorded_episode()
-

@@ -67,7 +67,7 @@ Tells the system which direction in VR-world space is "user-forward" and "user-u
 3. **Step 2 — Up axis**: squeeze grip again, **keep it held**, move your hand straight up by ~10 cm. Release grip.
 4. **Step 3 — Left axis**: squeeze grip again, **keep it held**, move your hand to your left by ~10 cm. Release grip.
 5. **Step 4 — Wrist pitch**: squeeze grip, keep it held, pitch your wrist **UP** by ~20-45°, then release. For both controllers, use the same physical intent: thumb side rises toward the ceiling.
-6. **Step 5 — Wrist roll**: squeeze grip, keep it held, roll your wrist **RIGHT** by ~20-45°, then release. For both controllers, use the same physical intent: thumb side rolls to your right. You can skip wrist steps for translation-only testing, but wrist teleop will then use WebXR defaults.
+6. **Step 5 — Wrist roll**: squeeze grip, keep it held, roll your wrist **RIGHT** by ~20-45°, then release. For both controllers, use the same physical intent: thumb side rolls to your right. You can skip wrist steps for translation-only testing, but wrist teleop will then use the standard Quest controller-axis defaults.
 7. Calibration finalises. The 3×3 VR→robot rotation matrix plus empirical wrist pitch/roll axes are saved to **`config/vr_calibration.yaml`**.
 
 Subsequent dashboard restarts load the saved matrix automatically. You only need to re-run the wizard if you change where you stand or how you orient yourself relative to the robot.

@@ -6,7 +6,6 @@ import os
 import pathlib
 import shutil
 import subprocess
-import sys
 from dataclasses import asdict, dataclass
 from typing import Literal
 
@@ -15,8 +14,6 @@ import yaml
 from openpibot.server.config import REPO_ROOT
 
 CONFIG_YAML = REPO_ROOT / "config" / "xlerobot.yaml"
-XLEVR_DIR = REPO_ROOT / "XLerobot_xuweiwu" / "XLeVR"
-
 Status = Literal["ok", "warn", "fail", "info"]
 
 
@@ -187,13 +184,9 @@ def check_config_paths() -> list[Check]:
 
 
 def check_python_imports() -> list[Check]:
-    if XLEVR_DIR.is_dir() and str(XLEVR_DIR) not in sys.path:
-        sys.path.insert(0, str(XLEVR_DIR))
-
     targets = [
         ("lerobot", "lerobot"),
         ("lerobot.robots.xlerobot", "lerobot.robots.xlerobot"),
-        ("XLeVR runtime", "xlevr"),
         ("openpi_client", "openpi_client"),
         ("cv2", "cv2"),
         ("pyrealsense2", "pyrealsense2"),
@@ -233,6 +226,23 @@ def check_realsense() -> Check:
         return Check("realsense", "info", f"not available: {e}")
 
 
+def check_gstreamer() -> Check:
+    missing = [
+        name
+        for name in ("gst-launch-1.0",)
+        if shutil.which(name) is None
+    ]
+    if missing:
+        return Check(
+            "gstreamer",
+            "warn",
+            "missing "
+            + ", ".join(missing)
+            + " (install gstreamer1.0-tools and plugins for Quest video)",
+        )
+    return Check("gstreamer", "ok", "gst-launch-1.0 available for Quest video bridge")
+
+
 def run_doctor() -> list[dict]:
     checks: list[Check] = []
     checks.append(check_lsusb())
@@ -243,4 +253,5 @@ def run_doctor() -> list[dict]:
     checks.extend(check_python_imports())
     checks.append(check_v4l2_caps())
     checks.append(check_realsense())
+    checks.append(check_gstreamer())
     return [asdict(c) for c in checks]

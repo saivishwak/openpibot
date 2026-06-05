@@ -1,10 +1,4 @@
 [submodule "lerobot"]
-	path = lerobot
+	path = vendor/lerobot
 	url = https://github.com/huggingface/lerobot.git
 	branch = main
-[submodule "XLerobot_xuweiwu"]
-	path = XLerobot_xuweiwu
-	url = git@github.com:saivishwak/XLeRobot_xuweiwu.git
-	# cert.pem / key.pem inside this submodule are regenerated per-machine
-	# and shouldn't appear as "modified content" in parent-repo status.
-	ignore = dirty

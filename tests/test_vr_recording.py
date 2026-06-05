@@ -1,12 +1,11 @@
-import asyncio
 import time
 import threading
-from types import SimpleNamespace
 
 import pytest
 from fastapi import HTTPException
 
 from openpibot.server.routers import vr as vr_router
+from openpibot.server.runtime.native_quest import NativeQuestAdapter
 from openpibot.server.runtime import vr_teleop as vr_mod
 
 
@@ -222,30 +221,18 @@ def test_b_button_start_requires_synced_task(monkeypatch):
     assert recorder.task == "Pick the red block"
 
 
-def test_vr_button_release_is_forwarded_for_repeat_b_toggles():
-    from xlevr.inputs.vr_ws_server import VRWebSocketServer
+def test_native_quest_button_release_is_forwarded_for_repeat_b_toggles():
+    adapter = NativeQuestAdapter(coordinate_frame="unity_openxr")
 
-    async def run():
-        queue = asyncio.Queue()
-        server = VRWebSocketServer(command_queue=queue, config=SimpleNamespace())
+    packets = [
+        {"controllers": {"right": {"position": [0, 0, 0], "rotation": [0, 0, 0, 1], "buttons": {"B": True}}}},
+        {"controllers": {"right": {"position": [0, 0, 0], "rotation": [0, 0, 0, 1], "buttons": {"B": False}}}},
+        {"controllers": {"right": {"position": [0, 0, 0], "rotation": [0, 0, 0, 1], "buttons": {"B": True}}}},
+    ]
 
-        await server.process_single_controller(
-            "right",
-            {"gripActive": False, "buttons": {"B": True}},
-        )
-        await server.process_single_controller(
-            "right",
-            {"gripActive": False, "buttons": {"B": False}},
-        )
-        await server.process_single_controller(
-            "right",
-            {"gripActive": False, "buttons": {"B": True}},
-        )
+    goals = [adapter.process_packet(packet)[0] for packet in packets]
 
-        goals = [await asyncio.wait_for(queue.get(), timeout=0.5) for _ in range(3)]
-        return [goal.buttons for goal in goals]
-
-    assert asyncio.run(run()) == [{"B": True}, {"B": False}, {"B": True}]
+    assert [goal.buttons for goal in goals] == [{"B": True}, {"B": False}, {"B": True}]
 
 
 def test_delete_last_recorded_episode_requires_stop():

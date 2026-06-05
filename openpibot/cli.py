@@ -109,6 +109,8 @@ def run(
         if _port_in_use(host, candidate):
             console.print(f"[yellow]Port {candidate} is in use; trying next.[/yellow]")
             continue
+        os.environ["OPENPIBOT_HOST"] = host
+        os.environ["OPENPIBOT_PORT"] = str(candidate)
         console.print(f"[green]OpenPIBot dashboard:[/green] http://127.0.0.1:{candidate}")
         console.print(f"[dim]Logs:[/dim] {log_file}")
         uvicorn.run(

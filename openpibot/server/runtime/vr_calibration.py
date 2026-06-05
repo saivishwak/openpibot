@@ -12,6 +12,7 @@ File format (`config/vr_calibration.yaml`):
     profiles:
       default:
         left:
+          calibration_mode: vr_direction
           session_vr_to_robot:
             - [m00, m01, m02]
             - [m10, m11, m12]
@@ -22,6 +23,12 @@ File format (`config/vr_calibration.yaml`):
           left_motion_m: 0.088
           invert_lateral: false
           confidence: good
+          robot_verification:
+            calibration_mode: robot_verified
+            translation_scale: 0.51
+            fit_error_cm: 1.2
+            calibration_quality: good
+            robot_verified_samples: [...]
         right: { ... same shape ... }
 
 Older files with top-level `left:` / `right:` are still accepted and are
@@ -217,9 +224,47 @@ def matrix_for_arm(side: str) -> np.ndarray | None:
     return _valid_matrix(data.get("session_vr_to_robot"), side=side, label="session_vr_to_robot")
 
 
+def robot_verification_entry(data: dict[str, Any] | None) -> dict[str, Any]:
+    """Return the robot-verification block from an arm entry.
+
+    New files store this separately under `robot_verification`. Older files
+    flattened these keys into the arm entry with `calibration_mode:
+    robot_verified`; keep accepting that shape so existing profiles keep loading.
+    """
+    if not isinstance(data, dict) or not data:
+        return {}
+    nested = data.get("robot_verification")
+    if isinstance(nested, dict):
+        return dict(nested)
+    if data.get("calibration_mode") != "robot_verified":
+        return {}
+    return {
+        "calibration_mode": "robot_verified",
+        "teleop_source": data.get("teleop_source"),
+        "base_vr_direction_matrix": data.get(
+            "base_vr_direction_matrix",
+            data.get("session_vr_to_robot"),
+        ),
+        "verified_vr_to_robot_matrix": data.get("verified_vr_to_robot_matrix"),
+        "translation_vr_to_robot_matrix": data.get("translation_vr_to_robot_matrix"),
+        "translation_scale": data.get("translation_scale", 1.0),
+        "fit_error_cm": data.get("fit_error_cm"),
+        "calibration_quality": data.get("calibration_quality"),
+        "verified_at": data.get("verified_at"),
+        "robot_verified_samples": data.get("robot_verified_samples") or [],
+        "robot_verified_sample_residuals": data.get("robot_verified_sample_residuals") or [],
+    }
+
+
+def robot_verification_for_arm(side: str) -> dict[str, Any] | None:
+    """Robot-verification data for one arm, separate from VR direction data."""
+    entry = robot_verification_entry(read_for_arm(side))
+    return entry or None
+
+
 def verified_matrix_for_arm(side: str) -> np.ndarray | None:
     """Return the explicitly verified matrix if the arm has passed robot verification."""
-    data = read_for_arm(side)
+    data = robot_verification_for_arm(side)
     if not data or data.get("calibration_mode") != "robot_verified":
         return None
     return _valid_matrix(
@@ -231,7 +276,7 @@ def verified_matrix_for_arm(side: str) -> np.ndarray | None:
 
 def translation_scale_for_arm(side: str) -> float:
     """Robot/VR translation scale learned by robot verification. Defaults to 1."""
-    data = read_for_arm(side) or {}
+    data = robot_verification_for_arm(side) or {}
     try:
         scale = float(data.get("translation_scale", 1.0))
     except (TypeError, ValueError):
@@ -262,7 +307,7 @@ def write_for_arm(side: str, matrix: np.ndarray,
         stale entries left over from older versions are dropped on re-write.
       - `wrist_pitch_anchor_local` / `wrist_roll_anchor_local` (optional) are
         empirical raw controller-anchor unit rotvecs captured by the wrist
-        wizard. None / absent → runtime falls back to the WebXR analytical
+        wizard. None / absent → runtime falls back to the Quest analytical
         canonical. Older left-arm files without `wrist_canonical_frame` are
         converted on load for backward compatibility.
     """
@@ -271,6 +316,7 @@ def write_for_arm(side: str, matrix: np.ndarray,
     M = _orthonormalize_matrix(np.array(matrix, dtype=float))
     entry: dict[str, Any] = {
         "calibration_mode": "vr_direction",
+        "teleop_source": "native_quest",
         "wrist_canonical_frame": "raw_controller_anchor_local",
         "session_vr_to_robot": [[float(v) for v in row] for row in M],
         "calibrated_at": datetime.datetime.now().isoformat(timespec="seconds"),
@@ -304,9 +350,9 @@ def write_robot_verification_for_arm(
 ) -> None:
     """Persist the robot-verified refinement layer for one arm.
 
-    `session_vr_to_robot` remains the stage-1 orientation frame used at runtime.
-    The full robot-verified linear map is position-only and lives in
-    `translation_vr_to_robot_matrix`.
+    The top-level arm entry remains the VR-direction calibration. The
+    robot-verified solve is stored as a separate `robot_verification` block so
+    VR direction capture and robot verification are not conflated.
     """
     doc = _normalized_doc()
     existing = dict(_active_profile_entry(doc))
@@ -316,19 +362,34 @@ def write_robot_verification_for_arm(
     translation = np.array(translation_matrix, dtype=float)
     if translation.shape != (3, 3) or not np.all(np.isfinite(translation)):
         raise ValueError("translation_matrix must be a finite 3x3 matrix")
-    entry.update({
+    for key in (
+        "base_vr_direction_matrix",
+        "verified_vr_to_robot_matrix",
+        "translation_vr_to_robot_matrix",
+        "translation_scale",
+        "fit_error_cm",
+        "calibration_quality",
+        "verified_at",
+        "robot_verified_samples",
+        "robot_verified_sample_residuals",
+    ):
+        entry.pop(key, None)
+    entry["calibration_mode"] = "vr_direction"
+    entry["teleop_source"] = "native_quest"
+    entry["session_vr_to_robot"] = [[float(v) for v in row] for row in base]
+    entry["robot_verification"] = {
         "calibration_mode": "robot_verified",
+        "teleop_source": "native_quest",
         "base_vr_direction_matrix": [[float(v) for v in row] for row in base],
         "verified_vr_to_robot_matrix": [[float(v) for v in row] for row in verified],
         "translation_vr_to_robot_matrix": [[float(v) for v in row] for row in translation],
-        "session_vr_to_robot": [[float(v) for v in row] for row in base],
         "translation_scale": float(translation_scale),
         "fit_error_cm": float(fit_error_cm),
         "calibration_quality": str(quality or "unknown"),
         "verified_at": datetime.datetime.now().isoformat(timespec="seconds"),
         "robot_verified_samples": samples,
         "robot_verified_sample_residuals": sample_residuals,
-    })
+    }
     existing[side] = entry
     doc["profiles"][doc["active_profile"]] = existing
     _write_doc(doc)
@@ -345,9 +406,13 @@ def status() -> dict[str, dict[str, Any]]:
     out: dict[str, dict[str, Any]] = {}
     for side in ("left", "right"):
         data = saved.get(side) or {}
+        robot_data = robot_verification_entry(data)
+        robot_quality = robot_data.get("calibration_quality")
+        robot_verified = robot_data.get("calibration_mode") == "robot_verified"
         out[side] = {
             "saved": "session_vr_to_robot" in data,
             "calibration_mode": data.get("calibration_mode", "legacy" if data else None),
+            "teleop_source": data.get("teleop_source", "legacy" if data else None),
             "calibrated_at": data.get("calibrated_at"),
             "forward_motion_m": float(data.get("forward_motion_m", 0.0)),
             "up_motion_m": float(data.get("up_motion_m", 0.0)),
@@ -359,13 +424,13 @@ def status() -> dict[str, dict[str, Any]]:
             ),
             "has_empirical_wrist_pitch_canonical": "wrist_pitch_anchor_local" in data,
             "has_empirical_wrist_roll_canonical": "wrist_roll_anchor_local" in data,
-            "robot_verified": data.get("calibration_mode") == "robot_verified",
-            "verified_at": data.get("verified_at"),
-            "fit_error_cm": data.get("fit_error_cm"),
-            "translation_scale": float(data.get("translation_scale", 1.0)),
-            "calibration_quality": data.get("calibration_quality"),
-            "needs_recapture": data.get("calibration_quality") in {"warn", "poor", "needs_recapture"},
-            "verified_sample_count": len(data.get("robot_verified_samples") or []),
+            "robot_verified": robot_verified,
+            "verified_at": robot_data.get("verified_at"),
+            "fit_error_cm": robot_data.get("fit_error_cm"),
+            "translation_scale": float(robot_data.get("translation_scale", 1.0)),
+            "calibration_quality": robot_quality,
+            "needs_recapture": robot_quality in {"warn", "poor", "needs_recapture"},
+            "verified_sample_count": len(robot_data.get("robot_verified_samples") or []),
         }
     return out
 
@@ -378,10 +443,12 @@ def profile_status() -> dict[str, Any]:
         profile = profile if isinstance(profile, dict) else {}
         left = profile.get("left") or {}
         right = profile.get("right") or {}
+        left_robot = robot_verification_entry(left)
+        right_robot = robot_verification_entry(right)
         timestamps = [
             v for v in (
-                left.get("verified_at"), left.get("calibrated_at"),
-                right.get("verified_at"), right.get("calibrated_at"),
+                left_robot.get("verified_at"), left.get("calibrated_at"),
+                right_robot.get("verified_at"), right.get("calibrated_at"),
             )
             if v
         ]
@@ -389,8 +456,8 @@ def profile_status() -> dict[str, Any]:
             "name": name,
             "left_saved": "session_vr_to_robot" in left,
             "right_saved": "session_vr_to_robot" in right,
-            "left_robot_verified": left.get("calibration_mode") == "robot_verified",
-            "right_robot_verified": right.get("calibration_mode") == "robot_verified",
+            "left_robot_verified": left_robot.get("calibration_mode") == "robot_verified",
+            "right_robot_verified": right_robot.get("calibration_mode") == "robot_verified",
             "updated_at": max(timestamps) if timestamps else None,
         })
     rows.sort(key=lambda p: (p["name"] != doc["active_profile"], p["name"]))

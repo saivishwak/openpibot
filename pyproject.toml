@@ -39,7 +39,7 @@ override-dependencies = [
 
 [tool.uv.workspace]
 members = [
-    "lerobot",
+    "vendor/lerobot",
 ]
 
 [dependency-groups]

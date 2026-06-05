@@ -1,6 +1,7 @@
 # VR Teleop
 
-Drive one or both SO-101 arms with a Meta Quest 3.
+Drive one or both SO-101 arms with a Meta Quest 3. The production headset path
+is the native Unity/OpenXR Quest app in `apps/quest-xlerobot`.
 
 ## Controllers
 
@@ -15,16 +16,34 @@ Drive one or both SO-101 arms with a Meta Quest 3.
 
 ## Per-session flow
 
-1. **Open the dashboard**: `http://<workstation>:5000`. Click *Connect* on each arm you want to use.
-2. **Open the VR operator URL on the Quest browser** (shown on the *VR Operator* page). Accept the self-signed cert, enter VR.
-3. **Calibrate** if you haven't, or if you're standing somewhere new — see [calibration.md](calibration.md). Once-per-setup; the calibration is saved.
-4. In the headset, use the operator panel like Reachy's flow:
+1. **Set a pairing token** before starting the backend:
+   `XLE_QUEST_PAIRING_TOKEN=<shared-secret> uv run openpibot run`.
+2. **Open the dashboard**: `http://<workstation>:5000`. Click *Connect* on each arm you want to use.
+3. **Launch the XLeRobot Quest app** on the headset. In the app, connect to the
+   tokenized `ws://<workstation>:5000/api/vr/quest/ws?token=...` endpoint shown
+   on the *VR Operator* page. Enter the same pairing token in the dashboard and
+   Unity app; the public status API does not expose it.
+4. **Calibrate** if you haven't or if you're standing somewhere new — see
+   [calibration.md](calibration.md). Once-per-setup; the calibration is saved.
+5. In the headset, use the operator panel like Reachy's flow:
    **Connection** -> **Mirror/ready** -> **Teleop** -> **Suspension**.
    Hold **A** while facing the workspace to confirm Ready/recenter.
-5. Press **A**/**X** or toggle Engage in the dashboard. The headset panel shows whether each arm is connected, torqued, anchored, wrist-aligned, and recording-ready.
-6. **Squeeze grip** on a controller to anchor that arm's EE pose. The panel shows "anchored"; releasing grip stops motion.
-7. **Hold grip + move your hand**. The arm follows. Pull trigger to close the gripper.
-8. Press **B** to request dataset recording. The backend still enforces calibration/verification blockers, so the headset can request recording but cannot bypass safety or dataset-quality checks.
+6. Press **A**/**X** or toggle Engage in the dashboard. The headset panel shows whether each arm is connected, torqued, anchored, wrist-aligned, and recording-ready.
+7. **Squeeze grip** on a controller to anchor that arm's EE pose. The panel shows "anchored"; releasing grip stops motion.
+8. **Hold grip + move your hand**. The arm follows. Pull trigger to close the gripper.
+9. Press **B** to request dataset recording. The backend still enforces calibration/verification blockers, so the headset can request recording but cannot bypass safety or dataset-quality checks.
+
+## Headset Video
+
+The native path uses backend-managed GStreamer H.264/RTP pipelines for low-latency
+camera delivery. Install `gst-launch-1.0` on the workstation and configure the
+`head`, `left_wrist`, and `right_wrist` camera roles before expecting video to be
+ready.
+
+On the *VR Operator* page, enter the Quest headset IP and click **Start video**.
+The backend starts one GStreamer process per camera role and shows the UDP ports,
+PIDs, and any process errors. Click **Stop video** before changing cameras or
+shutting down teleop.
 
 ## Bimanual
 
@@ -59,12 +78,17 @@ Grip press anchors two things for that arm:
 - The current robot gripper pose.
 - The current Quest controller pose and controller-to-gripper rotation.
 
-While grip is held, the backend integrates XLeVR's per-frame `relative_position`
-packets, maps that reset-relative controller displacement through the saved
-VR-to-robot frame, and caps the end-effector target step before IK. This keeps
-slow hand motion smooth and rejects one-frame tracking spikes. The controller's
-rotation is also mapped through the reset-time controller-to-EE alignment so
-wrist intent does not depend on the exact grip angle at anchor time.
+While grip is held, the native Quest app streams Unity/OpenXR controller poses to
+the backend. The backend converts those packets into reset-relative controller
+displacements, maps them through the saved VR-to-robot frame, and caps the
+end-effector target step before IK. This keeps slow hand motion smooth and
+rejects one-frame tracking spikes. The controller's rotation is also mapped
+through the reset-time controller-to-EE alignment so wrist intent does not
+depend on the exact grip angle at anchor time.
+
+The native adapter converts Unity/OpenXR operator-origin coordinates into the
+backend VR frame before calibration: Unity +Z forward becomes backend -Z
+forward, while X and Y remain right/up.
 
 Useful tuning keys live in `config/xlerobot.yaml`:
 
@@ -85,14 +109,27 @@ vr:
 - **Per-tick joint caps** — max joint speeds capped (e.g. shoulder_pan 5°/tick at 30 Hz = 150°/s). Independent of the speed slider.
 - **No autonomous motion**, ever. Disconnect = torque off, no homing. The only motion the app initiates is the user-clicked *Go to Home*.
 
-## Future OpenXR App TODO
+## Native Quest App
 
-The current implementation intentionally keeps the existing WebXR/XLeVR stack while adopting the Reachy-style operator flow. A future native OpenXR app should preserve the same backend contract and add:
+The app source lives in `apps/quest-xlerobot`. It is a first-party Quest 3 app
+that adapts the Reachy2 Unity mirror/ready flow to XLeRobot:
 
-- Lower-latency controller and headset pose streaming with explicit tracking-quality flags.
-- Native multi-panel video rendering with head-camera and optional wrist/scene camera feeds.
-- Persistent in-headset connection, mirror/ready, teleop, and suspension scenes.
-- Haptic warnings for stale tracking, IK/reachability rejects, and recording blockers.
-- Signed/packaged deployment so the Quest app does not depend on browser certificate acceptance.
+- Controller snapshots stream to `/api/vr/quest/ws`.
+- `XLeRobotStateClient` polls backend operator status for in-headset UI.
+- `XLeRobotOperatorFlowManager` maps backend stages to connection, mirror,
+  teleop, and suspension UI.
+- `XLeRobotVideoBridgeClient` starts/stops backend camera pipelines, while
+  `XLeRobotVideoSurfaceBinder` and `XLeRobotGStreamerTextureAdapter` bind
+  received textures to headset surfaces.
+- Bridge status is available at `/api/vr/quest/status`.
+- GStreamer video runtime status is available at `/api/vr/quest/video/status`.
+  Start/stop endpoints require the Quest pairing token.
+- The backend remains responsible for safety, IK, calibration persistence,
+  recording blockers, and dataset writes.
+
+See [quest3_build_and_sideload.md](quest3_build_and_sideload.md) for Unity
+build, APK, and Quest 3 sideload instructions.
+
+See [quest_parity.md](quest_parity.md) for the full parity acceptance checklist.
 
 See [troubleshooting.md](troubleshooting.md) if motion feels wrong or doesn't happen.

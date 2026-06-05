@@ -18,14 +18,14 @@ It combines a FastAPI backend, a React dashboard, hardware-aware robot runtime c
 - Linux recommended for robot control. USB motor access requires membership in the `dialout` group.
 - Python `>=3.12,<3.13` and [`uv`](https://docs.astral.sh/uv/) for the backend, CLI, and training tools.
 - Node.js `>=20` and `pnpm` for building the dashboard.
-- Initialized `lerobot` submodule; it is used as the editable LeRobot workspace for XLeRobot support.
+- Initialized `vendor/lerobot` submodule; it is used as the editable LeRobot workspace for XLeRobot support.
 - Calibrated SO-101/XLeRobot arms, USB cameras, and a Meta Quest headset for VR teleop.
 - A Hugging Face account/token if you plan to push datasets or model checkpoints.
 
 ## Quick Start
 
 ```bash
-git submodule update --init lerobot
+git submodule update --init vendor/lerobot
 uv sync
 uv run openpibot run
 ```
@@ -80,8 +80,8 @@ Typical first run:
 ├── scripts/               Training, dataset, push, and inference utilities
 ├── config/                Robot profiles, camera config, calibration, home pose
 ├── docs/                  Setup, teleop, calibration, recording, troubleshooting
-├── XLeRobot/              XLeRobot reference submodule
-└── XLerobot_xuweiwu/      Bimanual SO-101 reference submodule
+├── reference/             Local reference docs/assets used by the app
+└── vendor/                LeRobot submodule plus local XLeRobot URDF assets
 ```
 
 ## Documentation
