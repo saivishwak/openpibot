@@ -2,8 +2,12 @@ import math
 
 import numpy as np
 import pytest
+import asyncio
 
 from openpibot.server.runtime import vr_teleop as vr
+from xlevr.config import XLeVRConfig
+from xlevr.inputs.base import ControlMode
+from xlevr.inputs.vr_ws_server import VRWebSocketServer
 
 
 def _sample(label, vr_delta, robot_delta):
@@ -70,6 +74,11 @@ class _BoundsOnlyMotors:
         return {k: v for k, v in self._positions.items() if k.startswith(f"{side}_arm_")}
 
 
+class _FakeCamera:
+    name = "head"
+    role = "head"
+
+
 def test_analytical_so101_fk_ik_roundtrip():
     kin = vr._SO101Kin()
     for shoulder_lift, elbow_flex in [(-80.0, 60.0), (-35.0, 25.0), (20.0, -10.0)]:
@@ -112,20 +121,20 @@ def test_wrist_axes_apply_left_handedness_once():
     assert left_roll.tolist() == pytest.approx([0.0, 0.0, 1.0])
 
 
-def test_runtime_translation_prefers_robot_verified_matrix():
+def test_runtime_translation_uses_verified_scale_without_replacing_live_frame():
     session = vr.VRTeleopSession()
     arm = vr._PerArm(side="right")
-    arm.session_vr_to_robot = np.eye(3)
+    arm.session_vr_to_robot = vr._VR_TO_ROBOT.copy()
     arm.translation_scale = 0.5
     verified = np.array([[0.0, -2.0, 0.0], [2.0, 0.0, 0.0], [0.0, 0.0, 2.0]])
     arm.translation_vr_to_robot = verified
     arm.robot_verify_quality = "good"
 
     assert session._runtime_translation_matrix(arm) is not None
-    np.testing.assert_allclose(session._runtime_translation_matrix(arm), verified)
+    np.testing.assert_allclose(session._runtime_translation_matrix(arm), 0.5 * vr._VR_TO_ROBOT)
 
 
-def test_runtime_translation_does_not_double_invert_robot_verified_matrix():
+def test_runtime_translation_applies_lateral_invert_after_robot_verification():
     session = vr.VRTeleopSession()
     arm = vr._PerArm(side="right")
     arm.session_vr_to_robot = np.eye(3)
@@ -134,7 +143,57 @@ def test_runtime_translation_does_not_double_invert_robot_verified_matrix():
     arm.translation_vr_to_robot = verified
     arm.robot_verify_quality = "good"
 
-    np.testing.assert_allclose(session._runtime_translation_matrix(arm), verified)
+    np.testing.assert_allclose(session._runtime_translation_matrix(arm), np.diag([1.0, -1.0, 1.0]))
+
+
+def test_left_verified_runtime_keeps_forward_axis_when_solved_matrix_is_degenerate(monkeypatch):
+    session = vr.VRTeleopSession()
+    monkeypatch.setattr(vr, "MOTORS", _BoundsOnlyMotors())
+    monkeypatch.setattr(vr, "POS_EMA_ALPHA", 1.0)
+    monkeypatch.setattr(vr, "MAX_EE_STEP_M", 1.0)
+    monkeypatch.setattr(vr, "POS_DEADZONE_M", 0.0)
+
+    arm = session._arms["left"]
+    arm.using_analytical_fallback = True
+    arm.session_vr_to_robot = vr._VR_TO_ROBOT.copy()
+    arm.translation_scale = 1.0
+    arm.robot_verify_quality = "good"
+    # This is the class of bad solve that broke live teleop: the verified matrix
+    # can pass persistence/quality checks yet map VR forward to no robot X.
+    arm.translation_vr_to_robot = np.array([
+        [0.0, 0.0, 0.0],
+        [-1.0, 0.0, 0.0],
+        [0.0, 1.0, 0.0],
+    ])
+    arm.controller_anchor_T = vr._pose_matrix_from_vr((0.0, 0.0, 0.0), (0.0, 0.0, 0.0, 1.0))
+    arm.anchor_ee_pos = (0.20, 0.0, 0.05)
+    arm.anchor_R_robot = np.eye(3)
+    arm.smoothed_R_target = np.eye(3)
+    arm.target_R_robot = np.eye(3)
+    arm.anchor = vr._AnchorPose(
+        shoulder_lift_deg=-60.0,
+        elbow_flex_deg=45.0,
+        wrist_flex_deg=20.0,
+        wrist_roll_deg=0.0,
+        captured=True,
+    )
+
+    session._compute_targets_from_vr(
+        "left",
+        vr._LatestGoal(
+            received_at=1.0,
+            has_data=True,
+            mode="position",
+            rel_position=(0.0, 0.0, -0.03),
+            controller_position=(0.0, 0.0, -0.03),
+            rotation_quat=(0.0, 0.0, 0.0, 1.0),
+            trigger=False,
+        ),
+        scale=1.0,
+    )
+
+    assert arm.offset_robot[0] > 0.0
+    np.testing.assert_allclose(arm.last_diag["dp_robot"], [0.03, 0.0, 0.0], atol=1e-9)
 
 
 def test_runtime_translation_applies_lateral_invert_to_vr_only_matrix():
@@ -530,7 +589,8 @@ def test_robot_verification_live_status_requires_relative_motion(monkeypatch):
 def test_robot_verification_solve_accepts_clean_six_axis_fit():
     session = vr.VRTeleopSession()
     arm = vr._PerArm(side="right")
-    expected = np.array([[0.0, -0.5, 0.0], [0.5, 0.0, 0.0], [0.0, 0.0, 0.5]])
+    expected = 0.5 * vr._VR_TO_ROBOT
+    arm.session_vr_to_robot = vr._VR_TO_ROBOT.copy()
     arm.robot_verify_samples = _six_axis_samples(expected)
 
     final_m, translation_m, scale, fit_error_cm, quality, residuals = (
@@ -545,18 +605,20 @@ def test_robot_verification_solve_accepts_clean_six_axis_fit():
     assert final_m.shape == (3, 3)
 
 
-def test_robot_verification_solve_does_not_apply_lateral_invert_to_samples():
+def test_robot_verification_solve_scores_against_lateral_inverted_live_frame():
     session = vr.VRTeleopSession()
     arm = vr._PerArm(side="right")
     arm.invert_lateral = True
-    expected = np.array([[0.0, -0.5, 0.0], [0.5, 0.0, 0.0], [0.0, 0.0, 0.5]])
+    arm.session_vr_to_robot = vr._VR_TO_ROBOT.copy()
+    expected = 0.5 * (np.diag([1.0, -1.0, 1.0]) @ vr._VR_TO_ROBOT)
     arm.robot_verify_samples = _six_axis_samples(expected)
 
-    _final_m, translation_m, _scale, fit_error_cm, quality, _residuals = (
+    _final_m, translation_m, scale, fit_error_cm, quality, _residuals = (
         session._solve_robot_verified_calibration(arm)
     )
 
     np.testing.assert_allclose(translation_m, expected, atol=1e-6)
+    assert scale == pytest.approx(0.5, abs=1e-6)
     assert fit_error_cm == pytest.approx(0.0, abs=1e-5)
     assert quality == "good"
 
@@ -564,6 +626,7 @@ def test_robot_verification_solve_does_not_apply_lateral_invert_to_samples():
 def test_robot_verification_solve_marks_inconsistent_fit_for_recapture():
     session = vr.VRTeleopSession()
     arm = vr._PerArm(side="right")
+    arm.session_vr_to_robot = np.eye(3)
     expected = np.eye(3) * 0.5
     samples = _six_axis_samples(expected)
     samples[0] = _sample("forward", [0.10, 0.0, 0.0], [0.15, 0.10, 0.0])
@@ -573,6 +636,27 @@ def test_robot_verification_solve_marks_inconsistent_fit_for_recapture():
 
     assert fit_error_cm > vr.ROBOT_VERIFY_PASS_ERROR_CM
     assert quality in {"needs_recapture", "poor"}
+
+
+def test_robot_verification_solve_rejects_raw_fit_that_breaks_live_forward_axis():
+    session = vr.VRTeleopSession()
+    arm = vr._PerArm(side="left")
+    arm.session_vr_to_robot = vr._VR_TO_ROBOT.copy()
+    raw_fit_only = np.array([
+        [0.3, 0.0, 0.0],
+        [0.0, 0.5, 0.0],
+        [0.0, 0.0, 0.5],
+    ])
+    arm.robot_verify_samples = _six_axis_samples(raw_fit_only)
+
+    _final_m, translation_m, _scale, fit_error_cm, quality, residuals = (
+        session._solve_robot_verified_calibration(arm)
+    )
+
+    np.testing.assert_allclose(translation_m, raw_fit_only, atol=1e-6)
+    assert fit_error_cm > vr.ROBOT_VERIFY_PASS_ERROR_CM
+    assert quality in {"needs_recapture", "poor"}
+    assert any(item["label"] == "forward" for item in residuals)
 
 
 def test_robot_verification_requires_named_six_directions():
@@ -604,6 +688,70 @@ def test_recording_blocker_requires_urdf_kinematics(monkeypatch):
     blockers = session._recording_calibration_blockers()
 
     assert any("URDF kinematics missing" in blocker for blocker in blockers)
+
+
+def test_status_exposes_reachy_style_operator_summary(monkeypatch):
+    session = vr.VRTeleopSession()
+    motors = _BoundsOnlyMotors()
+    monkeypatch.setattr(vr, "MOTORS", motors)
+    monkeypatch.setattr(vr._cameras, "enumerate_cameras", lambda: [_FakeCamera()])
+    monkeypatch.setattr(vr._home, "home_pose_status", lambda: {
+        "left": {"captured": False, "joints": {}},
+        "right": {"captured": True, "joints": {}},
+    })
+    monkeypatch.setattr(vr._vrcal, "status", lambda: {
+        "left": {"saved": False},
+        "right": {"saved": True},
+    })
+    monkeypatch.setattr(vr._vrcal, "profile_status", lambda: {"active_profile": "default", "profiles": []})
+    session._https = type("Https", (), {"host": "127.0.0.1", "port": 8443})()
+    session._ws_server = type("Ws", (), {"is_running": True, "clients": [object()]})()
+    arm = session._arms["right"]
+    _mark_urdf_available(arm)
+    arm.robot_verify_quality = "good"
+    arm.robot_verify_fit_error_cm = 0.0
+    arm.robot_verify_test_completed = True
+    arm.calibrated = True
+    arm.vr_ctrl_to_ee = vr._R.identity()
+    arm.latest = vr._LatestGoal(
+        received_at=vr.time.time(),
+        has_data=True,
+        mode="position",
+        controller_position=(0.0, 0.0, 0.0),
+        rotation_quat=(0.0, 0.0, 0.0, 1.0),
+    )
+
+    status = session.status()
+
+    assert status["operator"]["stage"] == "mirror_ready"
+    assert status["operator"]["head_camera_url"] == "/camera/head/stream"
+    assert status["operator"]["connection"]["websocket_clients"] == 1
+    assert status["operator"]["arm_panels"]["right"]["wrist_aligned"] is True
+    assert status["operator"]["recording"]["ready"] is True
+
+
+def test_websocket_server_forwards_idle_pose_without_grip():
+    async def run():
+        queue = asyncio.Queue()
+        server = VRWebSocketServer(queue, XLeVRConfig())
+
+        await server.process_single_controller("right", {
+            "position": {"x": 0.1, "y": 0.2, "z": -0.3},
+            "quaternion": {"x": 0.0, "y": 0.0, "z": 0.0, "w": 1.0},
+            "gripActive": False,
+            "trigger": 0,
+            "thumbstick": {"x": 0.0, "y": 0.0},
+            "buttons": {"A": False, "B": False},
+        })
+
+        return await asyncio.wait_for(queue.get(), timeout=1.0)
+
+    goal = asyncio.run(run())
+
+    assert goal.arm == "right"
+    assert goal.mode == ControlMode.IDLE
+    np.testing.assert_allclose(goal.vr_ctrl_position, [0.1, 0.2, -0.3])
+    assert goal.vr_ctrl_rotation is not None
 
 
 def test_recording_blocker_requires_good_robot_verification(monkeypatch):

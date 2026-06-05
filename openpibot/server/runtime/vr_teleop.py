@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import asyncio
 import http.server
+import json
 import logging
 import math
 import os
@@ -44,6 +45,7 @@ from typing import Any, Optional
 
 from . import motors as _motors
 from .motors import SESSION as MOTORS, ArmSide
+from . import cameras as _cameras
 from . import dataset as _dataset
 from . import home as _home
 from . import vr_calibration as _vrcal
@@ -827,11 +829,54 @@ class _StaticHTTPSServer:
 
             def end_headers(self):
                 self.send_header("Access-Control-Allow-Origin", "*")
+                self.send_header("Access-Control-Allow-Headers", "content-type")
+                self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
                 try: super().end_headers()
                 except (BrokenPipeError, ConnectionResetError, ssl.SSLError): pass
 
             def do_OPTIONS(self):
                 self.send_response(200); self.end_headers()
+
+            def _json(self, payload: Any, status: int = 200):
+                data = json.dumps(payload).encode("utf-8")
+                self.send_response(status)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                try: self.wfile.write(data)
+                except (BrokenPipeError, ConnectionResetError, ssl.SSLError): pass
+
+            def _session(self):
+                return globals().get("SESSION")
+
+            def _read_json_body(self) -> dict[str, Any]:
+                try:
+                    length = int(self.headers.get("Content-Length") or "0")
+                except ValueError:
+                    length = 0
+                if length <= 0:
+                    return {}
+                raw = self.rfile.read(length)
+                try:
+                    return json.loads(raw.decode("utf-8")) or {}
+                except Exception:
+                    return {}
+
+            def _serve_mjpeg(self, cam_id: str):
+                if _cameras.find_camera(cam_id) is None:
+                    self.send_error(404); return
+                self.send_response(200)
+                self.send_header("Content-Type", "multipart/x-mixed-replace; boundary=frame")
+                self.send_header("Cache-Control", "no-store, no-cache, must-revalidate")
+                self.send_header("Pragma", "no-cache")
+                self.send_header("X-Accel-Buffering", "no")
+                self.end_headers()
+                try:
+                    for chunk in _cameras.mjpeg_iter(cam_id):
+                        self.wfile.write(chunk)
+                        self.wfile.flush()
+                except (BrokenPipeError, ConnectionResetError, ssl.SSLError):
+                    return
 
             def _serve(self, relpath: str, content_type: str):
                 path = (web_root / relpath).resolve()
@@ -860,12 +905,22 @@ class _StaticHTTPSServer:
                 self.send_response(200)
                 self.send_header("Content-Type", content_type)
                 self.send_header("Content-Length", str(len(data)))
+                self.send_header("Cache-Control", "no-store, no-cache, must-revalidate")
+                self.send_header("Pragma", "no-cache")
                 self.end_headers()
                 try: self.wfile.write(data)
                 except (BrokenPipeError, ConnectionResetError, ssl.SSLError): pass
 
             def do_GET(self):
                 p = self.path.split("?", 1)[0]
+                if p == "/api/vr/status":
+                    session = self._session()
+                    if session is None:
+                        return self._json({"error": "VR session unavailable"}, status=503)
+                    return self._json(session.status())
+                if p.startswith("/camera/") and p.endswith("/stream"):
+                    cam_id = p[len("/camera/"):-len("/stream")]
+                    return self._serve_mjpeg(cam_id)
                 if p in ("/", "/index.html"): return self._serve("index.html", "text/html")
                 if p.endswith(".css"):  return self._serve(p.lstrip("/"), "text/css")
                 if p.endswith(".js"):   return self._serve(p.lstrip("/"), "application/javascript")
@@ -875,7 +930,39 @@ class _StaticHTTPSServer:
                 if p.endswith(".gif"):  return self._serve(p.lstrip("/"), "image/gif")
                 self.send_error(404)
 
-        self._httpd = http.server.HTTPServer((self.host, self.port), Handler)
+            def do_POST(self):
+                p = self.path.split("?", 1)[0]
+                session = self._session()
+                if session is None:
+                    return self._json({"error": "VR session unavailable"}, status=503)
+                payload = self._read_json_body()
+                try:
+                    if p == "/api/vr/engage":
+                        active_arm = payload.get("active_arm")
+                        scale = payload.get("scale")
+                        return self._json(session.engage(
+                            bool(payload.get("engaged")),
+                            scale=float(scale) if scale is not None else None,
+                            active_arm=active_arm if active_arm in ("left", "right") else None,
+                        ))
+                    if p == "/api/vr/emergency_stop":
+                        return self._json(session.emergency_stop())
+                    if p == "/api/vr/recording":
+                        if "enabled" in payload:
+                            session.set_recording(
+                                bool(payload.get("enabled")),
+                                task=str(payload.get("task") or ""),
+                                root=str(payload.get("root") or ""),
+                            )
+                        return self._json(session.status())
+                    if p == "/api/vr/recording/task":
+                        return self._json(session.set_recording_task(str(payload.get("task") or "")))
+                except Exception as e:
+                    return self._json({"error": str(e)}, status=409)
+                self.send_error(404)
+
+        self._httpd = http.server.ThreadingHTTPServer((self.host, self.port), Handler)
+        self._httpd.daemon_threads = True
         ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         ctx.load_cert_chain(str(self.cert), str(self.key))
         self._httpd.socket = ctx.wrap_socket(self._httpd.socket, server_side=True)
@@ -1602,6 +1689,117 @@ class VRTeleopSession:
             log.info("deleted VR calibration profile %s; active profile is %s", name, active)
             return self.status()
 
+    def _operator_status(
+        self,
+        arms_status: dict[str, Any],
+        recording_info: dict[str, Any],
+        now: float,
+    ) -> dict[str, Any]:
+        """Condensed Reachy-style operator state for the in-headset UI."""
+        connected = list(MOTORS.connected_sides)
+        camera_roles: dict[str, dict[str, Any]] = {}
+        try:
+            for cam in _cameras.enumerate_cameras():
+                role = cam.role or cam.name
+                camera_roles[role] = {
+                    "configured": bool(cam.role),
+                    "name": cam.name,
+                    "stream_url": f"/camera/{cam.name}/stream",
+                }
+        except Exception as e:
+            camera_roles["error"] = {"configured": False, "error": str(e)}
+
+        head_camera = camera_roles.get("head")
+        ready_blockers: list[str] = []
+        if not connected:
+            ready_blockers.append("connect at least one arm")
+        if self._https is None:
+            ready_blockers.append("VR HTTPS endpoint is not running")
+        if self._ws_server is None or not bool(getattr(self._ws_server, "is_running", False)):
+            ready_blockers.append("VR websocket is not running")
+        if not head_camera:
+            ready_blockers.append("head camera role is not configured")
+        for side in connected:
+            arm_status = arms_status.get(side, {})
+            arm = self._arms[side]
+            if not arm_status.get("torque_enabled", False):
+                ready_blockers.append(f"{side} torque is off")
+            age_ms = arm_status.get("controller", {}).get("age_ms")
+            if age_ms is None:
+                ready_blockers.append(f"{side} controller has not sent a pose")
+            elif age_ms > int(GOAL_SKIP_AGE_S * 1000):
+                ready_blockers.append(f"{side} controller pose is stale")
+
+        if not connected:
+            stage = "connect_required"
+            guidance = "Connect at least one SO101 arm before entering VR teleop."
+        elif self._engaged:
+            active_sides = connected if self._dual_mode else ([self._active_arm] if self._active_arm in connected else [])
+            anchored = any(self._arms[s].calibrated for s in active_sides)
+            stage = "teleop_arms" if anchored else "teleop_head_only"
+            guidance = (
+                "Hold grip on each active controller to anchor and drive the arm."
+                if anchored
+                else "Teleop is engaged. Squeeze grip once on the active controller to anchor the arm."
+            )
+        elif ready_blockers:
+            stage = "mirror_waiting_robot"
+            guidance = ready_blockers[0]
+        else:
+            stage = "mirror_ready"
+            guidance = "Face the workspace, press Ready in VR, then hold A/X or use Engage to start teleop."
+        if self._last_error and self._engaged:
+            stage = "suspended"
+            guidance = self._last_error
+
+        arm_panels: dict[str, Any] = {}
+        for side in ("left", "right"):
+            arm_status = arms_status.get(side, {})
+            cal = arm_status.get("calibration", {})
+            quality = cal.get("quality") or {}
+            robot_verify = cal.get("robot_verification") or {}
+            arm_panels[side] = {
+                "connected": bool(arm_status.get("connected", False)),
+                "torque_enabled": bool(arm_status.get("torque_enabled", False)),
+                "anchored": bool(arm_status.get("calibrated", False)),
+                "wrist_aligned": bool(cal.get("vr_ctrl_to_ee_ready", False)),
+                "active": bool(self._dual_mode or self._active_arm == side),
+                "controller_age_ms": arm_status.get("controller", {}).get("age_ms"),
+                "ee_speed_cm_s": float(quality.get("offset_speed_ema_mps", 0.0)) * 100.0,
+                "ik_reject_fraction": float(quality.get("ik_reject_fraction", 0.0)),
+                "recording_readiness": robot_verify.get("readiness", "stage1_only"),
+            }
+
+        client_count = 0
+        try:
+            client_count = len(getattr(self._ws_server, "clients", []) or [])
+        except Exception:
+            client_count = 0
+        return {
+            "stage": stage,
+            "guidance": guidance,
+            "ready_blockers": ready_blockers,
+            "recording_blockers": list(recording_info.get("calibration_blockers") or []),
+            "connection": {
+                "backend_ready": True,
+                "https_ready": self._https is not None,
+                "websocket_ready": self._ws_server is not None and bool(getattr(self._ws_server, "is_running", False)),
+                "websocket_clients": client_count,
+                "connected_arms": connected,
+            },
+            "camera_roles": camera_roles,
+            "head_camera_url": head_camera.get("stream_url") if head_camera else None,
+            "arm_panels": arm_panels,
+            "recording": {
+                "active": bool(self._recording),
+                "frames": int(recording_info.get("frames_in_current_episode") or 0),
+                "episodes_saved": int(recording_info.get("episodes_saved") or 0),
+                "task": str(recording_info.get("last_task") or ""),
+                "ready": bool(recording_info.get("calibration_ready", False)),
+            },
+            "updated_at": now,
+        }
+
     def status(self) -> dict:
         now = time.time()
         with self._lock:
@@ -1767,6 +1965,7 @@ class VRTeleopSession:
                     )
                 except Exception:
                     shown_root = ""
+            recording_blockers = self._recording_calibration_blockers()
             recording_info = {
                 "active": self._recording,
                 "episodes_saved": (rec.episode_count if rec else self._episodes_saved),
@@ -1780,8 +1979,8 @@ class VRTeleopSession:
                 "repo_id": rec.repo_id if rec else self._recording_repo_id,
                 "last_task": self._last_task,
                 "root": shown_root,
-                "calibration_ready": not self._recording_calibration_blockers(),
-                "calibration_blockers": self._recording_calibration_blockers(),
+                "calibration_ready": not recording_blockers,
+                "calibration_blockers": recording_blockers,
             }
             # Per-arm home pose status (from YAML + live homing flag).
             try:
@@ -1805,6 +2004,7 @@ class VRTeleopSession:
 
             out = {
                 "arms": arms_status,
+                "operator": self._operator_status(arms_status, recording_info, now),
                 "calibration_profiles": _vrcal.profile_status(),
                 "connected_sides": list(MOTORS.connected_sides),
                 "active_arm": self._active_arm,
@@ -1917,18 +2117,13 @@ class VRTeleopSession:
     def _runtime_translation_matrix(self, arm: _PerArm) -> _np.ndarray:
         """Effective VR-delta → robot-delta matrix for translation.
 
-        Stage-1 calibration has only a rotation plus scalar. Robot verification
-        can fit a full 3x3 translation map from paired EE/controller deltas; that
-        map is used for position only. Wrist/orientation still uses
-        `session_vr_to_robot`, which remains a proper rotation.
+        Live teleop must keep a stable operator-to-robot frame. Robot
+        verification validates the calibration and refines the scalar reach
+        ratio, but the fitted 3x3 matrix is intentionally not used directly for
+        control: a least-squares fit can cross-couple or attenuate an axis after
+        noisy/handed samples, which makes motions like "left controller forward"
+        disappear even when the stage-1 frame feels correct.
         """
-        if arm.robot_verify_quality == "good" and arm.translation_vr_to_robot is not None:
-            # Robot verification samples are paired raw VR-world controller
-            # deltas and observed robot-frame EE deltas, so the solved matrix is
-            # already in the effective robot frame. Do not apply the stage-1
-            # lateral mirror again here; that would double-flip verified
-            # translation for profiles where `invert_lateral` is true.
-            return _np.asarray(arm.translation_vr_to_robot, dtype=float)
         scale = arm.translation_scale if arm.robot_verify_quality == "good" else 1.0
         return scale * self._effective_translation_matrix(
             arm,
@@ -3662,7 +3857,6 @@ class VRTeleopSession:
         vr_deltas: list[_np.ndarray] = []
         robot_deltas: list[_np.ndarray] = []
         valid_samples: list[dict[str, Any]] = []
-        ratios: list[float] = []
         for sample in samples:
             vr = _np.array(sample.get("vr_delta"), dtype=float)
             robot = _np.array(sample.get("robot_delta"), dtype=float)
@@ -3675,7 +3869,6 @@ class VRTeleopSession:
             vr_deltas.append(vr)
             robot_deltas.append(robot)
             valid_samples.append(sample)
-            ratios.append(rn / vn)
         if len(vr_deltas) < ROBOT_VERIFY_MIN_SAMPLES:
             raise RuntimeError(
                 f"need {ROBOT_VERIFY_MIN_SAMPLES} valid samples after filtering; got {len(vr_deltas)}"
@@ -3688,10 +3881,11 @@ class VRTeleopSession:
                 "verification samples do not span 3D motion; capture forward/back, left/right, and up/down"
             )
 
-        # Translation is calibrated as a direct linear map from raw VR deltas to
-        # robot EE deltas. A pure rotation+uniform-scale fit is too restrictive
-        # for real controller/robot workspaces and can keep RMS high even after
-        # recapturing better samples.
+        # Keep the raw least-squares map as diagnostics. Runtime control stays on
+        # the stable stage-1 frame, so verification quality below is measured
+        # against that same frame plus a fitted scalar. This mirrors Reachy's
+        # fixed headset/controller basis with per-user scale, and prevents a
+        # noisy 3x3 solve from deleting/cross-coupling a live control axis.
         translation_effective_T, *_ = _np.linalg.lstsq(V, R, rcond=None)
         translation_effective = translation_effective_T.T
         if not _np.all(_np.isfinite(translation_effective)):
@@ -3703,14 +3897,19 @@ class VRTeleopSession:
         final_M = _project_to_rotation_matrix(translation_effective)
         translation_M = translation_effective
 
-        singular_values = _np.linalg.svd(translation_effective, compute_uv=False)
-        scale = float(_np.median(singular_values))
+        base_M = self._effective_translation_matrix(arm, arm.session_vr_to_robot)
+        base_predictions = [base_M @ vr for vr in vr_deltas]
+        denom = float(sum(_np.dot(pred, pred) for pred in base_predictions))
+        if denom <= 1e-12:
+            raise RuntimeError("verification solve has no usable calibrated-frame motion")
+        scale_raw = float(sum(_np.dot(pred, robot) for pred, robot in zip(base_predictions, robot_deltas)) / denom)
+        scale = scale_raw
         scale = max(0.05, min(5.0, scale))
 
         residual_norms = []
         residual_details: list[dict[str, Any]] = []
-        for idx, (vr, robot, sample) in enumerate(zip(vr_deltas, robot_deltas, valid_samples)):
-            pred = translation_effective @ vr
+        for idx, (base_pred, robot, sample) in enumerate(zip(base_predictions, robot_deltas, valid_samples)):
+            pred = scale * base_pred
             residual_m = float(_np.linalg.norm(pred - robot))
             residual_norms.append(residual_m)
             pred_norm = float(_np.linalg.norm(pred))
@@ -3981,21 +4180,11 @@ class VRTeleopSession:
             return self._recording
 
         if enabled:
-            try:
-                cfg_for_gate = _dataset.load_dataset_config()
-                allow_unverified = bool(
-                    cfg_for_gate.get("allow_unverified_vr_recording", False)
-                    or cfg_for_gate.get("allow_unverified_recording", False)
-                )
-            except Exception:
-                allow_unverified = False
             blockers = self._recording_calibration_blockers()
-            if blockers and not allow_unverified:
+            if blockers:
                 self._last_error = "recording blocked: " + "; ".join(blockers)
                 log.warning(self._last_error)
                 return self._recording
-            if blockers and allow_unverified:
-                log.warning("recording with unverified calibration override: %s", "; ".join(blockers))
 
         # Resolve home_first from config if not explicitly set.
         if home_first is None:

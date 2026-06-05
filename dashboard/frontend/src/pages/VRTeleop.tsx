@@ -7,6 +7,75 @@ import { Badge, Button, Card, ConfirmDialog, Page, Range, Toggle } from "../comp
 
 const RobotUrdfViewer = lazy(() => import("../components/RobotUrdfViewer"));
 
+function operatorStageLabel(stage?: string) {
+  switch (stage) {
+    case "connect_required": return "connection";
+    case "mirror_waiting_robot": return "robot check";
+    case "mirror_ready": return "mirror ready";
+    case "teleop_head_only": return "head camera only";
+    case "teleop_arms": return "teleop active";
+    case "suspended": return "suspended";
+    default: return stage?.replaceAll("_", " ") ?? "loading";
+  }
+}
+
+function OperatorFlow({ status }: { status?: VRStatus }) {
+  const operator = status?.operator;
+  const blockers = [
+    ...(operator?.ready_blockers ?? []),
+    ...(operator?.recording_blockers ?? []),
+  ];
+  const headCamera = operator?.head_camera_url;
+  return (
+    <Card className={operator?.stage === "suspended" ? "border-danger bg-danger/5" : ""}>
+      <div className="flex flex-col gap-3 lg:flex-row lg:items-start lg:justify-between">
+        <div>
+          <h2 className="text-sm font-semibold">Operator flow</h2>
+          <p className="mt-1 text-sm text-muted-foreground">
+            {operator?.guidance ?? "Waiting for the VR backend operator state."}
+          </p>
+        </div>
+        <div className="flex flex-wrap gap-2">
+          <Badge tone={operator?.stage === "teleop_arms" ? "success" : operator?.stage === "suspended" ? "danger" : "info"}>
+            {operatorStageLabel(operator?.stage)}
+          </Badge>
+          <Badge tone={operator?.connection?.websocket_clients ? "success" : "neutral"}>
+            {operator?.connection?.websocket_clients ?? 0} headset client{operator?.connection?.websocket_clients === 1 ? "" : "s"}
+          </Badge>
+          <Badge tone={headCamera ? "success" : "warning"}>{headCamera ? "head camera ready" : "head camera missing"}</Badge>
+          <Badge tone={operator?.recording?.active ? "danger" : operator?.recording?.ready ? "success" : "warning"}>
+            {operator?.recording?.active ? `recording ${operator.recording.frames} frames` : operator?.recording?.ready ? "recording ready" : "recording blocked"}
+          </Badge>
+        </div>
+      </div>
+      <div className="mt-4 grid gap-3 md:grid-cols-4">
+        {(["connection", "mirror", "teleop", "suspend"] as const).map((step) => {
+          const active = (
+            (step === "connection" && operator?.stage === "connect_required") ||
+            (step === "mirror" && (operator?.stage === "mirror_waiting_robot" || operator?.stage === "mirror_ready")) ||
+            (step === "teleop" && (operator?.stage === "teleop_head_only" || operator?.stage === "teleop_arms")) ||
+            (step === "suspend" && operator?.stage === "suspended")
+          );
+          return (
+            <div key={step} className={active ? "rounded-md border border-primary/50 bg-primary/10 p-3" : "rounded-md border border-border bg-muted/40 p-3"}>
+              <div className="text-xs font-semibold uppercase text-muted-foreground">{step}</div>
+              <p className="mt-1 text-xs text-muted-foreground">
+                {step === "connection" ? "Backend, WebSocket, arms, and cameras visible in headset." :
+                  step === "mirror" ? "Operator faces the workspace and confirms Ready." :
+                  step === "teleop" ? "Grip anchors the arms; trigger controls gripper." :
+                  "Warnings, stale tracking, and emergency stop stay visible."}
+              </p>
+            </div>
+          );
+        })}
+      </div>
+      {blockers.length ? (
+        <p className="mt-3 text-sm text-warning">Operator blockers: {blockers.join("; ")}</p>
+      ) : null}
+    </Card>
+  );
+}
+
 function safeCall<T>(work: () => Promise<T>, refresh: () => Promise<unknown>) {
   return work().then(refresh).catch((err) => alert(String(err)));
 }
@@ -118,7 +187,9 @@ export function VRTeleop() {
   const endpoint = data?.vr_endpoint;
 
   return (
-    <Page title="Control" description="Quest VR teleoperation with explicit connect, engage, grip anchoring, watchdog, and emergency release.">
+    <Page title="VR Operator" description="Reachy-style Quest workflow: connection, mirror/ready, teleop, and suspension state with backend-enforced recording blockers.">
+      <OperatorFlow status={data} />
+
       <div className="grid gap-4 xl:grid-cols-2">
         <ArmControl side="left" status={data} refresh={refresh} busy={busy || isLoading} setBusy={setBusy} />
         <ArmControl side="right" status={data} refresh={refresh} busy={busy || isLoading} setBusy={setBusy} />
@@ -129,8 +200,8 @@ export function VRTeleop() {
         <Card>
           <div className="flex items-start justify-between gap-3">
             <div>
-              <h2 className="text-sm font-semibold">Quest Endpoint</h2>
-              <p className="mt-1 text-xs text-muted-foreground">Open this URL in the Quest browser after connecting an arm.</p>
+              <h2 className="text-sm font-semibold">Quest operator room</h2>
+              <p className="mt-1 text-xs text-muted-foreground">Open this URL in the Quest browser. The headset shows the same operator stage and blockers as this card.</p>
             </div>
             <Button variant="danger" onClick={() => setConfirmStop(true)}><Power size={16} />Emergency</Button>
           </div>

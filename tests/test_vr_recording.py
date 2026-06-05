@@ -160,12 +160,12 @@ def test_recording_restart_waits_for_previous_stop_to_finish(monkeypatch):
                 "fps": 30,
                 "push_to_hub": False,
                 "root": None,
-                "allow_unverified_vr_recording": True,
             },
         )
     monkeypatch.setattr(vr_mod._dataset, "role_camera_list", lambda: (["head"], (2, 2, 3)))
     monkeypatch.setattr(vr_mod._dataset, "resolve_root", lambda root, repo_id: "/tmp/test/repo")
     monkeypatch.setattr(vr_mod._dataset, "DatasetRecorder", lambda **kwargs: new_rec)
+    monkeypatch.setattr(session, "_recording_calibration_blockers", lambda: [])
 
     stop_thread = threading.Thread(target=lambda: session.set_recording(False))
     stop_thread.start()
@@ -203,12 +203,12 @@ def test_b_button_start_requires_synced_task(monkeypatch):
                 "fps": 30,
                 "push_to_hub": False,
                 "root": None,
-                "allow_unverified_vr_recording": True,
             },
         )
     monkeypatch.setattr(vr_mod._dataset, "role_camera_list", lambda: (["head"], (2, 2, 3)))
     monkeypatch.setattr(vr_mod._dataset, "resolve_root", lambda root, repo_id: "/tmp/test/repo")
     monkeypatch.setattr(vr_mod._dataset, "DatasetRecorder", lambda **kwargs: recorder)
+    monkeypatch.setattr(session, "_recording_calibration_blockers", lambda: [])
 
     session._handle_record_button("right")
 
@@ -323,12 +323,12 @@ def test_start_recording_after_delete_keeps_saved_count(monkeypatch):
                 "fps": 30,
                 "push_to_hub": False,
                 "root": None,
-                "allow_unverified_vr_recording": True,
             },
         )
     monkeypatch.setattr(vr_mod._dataset, "role_camera_list", lambda: (["head"], (2, 2, 3)))
     monkeypatch.setattr(vr_mod._dataset, "resolve_root", lambda root, repo_id: "/tmp/test/repo")
     monkeypatch.setattr(vr_mod._dataset, "DatasetRecorder", lambda **kwargs: recorder)
+    monkeypatch.setattr(session, "_recording_calibration_blockers", lambda: [])
 
     assert session.set_recording(True, task="Pick the red block") is True
     status = session.status()

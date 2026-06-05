@@ -21,7 +21,6 @@ dataset:
   fps: 30
   push_to_hub: false                  # set true to push to HF after finalizing
   home_before_episode: true           # auto-home all arms at start of each episode
-  allow_unverified_vr_recording: false # keep false for training data
 ```
 
 Set camera roles on the **Cameras page** (not the Teleop page). Each camera needs a role for it to be included as an `observation.images.*` feature.

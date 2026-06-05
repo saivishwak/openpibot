@@ -232,9 +232,60 @@ export interface VRArmState {
   };
 }
 
+export interface VROperatorArmPanel {
+  connected: boolean;
+  torque_enabled: boolean;
+  anchored: boolean;
+  wrist_aligned: boolean;
+  active: boolean;
+  controller_age_ms: number | null;
+  ee_speed_cm_s: number;
+  ik_reject_fraction: number;
+  recording_readiness: string;
+}
+
+export interface VROperatorStatus {
+  stage:
+    | "connect_required"
+    | "mirror_waiting_robot"
+    | "mirror_ready"
+    | "teleop_head_only"
+    | "teleop_arms"
+    | "suspended"
+    | string;
+  guidance: string;
+  ready_blockers: string[];
+  recording_blockers: string[];
+  connection: {
+    backend_ready: boolean;
+    https_ready: boolean;
+    websocket_ready: boolean;
+    websocket_clients: number;
+    connected_arms: ArmSide[];
+  };
+  camera_roles: Record<string, {
+    configured: boolean;
+    name?: string;
+    stream_url?: string;
+    error?: string;
+  }>;
+  head_camera_url: string | null;
+  arm_panels: Record<ArmSide, VROperatorArmPanel>;
+  recording: {
+    active: boolean;
+    frames: number;
+    episodes_saved: number;
+    task: string;
+    ready: boolean;
+  };
+  updated_at: number;
+}
+
 export interface VRStatus {
   /** New: per-arm state, keyed by side. */
   arms: { left: VRArmState; right: VRArmState };
+  /** Condensed Reachy-style state for the in-headset operator UI. */
+  operator?: VROperatorStatus;
   calibration_profiles: CalibrationProfilesStatus;
   /** Sides that currently have a motor connection. */
   connected_sides: ArmSide[];
