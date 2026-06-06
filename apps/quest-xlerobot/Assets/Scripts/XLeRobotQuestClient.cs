@@ -344,6 +344,12 @@ namespace XLeRobot.QuestTeleop
                 rotation = Quaternion.Inverse(operatorOrigin.rotation) * rotation;
             }
 
+            if (XLeRobotPassthroughHoldController.PassthroughHeld ||
+                XLeRobotPassthroughHoldController.IsPassthroughChordPressed())
+            {
+                trigger = 0.0f;
+            }
+
             sb.Append("\"");
             sb.Append(side);
             sb.Append("\":{");

@@ -158,7 +158,7 @@ vite.config.js.timestamp-*
 vite.config.ts.timestamp-*
 .vite/
 
-# Frontend build output served by OpenPIBot
+# Frontend build output served by OpenPiBot
 dashboard/dist/
 
 # Unity generated project state/build intermediates

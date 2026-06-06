@@ -1,6 +1,6 @@
-# OpenPIBot
+# OpenPiBot
 
-OpenPIBot is a dashboard and CLI for bimanual SO-101/XLeRobot workflows: native Quest/OpenXR VR teleoperation, LeRobot dataset recording, PI0.5 fine-tuning, and policy inference.
+OpenPiBot is a dashboard and CLI for bimanual SO-101/XLeRobot workflows: native Quest/OpenXR VR teleoperation, LeRobot dataset recording, PI0.5 fine-tuning, and policy inference.
 
 It combines a FastAPI backend, a React dashboard, hardware-aware robot runtime code, and focused scripts for training, dataset upload/visualization, and inference.
 
@@ -10,7 +10,7 @@ It combines a FastAPI backend, a React dashboard, hardware-aware robot runtime c
 - **Dataset recording** in LeRobot format with synchronized present joint state, same-tick commanded actions, and camera observations.
 - **PI0.5 training and inference** through local finetuned checkpoints using the same config, robot loader, camera roles, joint order, and VR-style command shaping as recording.
 - **Robot calibration tools** for home pose capture, VR frame calibration, and robot-verified calibration before dataset-quality recording.
-- **Production-oriented backend** with structured API routes, job logs, diagnostics, and a single OpenPIBot server process.
+- **Production-oriented backend** with structured API routes, job logs, diagnostics, and a single OpenPiBot server process.
 - **Clean dashboard** for control, calibration, recording, training, inference, cameras, diagnostics, and logs.
 
 ## Prerequisites
@@ -48,7 +48,7 @@ Typical first run:
 
 | Command | Purpose |
 |---|---|
-| `uv run openpibot run --host 0.0.0.0` | Build the dashboard and run the OpenPIBot backend on port 5000 |
+| `uv run openpibot run --host 0.0.0.0` | Build the dashboard and run the OpenPiBot backend on port 5000 |
 | `uv run openpibot run --reload --no-build-dashboard` | Run the backend with reload on port 5000 |
 | `pnpm --dir dashboard/frontend dev` | Run the Vite frontend dev server |
 | `pnpm --dir dashboard/frontend build` | Build the dashboard manually |
@@ -101,7 +101,7 @@ Typical first run:
 
 ## Safety
 
-OpenPIBot is designed for supervised robot operation.
+OpenPiBot is designed for supervised robot operation.
 
 - Connecting an arm enables holding torque only; it does not home or move automatically.
 - The Control page includes an emergency stop that disables torque immediately.

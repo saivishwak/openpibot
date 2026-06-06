@@ -1,4 +1,4 @@
-"""OpenPIBot robot dashboard and control server."""
+"""OpenPiBot robot dashboard and control server."""
 
 from __future__ import annotations
 

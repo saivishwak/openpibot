@@ -123,7 +123,7 @@ namespace XLeRobot.QuestTeleop
 #if UNITY_ANDROID && !UNITY_EDITOR
         private AndroidJavaObject StartReceiver(int port)
         {
-            AndroidJavaObject receiver = new AndroidJavaObject("com.xlerobot.questteleop.RtpH264Receiver");
+            AndroidJavaObject receiver = new AndroidJavaObject("com.openpibot.questteleop.RtpH264Receiver");
             receiver.Call("start", port, width, height);
             return receiver;
         }

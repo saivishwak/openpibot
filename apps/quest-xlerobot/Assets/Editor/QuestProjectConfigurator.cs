@@ -15,7 +15,7 @@ public static class QuestProjectConfigurator
 {
     private const string XRGeneralSettingsPath = "Assets/XR/XRGeneralSettingsPerBuildTarget.asset";
     private const string OpenXRLoaderPath = "Assets/XR/Loaders/OpenXRLoader.asset";
-    private const string AndroidPackageName = "com.xlerobot.questteleop";
+    private const string AndroidPackageName = "com.openpibot.questteleop";
 
     private static readonly string[] BuildScenes =
     {
@@ -34,7 +34,7 @@ public static class QuestProjectConfigurator
         "UnityEngine.XR.OpenXR.Features.Interactions.MetaQuestTouchProControllerProfile",
     };
 
-    [MenuItem("XLeRobot/Configure Quest Project")]
+    [MenuItem("OpenPiBot/Configure Quest Project")]
     public static void ConfigureQuestProject()
     {
         EnsureAndroidBuildSettings();
@@ -43,7 +43,7 @@ public static class QuestProjectConfigurator
         EnableQuestOpenXRFeatures();
 
         AssetDatabase.SaveAssets();
-        Debug.Log("XLeRobot Quest project configuration complete.");
+        Debug.Log("OpenPiBot Quest project configuration complete.");
     }
 
     public static void ConfigureQuestProjectAndExit()
@@ -65,11 +65,14 @@ public static class QuestProjectConfigurator
         try
         {
             ConfigureQuestProject();
-            Directory.CreateDirectory("builds");
+            string projectRoot = Path.GetFullPath(Path.Combine(Application.dataPath, ".."));
+            string outputDir = Path.Combine(projectRoot, "builds");
+            string outputPath = Path.Combine(outputDir, "openpibot-quest.apk");
+            Directory.CreateDirectory(outputDir);
             var options = new BuildPlayerOptions
             {
                 scenes = BuildScenes,
-                locationPathName = "builds/xlerobot-quest-teleop.apk",
+                locationPathName = outputPath,
                 target = BuildTarget.Android,
                 targetGroup = BuildTargetGroup.Android,
                 options = BuildOptions.None,
@@ -99,8 +102,8 @@ public static class QuestProjectConfigurator
             EditorUserBuildSettings.SwitchActiveBuildTarget(BuildTargetGroup.Android, BuildTarget.Android);
         }
 
-        PlayerSettings.companyName = "XLeRobot";
-        PlayerSettings.productName = "XLeRobot Quest Teleop";
+        PlayerSettings.companyName = "OpenPiBot";
+        PlayerSettings.productName = "OpenPiBot";
         PlayerSettings.colorSpace = ColorSpace.Linear;
         PlayerSettings.insecureHttpOption = InsecureHttpOption.AlwaysAllowed;
         PlayerSettings.SetApplicationIdentifier(BuildTargetGroup.Android, AndroidPackageName);

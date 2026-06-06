@@ -38,7 +38,7 @@ recaptured, not patched by hand.
 
 ## Wrist drifts when controller is still
 
-If you're seeing slow wrist drift even with your hand still, restart the OpenPIBot server and the native Quest app so both sides clear their controller anchors.
+If you're seeing slow wrist drift even with your hand still, restart the OpenPiBot server and the native Quest app so both sides clear their controller anchors.
 
 If drift persists, the Quest controller may need re-calibration in the Quest system menu.
 
@@ -94,7 +94,7 @@ field, or click the check button to persist `dataset.repo_id` and/or
 
 ## "Release for posing" doesn't release torque
 
-Check the server log for the `release_torque_for_posing` call. If you see no log line, the API didn't reach the OpenPIBot server. If you see the log but the arm still holds, the bus write failed silently — power-cycle the robot and try again.
+Check the server log for the `release_torque_for_posing` call. If you see no log line, the API didn't reach the OpenPiBot server. If you see the log but the arm still holds, the bus write failed silently — power-cycle the robot and try again.
 
 ## Quest app connects but motion doesn't reach the backend
 

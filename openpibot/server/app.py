@@ -1,4 +1,4 @@
-"""FastAPI application factory for OpenPIBot."""
+"""FastAPI application factory for OpenPiBot."""
 
 from __future__ import annotations
 
@@ -23,11 +23,11 @@ log = logging.getLogger(__name__)
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     configure_logging()
-    log.info("OpenPIBot server starting")
+    log.info("OpenPiBot server starting")
     try:
         yield
     finally:
-        log.info("OpenPIBot server shutting down")
+        log.info("OpenPiBot server shutting down")
         try:
             from openpibot.server.runtime import cameras as cam_mod
 
@@ -44,7 +44,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
 
 def create_app() -> FastAPI:
     app = FastAPI(
-        title="OpenPIBot",
+        title="OpenPiBot",
         version=__version__,
         lifespan=lifespan,
     )
@@ -110,7 +110,7 @@ def create_app() -> FastAPI:
 
     @app.get("/status")
     def server_status() -> dict:
-        return {"status": "ok", "name": "OpenPIBot", "version": __version__}
+        return {"status": "ok", "name": "OpenPiBot", "version": __version__}
 
     @app.get("/{path:path}", include_in_schema=False)
     def spa(path: str):

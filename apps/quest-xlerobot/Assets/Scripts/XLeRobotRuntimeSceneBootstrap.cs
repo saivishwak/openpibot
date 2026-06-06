@@ -16,10 +16,14 @@ namespace XLeRobot.QuestTeleop
     /// </summary>
     public sealed class XLeRobotRuntimeSceneBootstrap : MonoBehaviour
     {
-        private const string PlayerPrefsHost = "xlerobot.quest.host";
-        private const string PlayerPrefsPort = "xlerobot.quest.port";
-        private const string PlayerPrefsTls = "xlerobot.quest.tls";
-        private const string PlayerPrefsToken = "xlerobot.quest.token";
+        private const string PlayerPrefsHost = "openpibot.quest.host";
+        private const string PlayerPrefsPort = "openpibot.quest.port";
+        private const string PlayerPrefsTls = "openpibot.quest.tls";
+        private const string PlayerPrefsToken = "openpibot.quest.token";
+        private const string LegacyPlayerPrefsHost = "xlerobot.quest.host";
+        private const string LegacyPlayerPrefsPort = "xlerobot.quest.port";
+        private const string LegacyPlayerPrefsTls = "xlerobot.quest.tls";
+        private const string LegacyPlayerPrefsToken = "xlerobot.quest.token";
         private const string DefaultLocalHost = "192.168.0.113";
         private const int DefaultLocalPort = 5000;
         private const string DefaultLocalToken = "dev-quest-token";
@@ -32,7 +36,7 @@ namespace XLeRobot.QuestTeleop
                 return;
             }
 
-            GameObject root = new GameObject("XLeRobot Quest Runtime");
+            GameObject root = new GameObject("OpenPiBot Quest Runtime");
             DontDestroyOnLoad(root);
             root.AddComponent<XLeRobotRuntimeSceneBootstrap>().Build(root.transform);
         }
@@ -41,20 +45,21 @@ namespace XLeRobot.QuestTeleop
         {
             Transform operatorOrigin = CreateOperatorOrigin(root);
             Camera headsetCamera = CreateHeadsetCamera(operatorOrigin);
-            ConfigurePassthrough(root, headsetCamera);
+            ConfigurePassthroughRig(root, headsetCamera, out ARSession arSession, out ARCameraManager arCameraManager, out ARCameraBackground arCameraBackground);
             Canvas canvas = CreateWorldCanvas(headsetCamera.transform);
+            GameObject robotViewBackdrop = CreateRobotViewBackdrop(canvas.transform);
             Text stageText = CreateText(canvas.transform, "StageText", new Vector2(0.0f, 155.0f), 28, "Connecting");
             Text guidanceText = CreateText(canvas.transform, "GuidanceText", new Vector2(0.0f, 115.0f), 18, "Waiting for backend status...");
             Image indicator = CreateIndicator(canvas.transform);
             GameObject suspensionOverlay = CreateSuspensionOverlay(canvas.transform);
 
-            RawImage head = CreateVideoPanel(canvas.transform, "HeadVideo", new Vector2(0.0f, -25.0f), new Vector2(380.0f, 210.0f));
-            Text headVideoStatus = CreateText(canvas.transform, "HeadVideoStatus", new Vector2(0.0f, -150.0f), 13, "Head: starting");
-            RawImage left = CreateVideoPanel(canvas.transform, "LeftWristVideo", new Vector2(-200.0f, -245.0f), new Vector2(180.0f, 108.0f));
-            RawImage right = CreateVideoPanel(canvas.transform, "RightWristVideo", new Vector2(200.0f, -245.0f), new Vector2(180.0f, 108.0f));
-            Text leftVideoStatus = CreateText(canvas.transform, "LeftWristVideoStatus", new Vector2(-200.0f, -315.0f), 12, "Left wrist: starting");
-            Text rightVideoStatus = CreateText(canvas.transform, "RightWristVideoStatus", new Vector2(200.0f, -315.0f), 12, "Right wrist: starting");
-            Text diagnosticsText = CreateText(canvas.transform, "QuestDiagnostics", new Vector2(0.0f, -380.0f), 13, "Backend: waiting for status");
+            RawImage head = CreateVideoPanel(canvas.transform, "HeadVideo", new Vector2(0.0f, -55.0f), new Vector2(700.0f, 394.0f));
+            Text headVideoStatus = CreateText(canvas.transform, "HeadVideoStatus", new Vector2(0.0f, -278.0f), 13, "Head: starting");
+            RawImage left = CreateVideoPanel(canvas.transform, "LeftWristVideo", new Vector2(-225.0f, -360.0f), new Vector2(220.0f, 132.0f));
+            RawImage right = CreateVideoPanel(canvas.transform, "RightWristVideo", new Vector2(225.0f, -360.0f), new Vector2(220.0f, 132.0f));
+            Text leftVideoStatus = CreateText(canvas.transform, "LeftWristVideoStatus", new Vector2(-225.0f, -440.0f), 12, "Left wrist: starting");
+            Text rightVideoStatus = CreateText(canvas.transform, "RightWristVideoStatus", new Vector2(225.0f, -440.0f), 12, "Right wrist: starting");
+            Text diagnosticsText = CreateText(canvas.transform, "QuestDiagnostics", new Vector2(0.0f, -500.0f), 13, "Backend: waiting for status");
             ConfigureTextRect(diagnosticsText, new Vector2(820.0f, 92.0f), TextAnchor.UpperLeft);
             GameObject calibrationPanel = CreateCalibrationPanel(
                 canvas.transform,
@@ -81,6 +86,7 @@ namespace XLeRobot.QuestTeleop
             XLeRobotTeleoperationSceneManager teleoperationScene = systems.AddComponent<XLeRobotTeleoperationSceneManager>();
             XLeRobotSuspensionUIManager suspension = systems.AddComponent<XLeRobotSuspensionUIManager>();
             XLeRobotEmergencyStopInput emergencyStop = systems.AddComponent<XLeRobotEmergencyStopInput>();
+            XLeRobotPassthroughHoldController passthroughHold = systems.AddComponent<XLeRobotPassthroughHoldController>();
             XLeRobotQuestRuntimeOrchestrator orchestrator = systems.AddComponent<XLeRobotQuestRuntimeOrchestrator>();
 
             flow.BindUi(stageText, guidanceText, indicator);
@@ -93,6 +99,16 @@ namespace XLeRobot.QuestTeleop
             mirrorScene.Bind(bootstrap);
             suspension.BindOverlay(suspensionOverlay);
             emergencyStop.Bind(stateClient);
+            passthroughHold.Bind(
+                arSession,
+                arCameraManager,
+                arCameraBackground,
+                headsetCamera,
+                new GameObject[]
+                {
+                    canvas.gameObject,
+                },
+                null);
             questClient.BindOperatorOrigin(operatorOrigin);
             questClient.onRawServerMessage.AddListener(stateClient.ApplyServerMessage);
             questClient.onError.AddListener(flow.ApplyConnectionError);
@@ -128,16 +144,36 @@ namespace XLeRobot.QuestTeleop
                     diagnosticsText.gameObject,
                 });
 
-            string host = PlayerPrefs.GetString(PlayerPrefsHost, DefaultLocalHost);
-            int port = PlayerPrefs.GetInt(PlayerPrefsPort, DefaultLocalPort);
-            bool tls = PlayerPrefs.GetInt(PlayerPrefsTls, 0) == 1;
-            string token = PlayerPrefs.GetString(PlayerPrefsToken, DefaultLocalToken);
+            string host = GetStringPref(PlayerPrefsHost, LegacyPlayerPrefsHost, DefaultLocalHost);
+            int port = GetIntPref(PlayerPrefsPort, LegacyPlayerPrefsPort, DefaultLocalPort);
+            bool tls = GetIntPref(PlayerPrefsTls, LegacyPlayerPrefsTls, 0) == 1;
+            string token = GetStringPref(PlayerPrefsToken, LegacyPlayerPrefsToken, DefaultLocalToken);
             bootstrap.BindSceneComponents(questClient, stateClient, flow, headsetCamera.transform);
             bootstrap.ConfigureEndpoint(host, port, tls, token);
 
             EnsureEventSystem(root);
             _ = eventManager;
             _ = teleoperationScene;
+        }
+
+        private static string GetStringPref(string key, string legacyKey, string fallback)
+        {
+            if (PlayerPrefs.HasKey(key))
+            {
+                return PlayerPrefs.GetString(key, fallback);
+            }
+
+            return PlayerPrefs.GetString(legacyKey, fallback);
+        }
+
+        private static int GetIntPref(string key, string legacyKey, int fallback)
+        {
+            if (PlayerPrefs.HasKey(key))
+            {
+                return PlayerPrefs.GetInt(key, fallback);
+            }
+
+            return PlayerPrefs.GetInt(legacyKey, fallback);
         }
 
         private static Transform CreateOperatorOrigin(Transform root)
@@ -167,25 +203,41 @@ namespace XLeRobot.QuestTeleop
             }
 
             camera.clearFlags = CameraClearFlags.SolidColor;
-            camera.backgroundColor = new Color(0.0f, 0.0f, 0.0f, 0.0f);
+            camera.backgroundColor = new Color(0.0f, 0.0f, 0.0f, 1.0f);
             return camera;
         }
 
-        private static void ConfigurePassthrough(Transform root, Camera headsetCamera)
+        private static void ConfigurePassthroughRig(
+            Transform root,
+            Camera headsetCamera,
+            out ARSession session,
+            out ARCameraManager cameraManager,
+            out ARCameraBackground cameraBackground)
         {
-            if (FindObjectOfType<ARSession>() == null)
+            session = FindObjectOfType<ARSession>();
+            if (session == null)
             {
                 GameObject sessionObject = new GameObject("Quest Passthrough Session");
                 sessionObject.transform.SetParent(root, false);
-                sessionObject.AddComponent<ARSession>();
+                session = sessionObject.AddComponent<ARSession>();
             }
 
-            ARCameraManager cameraManager = headsetCamera.GetComponent<ARCameraManager>();
+            cameraManager = headsetCamera.GetComponent<ARCameraManager>();
             if (cameraManager == null)
             {
                 cameraManager = headsetCamera.gameObject.AddComponent<ARCameraManager>();
             }
-            cameraManager.enabled = true;
+
+            cameraBackground = headsetCamera.GetComponent<ARCameraBackground>();
+            if (cameraBackground == null)
+            {
+                cameraBackground = headsetCamera.gameObject.AddComponent<ARCameraBackground>();
+            }
+
+            session.enabled = false;
+            session.gameObject.SetActive(false);
+            cameraManager.enabled = false;
+            cameraBackground.enabled = false;
         }
 
         private static Canvas CreateWorldCanvas(Transform headset)
@@ -200,8 +252,20 @@ namespace XLeRobot.QuestTeleop
             canvas.renderMode = RenderMode.WorldSpace;
             canvasObject.AddComponent<GraphicRaycaster>();
             RectTransform rect = canvasObject.GetComponent<RectTransform>();
-            rect.sizeDelta = new Vector2(900.0f, 760.0f);
+            rect.sizeDelta = new Vector2(980.0f, 940.0f);
             return canvas;
+        }
+
+        private static GameObject CreateRobotViewBackdrop(Transform parent)
+        {
+            GameObject obj = new GameObject("RobotCameraOnlyBackdrop");
+            obj.transform.SetParent(parent, false);
+            Image image = obj.AddComponent<Image>();
+            image.color = new Color(0.005f, 0.008f, 0.012f, 0.96f);
+            RectTransform rect = obj.GetComponent<RectTransform>();
+            rect.anchoredPosition = new Vector2(0.0f, -165.0f);
+            rect.sizeDelta = new Vector2(900.0f, 760.0f);
+            return obj;
         }
 
         private static Text CreateText(Transform parent, string name, Vector2 position, int size, string value)

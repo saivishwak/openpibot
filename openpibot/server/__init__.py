@@ -1,4 +1,4 @@
-"""FastAPI server package for OpenPIBot."""
+"""FastAPI server package for OpenPiBot."""
 
 from __future__ import annotations
 

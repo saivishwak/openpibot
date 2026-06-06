@@ -1,4 +1,4 @@
-"""Pydantic schemas for OpenPIBot API boundaries."""
+"""Pydantic schemas for OpenPiBot API boundaries."""
 
 from __future__ import annotations
 

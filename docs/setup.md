@@ -8,7 +8,7 @@ One-time install + hardware config for a bimanual SO-101 XLeRobot.
 uv sync
 ```
 
-This prepares the OpenPIBot CLI, backend, dashboard runtime, LeRobot dataset tooling, and PI0.5 training/inference dependencies. The optional OpenPI WebSocket policy server is started through `uv` from a package-managed OpenPI runtime instead of a vendored checkout.
+This prepares the OpenPiBot CLI, backend, dashboard runtime, LeRobot dataset tooling, and PI0.5 training/inference dependencies. The optional OpenPI WebSocket policy server is started through `uv` from a package-managed OpenPI runtime instead of a vendored checkout.
 
 See [architecture.md](architecture.md) for the current Quest/OpenXR teleop,
 recording, finetuning, and inference data path.

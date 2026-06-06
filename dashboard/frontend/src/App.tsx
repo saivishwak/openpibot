@@ -91,7 +91,7 @@ function Sidebar({ open, onClose }: { open: boolean; onClose: () => void }) {
         <div className="flex items-center gap-2">
           <Bot size={22} />
           <div>
-            <div className="text-sm font-semibold">OpenPIBot</div>
+            <div className="text-sm font-semibold">OpenPiBot</div>
             <div className="text-xs text-muted-foreground">robot console</div>
           </div>
         </div>
@@ -175,7 +175,7 @@ export function App() {
             </Button>
             <div className="flex items-center gap-2 text-sm text-muted-foreground">
               <Activity size={17} />
-              <span>OpenPIBot dashboard</span>
+              <span>OpenPiBot dashboard</span>
             </div>
           </div>
           <div className="flex items-center gap-3">

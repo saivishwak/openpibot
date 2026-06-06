@@ -35,7 +35,7 @@ export function Dashboard() {
 
   return (
     <Page
-      title="OpenPIBot Dashboard"
+      title="OpenPiBot Dashboard"
       description="Bimanual SO-101 control, VR teleoperation, dataset recording, PI0.5 training, and inference in one local console."
       action={
         <div className="w-56">

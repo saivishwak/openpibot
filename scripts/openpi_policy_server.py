@@ -52,7 +52,7 @@ def create_policy(args: Args) -> _policy.Policy:
                 default_prompt=args.default_prompt,
             )
         case Default():
-            raise ValueError("default OpenPI policy serving is not configured for OpenPIBot")
+            raise ValueError("default OpenPI policy serving is not configured for OpenPiBot")
 
 
 def main(args: Args) -> None:

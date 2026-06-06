@@ -305,7 +305,7 @@ export default function RobotUrdfViewer({ status }: { status: VRStatus | undefin
       <div className="space-y-3">
         <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
           <div className="flex flex-wrap items-center gap-2">
-            <h2 className="text-sm font-semibold">OpenPIBot 3D View</h2>
+            <h2 className="text-sm font-semibold">OpenPiBot 3D View</h2>
             <Badge tone={loadState === "ready" ? "success" : loadState === "error" ? "danger" : "neutral"}>
               {loadState}
             </Badge>

@@ -1,4 +1,4 @@
-"""Logging setup for OpenPIBot."""
+"""Logging setup for OpenPiBot."""
 
 from __future__ import annotations
 

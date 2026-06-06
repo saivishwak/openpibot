@@ -1,7 +1,7 @@
 [project]
 name = "openpibot"
 version = "0.1.0"
-description = "OpenPIBot robot dashboard, VR teleop, recording, training, and inference tools."
+description = "OpenPiBot robot dashboard, VR teleop, recording, training, and inference tools."
 readme = "README.md"
 requires-python = ">=3.12,<3.13"
 dependencies = [

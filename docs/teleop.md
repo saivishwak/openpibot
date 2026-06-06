@@ -11,6 +11,7 @@ For the full end-to-end runtime path, see [architecture.md](architecture.md).
 |---|---|
 | **Grip** (side, middle finger) | **Hold to drive**, **first press = anchor for teleop**. Releasing stops motion. |
 | **Trigger** (front, index finger) | Close gripper while held. Released = open. |
+| **Both triggers together** | Hold to temporarily show Quest passthrough. Release either trigger to return to the robot-camera scene. Trigger/gripper values are suppressed while this chord is held. |
 | **A** (right) / **X** (left) | Confirm the headset is facing the workspace, then engage/switch the active arm. |
 | **Y** (left) | Toggle dual mode. Press Y by itself; X+Y chords are ignored so engage and dual mode do not fight. |
 | **B** (right) | Toggle dataset recording. |
@@ -21,7 +22,7 @@ For the full end-to-end runtime path, see [architecture.md](architecture.md).
 1. **Set a pairing token** before starting the backend:
    `XLE_QUEST_PAIRING_TOKEN=<shared-secret> uv run openpibot run`.
 2. **Open the dashboard**: `http://<workstation>:5000`. Click *Connect* on each arm you want to use.
-3. **Launch the XLeRobot Quest app** on the headset. In the app, connect to the
+3. **Launch the OpenPiBot Quest app** on the headset. In the app, connect to the
    tokenized `ws://<workstation>:5000/api/vr/quest/ws?token=...` endpoint shown
    on the *VR Operator* page. Enter the same pairing token in the dashboard and
    Unity app; the public status API does not expose it.
@@ -41,6 +42,11 @@ The native path uses backend-managed GStreamer H.264/RTP pipelines for low-laten
 camera delivery. Install `gst-launch-1.0` on the workstation and configure the
 `head`, `left_wrist`, and `right_wrist` camera roles before expecting video to be
 ready.
+
+The headset default view is robot-camera-only on a dark operator scene. Quest
+passthrough is disabled so dataset operators focus on what the robot sees. Hold
+both index triggers together only when you need to check the real surroundings;
+release either trigger to return to the previous robot-camera screen.
 
 On the *VR Operator* page, enter the Quest headset IP and click **Start video**.
 The backend starts one GStreamer process per camera role and shows the UDP ports,

@@ -1,4 +1,4 @@
-# XLeRobot Quest Teleop
+# OpenPiBot Quest App
 
 Standalone Quest 3/OpenXR Unity client for XLeRobot teleoperation.
 
@@ -17,6 +17,9 @@ streams operator intent and renders operator/video state.
   over a tokenized WebSocket.
 - Video target: consume backend-managed GStreamer H.264/RTP camera streams for
   low-latency headset video.
+- Operator view: default view is robot-camera-only on a dark Reachy-style
+  operator surface. Quest passthrough is hidden during recording/teleop unless
+  explicitly held.
 
 ## What Is Different For XLeRobot
 
@@ -42,8 +45,8 @@ Open this directory as a Unity project, switch to Android, open
 `Assets/Scenes/BaseScene.unity`, and build/sideload the APK.
 `XLeRobotRuntimeSceneBootstrap` creates the runtime XR origin, operator status
 panel, video surfaces, and backend clients when the scene loads. The bootstrap
-uses PlayerPrefs keys `xlerobot.quest.host`, `xlerobot.quest.port`,
-`xlerobot.quest.tls`, and `xlerobot.quest.token`; if they are unset, edit
+uses PlayerPrefs keys `openpibot.quest.host`, `openpibot.quest.port`,
+`openpibot.quest.tls`, and `openpibot.quest.token`; if they are unset, edit
 `XLeRobotRuntimeSceneBootstrap` defaults or add a small settings scene before
 shipping. Use the same token as `XLE_QUEST_PAIRING_TOKEN` on the backend. The
 public dashboard status does not expose the token.
@@ -65,9 +68,15 @@ public dashboard status does not expose the token.
   received textures to headset UI or renderer surfaces.
 - `XLeRobotGStreamerWebRtcReceiver` optionally binds Pollen/Reachy
   `GstreamerWebRTC` texture events into the same video surfaces.
+- `XLeRobotPassthroughHoldController` keeps passthrough disabled by default and
+  temporarily shows it only while both index triggers are held.
 
 Hold the primary and secondary buttons together for about one second on either
 controller to trigger backend emergency stop.
+Hold both index triggers together to show passthrough for checking the real
+surroundings; release either trigger to return to the robot-camera scene. While
+this passthrough chord is held, trigger values are suppressed in the teleop
+packet so the look-around action does not close the grippers.
 
 ## Runtime Contract
 

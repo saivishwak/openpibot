@@ -71,7 +71,7 @@ function CameraTile({ cam, roles, refresh }: { cam: CameraSpec; roles: string[];
 export function Cameras() {
   const { data, error, mutate } = useSWR<{ cameras: CameraSpec[]; roles: string[] }>("/api/cameras", fetcher);
   return (
-    <Page title="Cameras" description="Assign USB camera devices to OpenPIBot roles. Assignments are saved to YAML and reused for recording and inference.">
+    <Page title="Cameras" description="Assign USB camera devices to OpenPiBot roles. Assignments are saved to YAML and reused for recording and inference.">
       {error ? <Card className="border-danger text-danger">{String(error)}</Card> : null}
       <div className="grid gap-4 lg:grid-cols-2 2xl:grid-cols-3">
         {(data?.cameras ?? []).map((cam) => (

@@ -48,10 +48,10 @@ export function Inference() {
   ).reverse();
 
   return (
-    <Page title="Inference" description="Run the package-managed PI0.5 WebSocket server or local finetuned checkpoint inference from OpenPIBot.">
+    <Page title="Inference" description="Run the package-managed PI0.5 WebSocket server or local finetuned checkpoint inference from OpenPiBot.">
       <div className="grid gap-4 xl:grid-cols-2">
         <Card>
-          <h2 className="text-sm font-semibold">OpenPIBot policy server</h2>
+          <h2 className="text-sm font-semibold">OpenPiBot policy server</h2>
           <p className="mt-1 text-sm text-muted-foreground">Starts OpenPI from the package-managed runtime. No vendored third-party checkout is used.</p>
           <Button className="mt-4" onClick={() => api.startPi05Server().then(() => mutate()).catch((err) => alert(String(err)))}>
             <Server size={16} />Start PI0.5 server

@@ -1,4 +1,4 @@
-"""OpenPIBot command line interface."""
+"""OpenPiBot command line interface."""
 
 from __future__ import annotations
 
@@ -22,7 +22,7 @@ from openpibot.server.runtime.openpi_policy import build_openpi_policy_server_co
 
 app = typer.Typer(
     name="openpibot",
-    help="OpenPIBot robot dashboard, VR teleop, recording, and PI0.5 tooling.",
+    help="OpenPiBot robot dashboard, VR teleop, recording, and PI0.5 tooling.",
     no_args_is_help=True,
 )
 dataset_app = typer.Typer(help="Dataset utilities.")
@@ -43,7 +43,7 @@ def main(
         typer.Option("--version", callback=_version_callback, is_eager=True, help="Show version and exit."),
     ] = False,
 ) -> None:
-    """OpenPIBot CLI root."""
+    """OpenPiBot CLI root."""
 
 
 def _port_in_use(host: str, port: int) -> bool:
@@ -96,7 +96,7 @@ def run(
         help="Build dashboard/frontend before starting the backend.",
     ),
 ) -> None:
-    """Start the production OpenPIBot dashboard and API server."""
+    """Start the production OpenPiBot dashboard and API server."""
     if build_dashboard:
         _build_dashboard()
 
@@ -111,7 +111,7 @@ def run(
             continue
         os.environ["OPENPIBOT_HOST"] = host
         os.environ["OPENPIBOT_PORT"] = str(candidate)
-        console.print(f"[green]OpenPIBot dashboard:[/green] http://127.0.0.1:{candidate}")
+        console.print(f"[green]OpenPiBot dashboard:[/green] http://127.0.0.1:{candidate}")
         console.print(f"[dim]Logs:[/dim] {log_file}")
         uvicorn.run(
             "openpibot.server.app:create_app",
@@ -131,7 +131,7 @@ def info() -> None:
     """Print project, config, and robot profile information."""
     cfg = load_project_config()
     profiles = get_robot_profiles(cfg)
-    table = Table(title="OpenPIBot")
+    table = Table(title="OpenPiBot")
     table.add_column("Key")
     table.add_column("Value")
     table.add_row("Version", __version__)
