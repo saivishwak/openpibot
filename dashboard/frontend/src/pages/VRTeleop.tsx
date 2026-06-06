@@ -239,7 +239,7 @@ function QuestNativeBridge({ status, bridge, video, refreshVideo }: {
           <Badge tone={video?.ready ? "success" : video?.gst_available === false ? "danger" : "warning"}>
             {video?.ready ? "video running" : video?.gst_available === false ? "gst missing" : "video stopped"}
           </Badge>
-          <Badge tone="info">{bridge?.coordinate_frame ?? "unity_openxr"}</Badge>
+          <Badge tone="info">{bridge?.coordinate_frame ?? "quest_operator_frame"}</Badge>
         </div>
       </div>
       <div className="mt-3 flex items-center gap-2 rounded-md border border-border bg-muted p-3">

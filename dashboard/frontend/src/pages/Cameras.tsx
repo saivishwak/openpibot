@@ -2,11 +2,12 @@ import { Camera as CameraIcon } from "lucide-react";
 import { useState } from "react";
 import useSWR from "swr";
 import { CameraSpec, api, fetcher } from "../api";
-import { Badge, Card, Page, SelectField } from "../components/ui";
+import { Badge, Button, Card, Page, SelectField } from "../components/ui";
 
 function CameraTile({ cam, roles, refresh }: { cam: CameraSpec; roles: string[]; refresh: () => Promise<unknown> }) {
   const [busy, setBusy] = useState(false);
   const [errored, setErrored] = useState(false);
+  const [previewSrc, setPreviewSrc] = useState("");
   const assign = async (role: string) => {
     if (!cam.by_path) return;
     setBusy(true);
@@ -27,19 +28,35 @@ function CameraTile({ cam, roles, refresh }: { cam: CameraSpec; roles: string[];
             <CameraIcon size={16} />
             <h2 className="truncate text-sm font-semibold">{cam.name}</h2>
             {cam.role ? <Badge tone="info">{cam.role}</Badge> : null}
+            {cam.available === false ? <Badge tone="danger">missing</Badge> : null}
+            {cam.capture === false ? <Badge tone="warning">not capture</Badge> : null}
+            {cam.capture === null || cam.capture === undefined ? <Badge>unprobed</Badge> : null}
           </div>
           <p className="mt-1 break-all text-xs text-muted-foreground">{cam.card || "unknown card"}</p>
           <p className="mono mt-1 break-all text-xs text-muted-foreground">{cam.by_path || cam.path}</p>
         </div>
       </div>
       <div className="cam-tile">
-        {!errored ? (
-          <img src={`/camera/${encodeURIComponent(cam.name)}/stream?t=${encodeURIComponent(cam.path)}`} alt={cam.name} onError={() => setErrored(true)} />
+        {previewSrc && !errored ? (
+          <img src={previewSrc} alt={cam.name} onError={() => setErrored(true)} />
         ) : (
-          <div className="grid h-full place-items-center p-4 text-center text-xs text-muted-foreground">stream unavailable</div>
+          <div className="grid h-full place-items-center p-4 text-center text-xs text-muted-foreground">
+            {errored ? "snapshot unavailable" : "snapshot not loaded"}
+          </div>
         )}
       </div>
-      <div className="mt-3">
+      <div className="mt-3 flex items-center gap-2">
+        <Button
+          type="button"
+          variant="secondary"
+          disabled={cam.available === false}
+          onClick={() => {
+            setErrored(false);
+            setPreviewSrc(`/camera/${encodeURIComponent(cam.name)}/snapshot?t=${Date.now()}`);
+          }}
+        >
+          Test
+        </Button>
         <SelectField
           value={cam.role || "__none__"}
           disabled={!cam.by_path || busy}
@@ -61,8 +78,7 @@ export function Cameras() {
           <CameraTile key={`${cam.name}-${cam.path}`} cam={cam} roles={data?.roles ?? []} refresh={() => mutate()} />
         ))}
       </div>
-      {data && data.cameras.length === 0 ? <p className="text-sm text-muted-foreground">No capture-capable cameras detected.</p> : null}
+      {data && data.cameras.length === 0 ? <p className="text-sm text-muted-foreground">No video devices detected.</p> : null}
     </Page>
   );
 }
-

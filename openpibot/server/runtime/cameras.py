@@ -48,6 +48,8 @@ class CameraSpec:
     role: str | None = None      # one of _ROLES if assigned, else None
     by_path: str | None = None   # /dev/v4l/by-path/... if known
     card: str = ""               # human-readable card name from V4L2_QUERYCAP
+    available: bool = True       # configured path/device node exists right now
+    capture: bool | None = None  # V4L2 capture-capable if probed; None if unknown
 
 
 def _query_v4l2_cap(path: str) -> tuple[bool, str] | None:
@@ -77,6 +79,20 @@ def _canonical_video_node(path: str) -> str:
     return str(pathlib.Path(path).resolve())
 
 
+def _opencv_capture_path(path: str) -> str:
+    """Path passed to OpenCV.
+
+    Keep config on stable by-path/by-id strings, but OpenCV's V4L2 backend emits
+    warnings and may fail when opened by symlink name. The resolved /dev/videoN
+    node is the correct capture handle while the stable mapping remains in YAML.
+    """
+    try:
+        resolved = _canonical_video_node(path)
+    except Exception:
+        return path
+    return resolved if resolved.startswith("/dev/video") else path
+
+
 def _by_path_for_node(node: str) -> str | None:
     """Find the first /dev/v4l/by-path/* symlink pointing to /dev/videoN. Prefer non-usbv2."""
     by_path_dir = pathlib.Path("/dev/v4l/by-path")
@@ -88,6 +104,56 @@ def _by_path_for_node(node: str) -> str | None:
         return None
     matches.sort(key=lambda p: ("usbv2" in p.name, p.name))
     return str(matches[0])
+
+
+def _all_symlinks_for_node(node: str) -> list[str]:
+    """Stable /dev/v4l symlinks pointing at a video node, by-path first."""
+    target = pathlib.Path(node).resolve()
+    out: list[str] = []
+    for directory in (pathlib.Path("/dev/v4l/by-path"), pathlib.Path("/dev/v4l/by-id")):
+        if not directory.is_dir():
+            continue
+        for path in sorted(directory.iterdir()):
+            try:
+                if path.resolve() == target:
+                    out.append(str(path))
+            except OSError:
+                continue
+    out.sort(key=lambda p: ("/by-path/" not in p, "usbv2" in p, p))
+    deduped: list[str] = []
+    for path in out:
+        if path not in deduped:
+            deduped.append(path)
+    return deduped
+
+
+def _video_device_candidates() -> list[str]:
+    """All visible V4L video device paths useful for camera role assignment.
+
+    Includes stable by-path/by-id symlinks and raw /dev/videoN nodes. Capability
+    probing can fail on some hosts while a device is still assignable, so probing
+    happens later and does not hide the candidate.
+    """
+    paths: list[str] = []
+    for directory in (pathlib.Path("/dev/v4l/by-path"), pathlib.Path("/dev/v4l/by-id")):
+        if directory.is_dir():
+            paths.extend(str(path) for path in sorted(directory.iterdir()))
+    paths.extend(str(path) for path in sorted(
+        pathlib.Path("/dev").glob("video*"),
+        key=lambda p: int(p.name[5:]) if p.name[5:].isdigit() else 999999,
+    ))
+    out: list[str] = []
+    for path in paths:
+        if path not in out:
+            out.append(path)
+    return out
+
+
+def _candidate_name(path: str, canonical_node: str, index: int) -> str:
+    if canonical_node.startswith("/dev/video"):
+        return f"raw:{pathlib.Path(canonical_node).name}"
+    leaf = pathlib.Path(path).name or f"video{index}"
+    return f"raw:{leaf}"
 
 
 def _read_config() -> dict:
@@ -104,7 +170,7 @@ def _write_config(cfg: dict) -> None:
 
 
 def enumerate_cameras() -> list[CameraSpec]:
-    """Configured cameras first (in role order), then any detected unassigned capture nodes."""
+    """Configured cameras first, then every visible unassigned V4L video device."""
     cfg = _read_config()
     cams_cfg = (cfg.get("cameras") or {})
 
@@ -118,10 +184,16 @@ def enumerate_cameras() -> list[CameraSpec]:
             continue
         path = c["path"]
         configured_paths.add(path)
+        available = pathlib.Path(path).exists()
+        canonical = ""
         try:
-            configured_nodes.add(_canonical_video_node(path))
+            canonical = _canonical_video_node(path)
+            if available:
+                configured_nodes.add(canonical)
         except Exception:
             pass
+        probed = _query_v4l2_cap(path) if available else None
+        capture, card = probed if probed is not None else (None, "")
         out.append(CameraSpec(
             name=role,
             path=path,
@@ -130,33 +202,43 @@ def enumerate_cameras() -> list[CameraSpec]:
             fps=int(c.get("fps", 30)),
             fourcc=c.get("fourcc", "MJPG"),
             role=role if role in _ROLES else None,
-            by_path=path if "/by-path/" in path else _by_path_for_node(path),
-            card="",
+            by_path=path if "/by-path/" in path or "/by-id/" in path else (_by_path_for_node(path) or path),
+            card=card,
+            available=available,
+            capture=capture,
         ))
 
-    # Discover raw capture-capable /dev/videoN nodes the config doesn't already use.
-    raw_nodes = sorted(pathlib.Path("/dev").glob("video*"), key=lambda p: int(p.name[5:]))
+    # Discover all visible video device candidates the config doesn't already use.
     seen_nodes: set[str] = set(configured_nodes)
-    for vid in raw_nodes:
-        node = str(vid)
+    seen_paths: set[str] = set(configured_paths)
+    raw_index = 0
+    for candidate in _video_device_candidates():
+        if candidate in seen_paths:
+            continue
+        try:
+            node = _canonical_video_node(candidate)
+        except Exception:
+            node = candidate
         if node in seen_nodes:
             continue
-        probed = _query_v4l2_cap(node)
-        if probed is None:
-            continue
-        is_capture, card = probed
-        if not is_capture:
-            continue
+        available = pathlib.Path(candidate).exists()
+        probed = _query_v4l2_cap(candidate) if available else None
+        capture, card = probed if probed is not None else (None, "")
         seen_nodes.add(node)
-        by_path = _by_path_for_node(node)
+        seen_paths.add(candidate)
+        symlinks = _all_symlinks_for_node(node) if node != candidate else []
+        assign_path = symlinks[0] if symlinks else candidate
         out.append(CameraSpec(
-            name=f"raw:{vid.name}",
-            path=by_path or node,
+            name=_candidate_name(candidate, node, raw_index),
+            path=assign_path,
             width=640, height=480, fps=30, fourcc="MJPG",
             role=None,
-            by_path=by_path,
+            by_path=assign_path,
             card=card,
+            available=available,
+            capture=capture,
         ))
+        raw_index += 1
     return out
 
 
@@ -237,11 +319,12 @@ class CameraStream:
 
     def _open(self) -> bool:
         self._close_cap()
-        cap = cv2.VideoCapture(self.spec.path, cv2.CAP_V4L2)
+        capture_path = _opencv_capture_path(self.spec.path)
+        cap = cv2.VideoCapture(capture_path, cv2.CAP_V4L2)
         if not cap.isOpened():
-            cap = cv2.VideoCapture(self.spec.path)
+            cap = cv2.VideoCapture(capture_path)
         if not cap.isOpened():
-            self.last_error = f"VideoCapture failed to open {self.spec.path}"
+            self.last_error = f"VideoCapture failed to open {self.spec.path} ({capture_path})"
             return False
         cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
         if self.spec.fourcc:

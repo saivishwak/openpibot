@@ -40,12 +40,11 @@ from .motors import JOINTS_PER_ARM
 log = logging.getLogger(__name__)
 
 # Order must match what the drive loop writes into `action` / `observation.state`.
-# All 12 joints (6 per arm × 2). If an arm is disconnected we still write
-# placeholder values (NaN-like → use the LAST commanded value if any, else 0.0)
-# so the schema stays fixed across episodes.
+# All 12 joints (6 per arm x 2) are required for strict dataset recording.
 JOINT_ORDER: list[str] = [
     f"{side}_arm_{j}" for side in ("left", "right") for j in JOINTS_PER_ARM
 ]
+REQUIRED_CAMERA_ROLES: tuple[str, ...] = ("head", "left_wrist", "right_wrist")
 
 
 class DatasetRecorder:
@@ -260,13 +259,17 @@ class DatasetRecorder:
                    present: dict[str, float],
                    camera_frames: dict[str, Optional[np.ndarray]]) -> None:
         """Append one frame to the current episode buffer. Caller must already
-        have called `start_episode`. `camera_frames` keys must include every
-        configured camera role; missing or None entries are replaced with a
-        zero-filled frame of the expected shape (so the dataset's schema stays
-        stable even if a camera glitches mid-episode)."""
+        have called `start_episode`.
+
+        Dataset-quality recording is strict: all joints and camera frames must be
+        present for every frame. Missing hardware data aborts the caller's active
+        recording instead of writing zero-filled or partial training examples."""
         with self._lock:
             if not self._in_episode:
                 return
+            self._validate_joint_dict("action", action)
+            self._validate_joint_dict("observation.state", present)
+            self._validate_camera_frames(camera_frames)
             action_vec  = self._joint_dict_to_array(action)
             present_vec = self._joint_dict_to_array(present)
 
@@ -277,30 +280,48 @@ class DatasetRecorder:
             }
             for role in self.camera_roles:
                 img = camera_frames.get(role)
-                if img is None or not isinstance(img, np.ndarray):
-                    # Fill missing/failed frame with zeros — preserves schema.
-                    img = np.zeros(self.camera_shape, dtype=np.uint8)
-                else:
-                    # Ensure the right shape + dtype.
-                    if img.shape != self.camera_shape:
-                        img = cv2.resize(img,
-                                          (self.camera_shape[1], self.camera_shape[0]))
-                    if img.dtype != np.uint8:
-                        img = img.astype(np.uint8)
                 frame[f"observation.images.{role}"] = img
 
+            with self._io_lock:
+                self._dataset.add_frame(frame)
+            self._frame_count += 1
+
+    @staticmethod
+    def _validate_joint_dict(label: str, joints: dict[str, float]) -> None:
+        missing = [k for k in JOINT_ORDER if k not in joints]
+        if missing:
+            raise RuntimeError(f"{label} missing joints: {', '.join(missing)}")
+        bad: list[str] = []
+        for key in JOINT_ORDER:
             try:
-                with self._io_lock:
-                    self._dataset.add_frame(frame)
-                self._frame_count += 1
-            except Exception as e:
-                # Don't bring down the drive loop on a single bad frame.
-                log.warning("add_frame failed (frame %d): %s", self._frame_count, e)
+                value = float(joints[key])
+            except (TypeError, ValueError):
+                bad.append(key)
+                continue
+            if not np.isfinite(value):
+                bad.append(key)
+        if bad:
+            raise RuntimeError(f"{label} has non-finite joints: {', '.join(bad)}")
+
+    def _validate_camera_frames(self, camera_frames: dict[str, Optional[np.ndarray]]) -> None:
+        missing = [role for role in self.camera_roles if role not in camera_frames]
+        if missing:
+            raise RuntimeError(f"camera frames missing roles: {', '.join(missing)}")
+        bad: list[str] = []
+        for role in self.camera_roles:
+            img = camera_frames.get(role)
+            if not isinstance(img, np.ndarray):
+                bad.append(role)
+                continue
+            if img.shape != self.camera_shape or img.dtype != np.uint8:
+                bad.append(role)
+        if bad:
+            shape = "x".join(str(v) for v in self.camera_shape)
+            raise RuntimeError(f"camera frames invalid for roles {', '.join(bad)}; expected uint8 RGB shape {shape}")
 
     @staticmethod
     def _joint_dict_to_array(joints: dict[str, float]) -> np.ndarray:
-        """Project a possibly-incomplete joint dict onto the fixed JOINT_ORDER.
-        Missing keys → 0.0 (e.g., an arm that isn't connected)."""
+        """Project a validated complete joint dict onto the fixed JOINT_ORDER."""
         return np.array(
             [float(joints.get(k, 0.0)) for k in JOINT_ORDER],
             dtype=np.float32,
@@ -333,6 +354,30 @@ class DatasetRecorder:
                 log.info("pushed dataset %s to Hub", self.repo_id)
             except Exception as e:
                 log.warning("push_to_hub failed: %s", e)
+
+    def discard_episode(self) -> None:
+        """Drop the current in-memory episode after a strict recording failure."""
+        with self._lock:
+            was_in_episode = self._in_episode
+            self._in_episode = False
+            self._frame_count = 0
+        if was_in_episode:
+            try:
+                with self._io_lock:
+                    self._dataset.clear_episode_buffer()
+            except Exception as e:
+                log.warning("discard_episode: clear_episode_buffer failed: %s", e)
+
+    def write_recording_context(self, metadata: dict[str, Any]) -> None:
+        """Append an audit record for a recording episode without changing features."""
+        try:
+            root = pathlib.Path(self._dataset.root)
+            path = root / "meta" / "recording_context.jsonl"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with path.open("a", encoding="utf-8") as f:
+                f.write(json.dumps(metadata, sort_keys=True) + "\n")
+        except Exception as e:
+            log.warning("write_recording_context failed: %s", e)
 
 
 # ─── helpers used by VRTeleopSession to build the recorder ─────────────────
@@ -422,7 +467,7 @@ def resolve_root(root: Optional[str], repo_id: str) -> str:
 
 def role_camera_list() -> tuple[list[str], tuple[int, int, int]]:
     """Return the list of camera roles to record + a single shared (H, W, 3)
-    shape that all roles must conform to (we resize on add_frame if needed)."""
+    shape that all roles must conform to."""
     cfg = load_dataset_config()
     roles: list[str] = []
     for c in cam_mod.enumerate_cameras():

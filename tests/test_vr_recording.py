@@ -42,6 +42,64 @@ class _FakeMotors:
         return dict(self._present)
 
 
+class _StrictMotors:
+    connected_sides = ["left", "right"]
+    bounds = {
+        f"{side}_arm_{joint}": (-180.0, 180.0)
+        for side in ("left", "right")
+        for joint in vr_mod._motors.JOINTS_PER_ARM
+    }
+
+    def __init__(self, present=None):
+        self._present = present or {
+            **_joint_values("left", 10),
+            **_joint_values("right", 20),
+        }
+
+    def is_connected(self, side):
+        return side in self.connected_sides
+
+    def is_torque_enabled(self, side):
+        return True
+
+    def read_positions(self, side=None):
+        if side is None:
+            return dict(self._present)
+        return {k: v for k, v in self._present.items() if k.startswith(f"{side}_arm_")}
+
+
+def _mark_strict_recording_ready(session, monkeypatch):
+    monkeypatch.setattr(vr_mod, "MOTORS", _StrictMotors())
+    monkeypatch.setattr(
+        vr_mod._dataset,
+        "role_camera_list",
+        lambda: (["head", "left_wrist", "right_wrist"], (2, 2, 3)),
+    )
+    monkeypatch.setattr(vr_mod._cameras, "suspended_capture_roles", lambda: {})
+    monkeypatch.setattr(vr_mod._home, "home_pose_status", lambda: {
+        "left": {"captured": True, "joints": {}},
+        "right": {"captured": True, "joints": {}},
+    })
+    monkeypatch.setattr(vr_mod._home, "read_home_pose", lambda: {
+        **_joint_values("left", 10),
+        **_joint_values("right", 20),
+    })
+    session._native_quest_clients = 1
+    for side in ("left", "right"):
+        arm = session._arms[side]
+        arm.kinematics = object()
+        arm.using_analytical_fallback = False
+        arm.cal_confidence = "good"
+        arm.robot_verify_quality = "good"
+        arm.robot_verify_fit_error_cm = 0.0
+        arm.robot_verify_test_completed = True
+        arm.controller_anchor_T = vr_mod._pose_matrix_from_vr((0.0, 0.0, 0.0), (0.0, 0.0, 0.0, 1.0))
+        arm.vr_ctrl_to_ee = vr_mod._R.identity()
+        arm.calibrated = True
+        arm.anchor_generation = arm.pose_generation
+        arm.anchor_invalid_reason = ""
+
+
 def _joint_values(side, base):
     prefix = f"{side}_arm_"
     return {
@@ -161,7 +219,11 @@ def test_recording_restart_waits_for_previous_stop_to_finish(monkeypatch):
                 "root": None,
             },
         )
-    monkeypatch.setattr(vr_mod._dataset, "role_camera_list", lambda: (["head"], (2, 2, 3)))
+    monkeypatch.setattr(
+        vr_mod._dataset,
+        "role_camera_list",
+        lambda: (["head", "left_wrist", "right_wrist"], (2, 2, 3)),
+    )
     monkeypatch.setattr(vr_mod._dataset, "resolve_root", lambda root, repo_id: "/tmp/test/repo")
     monkeypatch.setattr(vr_mod._dataset, "DatasetRecorder", lambda **kwargs: new_rec)
     monkeypatch.setattr(session, "_recording_calibration_blockers", lambda: [])
@@ -204,7 +266,11 @@ def test_b_button_start_requires_synced_task(monkeypatch):
                 "root": None,
             },
         )
-    monkeypatch.setattr(vr_mod._dataset, "role_camera_list", lambda: (["head"], (2, 2, 3)))
+    monkeypatch.setattr(
+        vr_mod._dataset,
+        "role_camera_list",
+        lambda: (["head", "left_wrist", "right_wrist"], (2, 2, 3)),
+    )
     monkeypatch.setattr(vr_mod._dataset, "resolve_root", lambda root, repo_id: "/tmp/test/repo")
     monkeypatch.setattr(vr_mod._dataset, "DatasetRecorder", lambda **kwargs: recorder)
     monkeypatch.setattr(session, "_recording_calibration_blockers", lambda: [])
@@ -312,7 +378,11 @@ def test_start_recording_after_delete_keeps_saved_count(monkeypatch):
                 "root": None,
             },
         )
-    monkeypatch.setattr(vr_mod._dataset, "role_camera_list", lambda: (["head"], (2, 2, 3)))
+    monkeypatch.setattr(
+        vr_mod._dataset,
+        "role_camera_list",
+        lambda: (["head", "left_wrist", "right_wrist"], (2, 2, 3)),
+    )
     monkeypatch.setattr(vr_mod._dataset, "resolve_root", lambda root, repo_id: "/tmp/test/repo")
     monkeypatch.setattr(vr_mod._dataset, "DatasetRecorder", lambda **kwargs: recorder)
     monkeypatch.setattr(session, "_recording_calibration_blockers", lambda: [])
@@ -322,3 +392,89 @@ def test_start_recording_after_delete_keeps_saved_count(monkeypatch):
     assert status["recording_info"]["episodes_saved"] == 2
     assert status["recording_info"]["last_episode_index"] == 1
     assert status["recording_info"]["last_episode_frames"] == 420
+
+
+def test_recording_start_arms_until_fresh_anchors(monkeypatch):
+    session = vr_mod.VRTeleopSession()
+    recorder = _FakeRecorder()
+    _mark_strict_recording_ready(session, monkeypatch)
+    monkeypatch.setattr(
+        vr_mod._dataset,
+        "load_dataset_config",
+        lambda: {
+            "home_before_episode": False,
+            "repo_id": "test/repo",
+            "fps": 30,
+            "push_to_hub": False,
+            "root": None,
+        },
+    )
+    monkeypatch.setattr(vr_mod._dataset, "resolve_root", lambda root, repo_id: "/tmp/test/repo")
+    monkeypatch.setattr(vr_mod._dataset, "DatasetRecorder", lambda **kwargs: recorder)
+
+    session._invalidate_teleop_anchor("left", "homing changed robot pose")
+
+    assert session.set_recording(True, task="Pick the red block") is False
+    assert session._recording is False
+    assert session._recording_armed is True
+    assert "waiting for fresh" in (session._last_error or "")
+
+    with session._lock:
+        left = session._arms["left"]
+        left.controller_anchor_T = vr_mod._pose_matrix_from_vr((0.0, 0.0, 0.0), (0.0, 0.0, 0.0, 1.0))
+        left.vr_ctrl_to_ee = vr_mod._R.identity()
+        left.calibrated = True
+        left.anchor_generation = left.pose_generation
+        left.anchor_invalid_reason = ""
+        session._maybe_start_armed_recording_locked()
+
+    assert session._recording is True
+    assert session._recording_armed is False
+    assert recorder.task == "Pick the red block"
+
+
+def test_go_home_invalidates_existing_anchor(monkeypatch):
+    session = vr_mod.VRTeleopSession()
+    _mark_strict_recording_ready(session, monkeypatch)
+    before_generation = session._arms["right"].pose_generation
+
+    session.go_home(side="right")
+
+    arm = session._arms["right"]
+    assert arm.pose_generation == before_generation + 1
+    assert arm.calibrated is False
+    assert arm.controller_anchor_T is None
+    assert "homing" in arm.anchor_invalid_reason
+
+
+def test_strict_frame_failure_aborts_episode(monkeypatch):
+    class RejectingRecorder(_FakeRecorder):
+        def __init__(self):
+            super().__init__()
+            self.discarded = False
+
+        def add_frame(self, action, present, camera_frames):
+            raise RuntimeError("camera frames missing roles: head")
+
+        def discard_episode(self):
+            self.discarded = True
+            self.in_episode = False
+
+    recorder = RejectingRecorder()
+    session = vr_mod.VRTeleopSession()
+    present = {**_joint_values("left", 10), **_joint_values("right", 20)}
+    session._recording = True
+    session._recorder = recorder
+    monkeypatch.setattr(vr_mod, "MOTORS", _StrictMotors(present))
+    monkeypatch.setattr(vr_mod._dataset, "grab_camera_frames", lambda: {})
+
+    session._record_frame_if_active(
+        commanded_this_tick={
+            "left": _joint_values("left", 100),
+            "right": _joint_values("right", 200),
+        }
+    )
+
+    assert session._recording is False
+    assert recorder.discarded is True
+    assert "strict frame rejected" in (session._last_error or "")

@@ -29,6 +29,7 @@ def test_robot_verification_persists_separately_from_vr_direction(tmp_path, monk
         sample_residuals=[{"label": "forward", "residual_cm": 0.4}],
         samples=[{"label": "forward", "vr_delta": [0.0, 0.0, -0.1], "robot_delta": [0.05, 0.0, 0.0]}],
         quality="good",
+        low_scale_test_completed=True,
     )
 
     raw = yaml.safe_load(cfg_path.read_text())
@@ -36,9 +37,12 @@ def test_robot_verification_persists_separately_from_vr_direction(tmp_path, monk
     robot = right["robot_verification"]
 
     assert right["calibration_mode"] == "vr_direction"
+    assert right["coordinate_frame"] == "quest_operator_frame"
     assert "translation_scale" not in right
     assert robot["calibration_mode"] == "robot_verified"
+    assert robot["coordinate_frame"] == "quest_operator_frame"
     assert robot["translation_scale"] == pytest.approx(0.5)
+    assert robot["low_scale_test_completed"] is True
     assert cal.status()["right"]["robot_verified"] is True
     assert cal.status()["right"]["calibration_mode"] == "vr_direction"
     assert cal.translation_scale_for_arm("right") == pytest.approx(0.5)
@@ -66,4 +70,5 @@ def test_robot_verification_reader_accepts_legacy_flat_entry():
 
     assert robot["calibration_mode"] == "robot_verified"
     assert robot["translation_scale"] == pytest.approx(0.5)
+    assert robot["low_scale_test_completed"] is False
     assert robot["robot_verified_samples"] == [{"label": "forward"}]

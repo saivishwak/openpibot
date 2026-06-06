@@ -36,6 +36,8 @@ export interface CameraSpec {
   role: string | null;
   by_path: string | null;
   card: string;
+  available?: boolean;
+  capture?: boolean | null;
 }
 
 export type ArmSide = "left" | "right";

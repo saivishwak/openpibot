@@ -13,6 +13,7 @@ File format (`config/vr_calibration.yaml`):
       default:
         left:
           calibration_mode: vr_direction
+          coordinate_frame: quest_operator_frame
           session_vr_to_robot:
             - [m00, m01, m02]
             - [m10, m11, m12]
@@ -28,6 +29,7 @@ File format (`config/vr_calibration.yaml`):
             translation_scale: 0.51
             fit_error_cm: 1.2
             calibration_quality: good
+            low_scale_test_completed: true
             robot_verified_samples: [...]
         right: { ... same shape ... }
 
@@ -241,6 +243,7 @@ def robot_verification_entry(data: dict[str, Any] | None) -> dict[str, Any]:
     return {
         "calibration_mode": "robot_verified",
         "teleop_source": data.get("teleop_source"),
+        "coordinate_frame": data.get("coordinate_frame"),
         "base_vr_direction_matrix": data.get(
             "base_vr_direction_matrix",
             data.get("session_vr_to_robot"),
@@ -251,6 +254,7 @@ def robot_verification_entry(data: dict[str, Any] | None) -> dict[str, Any]:
         "fit_error_cm": data.get("fit_error_cm"),
         "calibration_quality": data.get("calibration_quality"),
         "verified_at": data.get("verified_at"),
+        "low_scale_test_completed": data.get("low_scale_test_completed", False),
         "robot_verified_samples": data.get("robot_verified_samples") or [],
         "robot_verified_sample_residuals": data.get("robot_verified_sample_residuals") or [],
     }
@@ -294,6 +298,7 @@ def write_for_arm(side: str, matrix: np.ndarray,
                    confidence: str = "good",
                    wrist_pitch_anchor_local: tuple[float, float, float] | None = None,
                    wrist_roll_anchor_local: tuple[float, float, float] | None = None,
+                   coordinate_frame: str = "quest_operator_frame",
                    ) -> None:
     """Persist one arm's calibration. Preserves other arms' entries by reading
     the file first, mutating, and writing back.
@@ -317,6 +322,7 @@ def write_for_arm(side: str, matrix: np.ndarray,
     entry: dict[str, Any] = {
         "calibration_mode": "vr_direction",
         "teleop_source": "native_quest",
+        "coordinate_frame": str(coordinate_frame or "quest_operator_frame"),
         "wrist_canonical_frame": "raw_controller_anchor_local",
         "session_vr_to_robot": [[float(v) for v in row] for row in M],
         "calibrated_at": datetime.datetime.now().isoformat(timespec="seconds"),
@@ -347,6 +353,8 @@ def write_robot_verification_for_arm(
     sample_residuals: list[dict[str, Any]],
     samples: list[dict[str, Any]],
     quality: str,
+    low_scale_test_completed: bool = False,
+    coordinate_frame: str = "quest_operator_frame",
 ) -> None:
     """Persist the robot-verified refinement layer for one arm.
 
@@ -370,16 +378,19 @@ def write_robot_verification_for_arm(
         "fit_error_cm",
         "calibration_quality",
         "verified_at",
+        "low_scale_test_completed",
         "robot_verified_samples",
         "robot_verified_sample_residuals",
     ):
         entry.pop(key, None)
     entry["calibration_mode"] = "vr_direction"
     entry["teleop_source"] = "native_quest"
+    entry["coordinate_frame"] = str(coordinate_frame or "quest_operator_frame")
     entry["session_vr_to_robot"] = [[float(v) for v in row] for row in base]
     entry["robot_verification"] = {
         "calibration_mode": "robot_verified",
         "teleop_source": "native_quest",
+        "coordinate_frame": str(coordinate_frame or "quest_operator_frame"),
         "base_vr_direction_matrix": [[float(v) for v in row] for row in base],
         "verified_vr_to_robot_matrix": [[float(v) for v in row] for row in verified],
         "translation_vr_to_robot_matrix": [[float(v) for v in row] for row in translation],
@@ -387,6 +398,7 @@ def write_robot_verification_for_arm(
         "fit_error_cm": float(fit_error_cm),
         "calibration_quality": str(quality or "unknown"),
         "verified_at": datetime.datetime.now().isoformat(timespec="seconds"),
+        "low_scale_test_completed": bool(low_scale_test_completed),
         "robot_verified_samples": samples,
         "robot_verified_sample_residuals": sample_residuals,
     }
@@ -394,6 +406,23 @@ def write_robot_verification_for_arm(
     doc["profiles"][doc["active_profile"]] = existing
     _write_doc(doc)
     log.info("[%s] robot-verified VR calibration saved to %s profile=%s", side, CFG_PATH, doc["active_profile"])
+
+
+def set_robot_verification_test_completed(side: str, completed: bool) -> None:
+    """Persist whether the operator accepted the low-scale verified teleop test."""
+    if side not in SIDES:
+        raise ValueError(f"side must be one of {SIDES}, got {side!r}")
+    doc = _normalized_doc()
+    existing = dict(_active_profile_entry(doc))
+    entry = dict(existing.get(side) or {})
+    robot = robot_verification_entry(entry)
+    if not robot or robot.get("calibration_mode") != "robot_verified":
+        raise ValueError(f"{side} has no robot verification to update")
+    robot["low_scale_test_completed"] = bool(completed)
+    entry["robot_verification"] = robot
+    existing[side] = entry
+    doc["profiles"][doc["active_profile"]] = existing
+    _write_doc(doc)
 
 
 def status() -> dict[str, dict[str, Any]]:
@@ -413,6 +442,7 @@ def status() -> dict[str, dict[str, Any]]:
             "saved": "session_vr_to_robot" in data,
             "calibration_mode": data.get("calibration_mode", "legacy" if data else None),
             "teleop_source": data.get("teleop_source", "legacy" if data else None),
+            "coordinate_frame": data.get("coordinate_frame"),
             "calibrated_at": data.get("calibrated_at"),
             "forward_motion_m": float(data.get("forward_motion_m", 0.0)),
             "up_motion_m": float(data.get("up_motion_m", 0.0)),
@@ -426,6 +456,7 @@ def status() -> dict[str, dict[str, Any]]:
             "has_empirical_wrist_roll_canonical": "wrist_roll_anchor_local" in data,
             "robot_verified": robot_verified,
             "verified_at": robot_data.get("verified_at"),
+            "verified_coordinate_frame": robot_data.get("coordinate_frame"),
             "fit_error_cm": robot_data.get("fit_error_cm"),
             "translation_scale": float(robot_data.get("translation_scale", 1.0)),
             "calibration_quality": robot_quality,

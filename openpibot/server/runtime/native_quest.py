@@ -1,8 +1,9 @@
 """Native Quest controller protocol adapter.
 
-The Unity/OpenXR app streams absolute controller poses and button states. The
-existing teleop runtime consumes reset/position/idle goals with per-frame
-relative deltas, so this module is the narrow compatibility layer between them.
+The Unity/OpenXR app streams headset-yaw-relative controller poses and button
+states. The teleop runtime consumes controller poses in the same operator frame
+as the Reachy reference: forward, left/right, and up are already expressed as
+the axes the calibration wizard expects.
 """
 from __future__ import annotations
 
@@ -44,10 +45,14 @@ class _ControllerState:
 class NativeQuestAdapter:
     """Convert Unity/OpenXR controller snapshots into runtime control goals."""
 
-    def __init__(self, *, coordinate_frame: str = "unity_openxr") -> None:
-        if coordinate_frame not in {"unity_openxr", "unity_reachy"}:
-            raise ValueError("coordinate_frame must be 'unity_openxr' or 'unity_reachy'")
-        self.coordinate_frame = coordinate_frame
+    def __init__(self, *, coordinate_frame: str = "quest_operator_frame") -> None:
+        aliases = {"unity_reachy": "quest_operator_frame"}
+        normalized_frame = aliases.get(coordinate_frame, coordinate_frame)
+        if normalized_frame not in {"unity_openxr", "quest_operator_frame"}:
+            raise ValueError(
+                "coordinate_frame must be 'quest_operator_frame' or 'unity_openxr'"
+            )
+        self.coordinate_frame = normalized_frame
         self._state: dict[ArmSide, _ControllerState] = {
             "left": _ControllerState(),
             "right": _ControllerState(),
@@ -164,9 +169,9 @@ class NativeQuestAdapter:
             raise NativeQuestProtocolError(f"{label} must contain numbers") from exc
         if not np.all(np.isfinite(vec)):
             raise NativeQuestProtocolError(f"{label} must contain finite numbers")
-        if self.coordinate_frame == "unity_reachy":
-            # Match the Reachy reference's Unity-to-robot basis documentation:
-            # reachy = (unity.z, -unity.x, unity.y).
+        if self.coordinate_frame == "quest_operator_frame":
+            # Match the operator-frame basis used by the Reachy reference:
+            # operator = (unity.z, -unity.x, unity.y).
             vec = np.array([vec[2], -vec[0], vec[1]], dtype=float)
         elif self.coordinate_frame == "unity_openxr":
             # Unity/OpenXR uses +Z as forward in the operator-origin space. The
@@ -182,7 +187,7 @@ class NativeQuestAdapter:
         return Rotation.from_matrix(basis @ rot.as_matrix() @ basis.T)
 
     def _basis_matrix(self) -> np.ndarray | None:
-        if self.coordinate_frame == "unity_reachy":
+        if self.coordinate_frame == "quest_operator_frame":
             return np.array(
                 [
                     [0.0, 0.0, 1.0],

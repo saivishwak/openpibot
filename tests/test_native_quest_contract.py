@@ -36,15 +36,15 @@ def test_native_adapter_emits_reset_position_and_idle_modes():
 
     goals = adapter.process_packet({
         "controllers": {
-            "right": _controller([0.0, 1.0, -0.05], grip=True),
+            "right": _controller([0.0, 1.0, 0.05], grip=True),
         },
     })
     assert [goal.mode for goal in goals] == ["position"]
-    assert goals[0].relative_position == pytest.approx((0.0, 0.0, 0.05))
+    assert goals[0].relative_position == pytest.approx((0.05, 0.0, 0.0))
 
     goals = adapter.process_packet({
         "controllers": {
-            "right": _controller([0.0, 1.0, -0.05], grip=False),
+            "right": _controller([0.0, 1.0, 0.05], grip=False),
         },
     })
     assert [goal.mode for goal in goals] == ["idle"]
@@ -111,8 +111,8 @@ def test_unity_openxr_frame_maps_rotation_into_backend_basis():
     assert backend_rotvec[1] == pytest.approx(-Rotation.from_euler("y", 30, degrees=True).as_rotvec()[1])
 
 
-def test_unity_reachy_frame_matches_reachy_hand_tracker_basis():
-    adapter = NativeQuestAdapter(coordinate_frame="unity_reachy")
+def test_quest_operator_frame_matches_reachy_hand_tracker_basis():
+    adapter = NativeQuestAdapter(coordinate_frame="quest_operator_frame")
     adapter.process_packet({
         "controllers": {
             "right": _controller([0.0, 0.0, 0.0], grip=True),
@@ -128,8 +128,32 @@ def test_unity_reachy_frame_matches_reachy_hand_tracker_basis():
     assert goals[0].relative_position == pytest.approx((0.10, 0.0, 0.0))
 
 
-def test_unity_reachy_rotation_matches_reachy_basis_matrix():
+def test_default_native_frame_matches_shipped_quest_app_forward_axis():
+    adapter = NativeQuestAdapter()
+    adapter.process_packet({
+        "controllers": {
+            "right": _controller([0.0, 0.0, 0.0], grip=True),
+        },
+    })
+
+    goals = adapter.process_packet({
+        "controllers": {
+            "right": _controller([0.0, 0.0, 0.10], grip=True),
+        },
+    })
+
+    assert goals[0].metadata["coordinate_frame"] == "quest_operator_frame"
+    assert goals[0].relative_position == pytest.approx((0.10, 0.0, 0.0))
+
+
+def test_legacy_unity_reachy_alias_maps_to_quest_operator_frame():
     adapter = NativeQuestAdapter(coordinate_frame="unity_reachy")
+
+    assert adapter.coordinate_frame == "quest_operator_frame"
+
+
+def test_quest_operator_frame_rotation_matches_basis_matrix():
+    adapter = NativeQuestAdapter(coordinate_frame="quest_operator_frame")
     unity_rot = Rotation.from_euler("xyz", [10, 20, 30], degrees=True)
     basis = adapter._basis_matrix()
 
@@ -144,7 +168,7 @@ def test_unity_reachy_rotation_matches_reachy_basis_matrix():
     assert goals[0].vr_ctrl_rotation.as_matrix() == pytest.approx(expected)
 
 
-@pytest.mark.parametrize("coordinate_frame", ["unity_openxr", "unity_reachy"])
+@pytest.mark.parametrize("coordinate_frame", ["unity_openxr", "quest_operator_frame"])
 @pytest.mark.parametrize(
     ("axis", "angle_deg"),
     [
@@ -288,7 +312,7 @@ def test_session_ingests_native_quest_packet_into_latest_goal():
     })
 
     assert right.latest.mode == "position"
-    assert right.latest.rel_position == pytest.approx((0.0, 0.0, -0.02))
+    assert right.latest.rel_position == pytest.approx((0.02, 0.0, 0.0))
 
 
 def test_quest_router_ingest_uses_session_adapter(monkeypatch):
@@ -432,7 +456,7 @@ def test_quest_a_button_captures_robot_verification_vr_start_and_end():
     })
 
     assert arm.robot_verify_state == "vr_start_captured"
-    assert arm.robot_verify_vr_start == pytest.approx((0.0, 1.0, -0.0))
+    assert arm.robot_verify_vr_start == pytest.approx((0.0, -0.0, 1.0))
 
     session.ingest_native_quest_packet({
         "controllers": {
@@ -441,12 +465,12 @@ def test_quest_a_button_captures_robot_verification_vr_start_and_end():
     })
     session.ingest_native_quest_packet({
         "controllers": {
-            "right": _controller([0.10, 1.0, 0.0], grip=True, buttons={"A": False}),
+            "right": _controller([0.0, 1.0, 0.10], grip=True, buttons={"A": False}),
         },
     })
     session.ingest_native_quest_packet({
         "controllers": {
-            "right": _controller([0.10, 1.0, 0.0], grip=True, buttons={"A": True}),
+            "right": _controller([0.0, 1.0, 0.10], grip=True, buttons={"A": True}),
         },
     })
 

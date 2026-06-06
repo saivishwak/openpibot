@@ -53,12 +53,12 @@ pi05:
   control_fps: 30
 vr:
   kp: 0.75
-  wrist_delta_limit_deg: 5.0
-  pos_ema_alpha: 0.3
-  ori_ema_alpha: 0.35
-  pos_deadzone_m: 0.001
-  rot_deadzone_deg: 0.3
-  max_ee_step_m: 0.004
+  wrist_delta_limit_deg: 8.0
+  pos_ema_alpha: 0.22
+  ori_ema_alpha: 0.25
+  pos_deadzone_m: 0.002
+  rot_deadzone_deg: 0.7
+  max_ee_step_m: 0.003
   quest_video:
     roles:
     - head
@@ -72,18 +72,30 @@ vr:
     saturation: 1.0
   wrist_motor_polarity:
     left:
-      flex: -1
+      flex: 1
       roll: -1
     right:
       flex: -1
-      roll: -1
+      roll: 1
   joint_deg_caps:
     shoulder_pan: 5.0
     shoulder_lift: 5.0
     elbow_flex: 5.0
     wrist_flex: 6.0
-    wrist_roll: 6.0
+    wrist_roll: 10.0
     gripper: 15.0
+  joint_command_deadband_deg:
+    shoulder_pan: 0.18
+    shoulder_lift: 0.18
+    elbow_flex: 0.18
+    wrist_flex: 0.25
+    wrist_roll: 0.25
+    gripper: 0.0
+  joint_command_filter_weights:
+  - 0.4
+  - 0.3
+  - 0.2
+  - 0.1
 gripper:
   open_value: 0
   closed_value: 100
