@@ -8,6 +8,9 @@ This repo supports local finetuned PI0.5 inference:
 
 This document focuses on **finetuned local inference**, which matches the dataset layout recorded via the dashboard (`head`, `left_wrist`, `right_wrist` cameras and 12 arm joints).
 
+For the full Quest/OpenXR teleop -> LeRobot dataset -> finetuning -> inference
+contract, see [architecture.md](architecture.md).
+
 ## Prerequisites
 
 1. **Initialized `vendor/lerobot` submodule** on the configured `main` branch. The root `uv.lock` uses this submodule as the editable LeRobot workspace so the XLeRobot driver overlay is available.
@@ -41,6 +44,26 @@ Example checkpoint path after 5k steps:
 ```text
 outputs/pi05_finetune/checkpoints/005000/pretrained_model/
 ```
+
+## Shared Runtime Contract
+
+Inference intentionally uses the same runtime assumptions as recording:
+
+- `config/xlerobot.yaml` is the shared source of truth for serial ports, camera
+  role mappings, home pose, dataset FPS, PI0.5 horizon, and VR joint
+  caps/deadbands.
+- `scripts/_xlerobot_loader.py` builds the LeRobot `XLerobotConfig`; inference
+  uses the LeRobot `XLerobot` class for motor reads/writes instead of a separate
+  robot implementation.
+- The default `--camera-backend dashboard` reuses the same dashboard
+  `CameraStream` role registry as VR recording, avoiding a second V4L capture
+  stack.
+- Policy observations use the same 12-joint `JOINT_ORDER` and the same three
+  camera roles as recorded datasets.
+- Policy actions are shaped like recording labels before `send_action`. The
+  order is: optional policy EMA, optional first-action replan blend, VR-style
+  per-joint cap/KP shaping vs previous command, optional present clamp,
+  deadband, then optional final command EMA.
 
 ## Bimanual SO-101 vs full XLerobot driver
 
@@ -80,6 +103,30 @@ uv run python scripts/infer_pi05_finetuned.py \
   --fps 30
 ```
 
+## Run inference with extra smoothing disabled
+
+Use this when you want to evaluate the policy with the closest behavior to the
+recorded action labels. These flags disable policy-target EMA, final-command
+EMA, and first-action blend across replans. VR-style per-joint caps/KP shaping
+and deadbands from `config/xlerobot.yaml` still apply because those are part of
+the dataset label contract.
+
+```bash
+uv run python scripts/infer_pi05_finetuned.py \
+  --policy-path outputs/pi05_finetune/checkpoints/last/pretrained_model \
+  --task "Pick up the medicine and place it in the bowl" \
+  --episodes 1 \
+  --episode-time 60 \
+  --fps 30 \
+  --policy-ema-alpha=1 \
+  --command-ema-alpha=1 \
+  --replan-blend=1
+```
+
+If this preset reaches better but jitters, return to the balanced defaults or
+lower `--command-ema-alpha` gradually. If the balanced defaults stall near home,
+raise `--command-ema-alpha` or use this preset as a diagnostic.
+
 ### Tuning reach vs jitter
 
 | Symptom | Try |
@@ -106,7 +153,7 @@ uv run python scripts/infer_pi05_finetuned.py \
 
 ### Control loop
 
-- At `fps` (default from `pi05.control_fps` or `dataset.fps` in yaml), the script pops one action per tick from a chunk predicted by the policy.
+- At `fps` (default from `dataset.fps` in yaml), the script pops one action per tick from a chunk predicted by the policy.
 - Every `--open-loop-steps` (default 35), it grabs a new observation (motors + three cameras), runs preprocessors, calls `predict_action_chunk`, and postprocesses.
 - **Policy reset** at each episode start, after settle, and at episode end (clears action queue + preprocessor/postprocessor state).
 - **Homing**: unless `--skip-home`, the robot moves to `robot.home_pose` before the run and/or at each episode start (`--home-before-episode`, default from `dataset.home_before_episode`).
@@ -140,9 +187,9 @@ Inference runs **one observation → one action** per control tick (batch size 1
 | `--replan-miss-steps` | `2` | Consecutive ticks over threshold before early replan |
 | `--replan-blend` | `0.2` | Blend first action after each new chunk (`1.0` = no blend) |
 | `--settle-steps` | `60` | Hold pose after homing (~2s @ 30Hz) before policy runs |
-| `--policy-ema-alpha` | `0.36` | EMA on policy targets before VR shaping |
-| `--command-ema-alpha` | `0.2` | EMA on final motor command (lower = smoother) |
-| `--joint-deadband-deg` | `0.82` | Ignore tiny command deltas vs previous command |
+| `--policy-ema-alpha` | `0.36` | EMA on raw policy targets before VR shaping; `1.0` disables |
+| `--command-ema-alpha` | `0.2` | EMA on final motor command; lower = smoother, `1.0` disables |
+| `--joint-deadband-deg` | yaml `vr.joint_command_deadband_deg` | Override final command deadband for every joint; otherwise uses per-joint config |
 | `--clamp-to-present` | off | Clamp vs measured pose; usually causes jitter |
 | `--phase1-task` | — | Shorter prompt for the first segment (e.g. reach medicine only) |
 | `--phase1-sec` | `0` | Seconds to use `--phase1-task` before `--task` |
@@ -175,7 +222,7 @@ Training data from the dashboard uses:
 
 So each training frame’s `|action − state|` is usually **small** (≤ per-tick cap) while moving, not a 40°+ jump.
 
-`infer_pi05_finetuned.py` applies the same VR rate limits to policy outputs before `send_action`, then optional EMA/deadband. **Present-based** `max_relative_target` clamp is **off by default** (`--no-clamp-to-present`) because training labels are capped vs the previous command, not measured pose — enabling present clamp often causes oscillation. Use **`--fps 30`** to match `dataset.fps`.
+`infer_pi05_finetuned.py` applies the same VR rate limits to policy outputs before `send_action`: optional policy EMA, optional replan blend, per-joint cap/KP shaping vs previous command, optional present clamp, deadband, then final command EMA. `wrist_flex`, `wrist_roll`, and `gripper` bypass the final command EMA so wrist/gripper response matches the recording path more closely. **Present-based** `max_relative_target` clamp is **off by default** (`--no-clamp-to-present`) because training labels are capped vs the previous command, not measured pose — enabling present clamp often causes oscillation. Use **`--fps 30`** to match `dataset.fps`.
 
 ## Configuration (`config/xlerobot.yaml`)
 
@@ -185,8 +232,10 @@ So each training frame’s `|action − state|` is usually **small** (≤ per-ti
 | `robot.home_pose` | Homing targets (12 joint names, degrees) |
 | `cameras.*` | OpenCV device paths → `head`, `left_wrist`, `right_wrist` |
 | `dataset.repo_id` | Finetuning dataset id |
+| `dataset.root` | Optional local LeRobot dataset root used by recording/push tooling |
 | `dataset.home_before_episode` | Default per-episode homing |
 | `pi05.control_fps`, `pi05.action_horizon` | Inference timing defaults |
+| `vr.joint_deg_caps`, `vr.joint_command_deadband_deg` | Recording-style action shaping used by inference |
 
 Observation keys sent to the policy match finetuning rename map:
 
@@ -204,7 +253,7 @@ Observation keys sent to the policy match finetuning rename map:
 | `missing camera observations` | Camera path wrong or unplugged | Fix `cameras.*.path` in yaml; check `/dev/v4l/...` |
 | CUDA OOM during **training** | Full PI0.5 finetune | Keep default `--oom-safe`; reduce batch or steps |
 | Policy moves wrong / no task following | Wrong checkpoint or no finetune | Use a finetuned `pretrained_model`, not only `pi05_base` |
-| Arms **oscillate** / jitter in place | FPS ≠ dataset, replan too often, **clamp-to-present**, or command EMA too high | Use `--fps 30`, defaults; if still jittery after reaching, lower `--command-ema-alpha` and raise `--policy-ema-alpha`; keep `--no-clamp-to-present` |
+| Arms **oscillate** / jitter in place | FPS != dataset, replan too often, **clamp-to-present**, or command EMA too high | Use `--fps 30`, defaults; if still jittery after reaching, lower `--command-ema-alpha` and raise `--policy-ema-alpha`; keep `--no-clamp-to-present` |
 | **Never leaves home** for a long time | Command EMA too low or deadband too high | Raise `--command-ema-alpha` (e.g. `0.26–0.28`) and/or lower `--joint-deadband-deg` (e.g. `0.6–0.65`) |
 | Robot goes to **bowl before medicine** | Single task string for whole episode; head cam may bias toward bowl; demos pause at home first | Use `--settle-steps 60`, `--phase1-task` / `--phase1-sec`; align scene with training; finetune longer |
 | `create_causal_mask() got an unexpected keyword argument 'cache_position'` | transformers 5.6+ in venv | `uv sync` (root pins `transformers<5.6`) |

@@ -3,6 +3,8 @@
 Drive one or both SO-101 arms with a Meta Quest 3. The production headset path
 is the native Unity/OpenXR Quest app in `apps/quest-xlerobot`.
 
+For the full end-to-end runtime path, see [architecture.md](architecture.md).
+
 ## Controllers
 
 | Button | What it does |
@@ -86,21 +88,51 @@ rejects one-frame tracking spikes. The controller's rotation is also mapped
 through the reset-time controller-to-EE alignment so wrist intent does not
 depend on the exact grip angle at anchor time.
 
-The native adapter converts Unity/OpenXR operator-origin coordinates into the
-backend VR frame before calibration: Unity +Z forward becomes backend -Z
-forward, while X and Y remain right/up.
+The native adapter converts Unity/OpenXR controller coordinates into the
+backend operator frame before calibration. The default frame is
+`quest_operator_frame`:
+
+```text
+operator = (unity.z, -unity.x, unity.y)
+```
+
+The same basis is applied to controller rotations by matrix conjugation. Older
+calibration files that say `unity_reachy` are treated as the same
+`quest_operator_frame`; stale WebXR/legacy frame calibrations must be redone.
 
 Useful tuning keys live in `config/xlerobot.yaml`:
 
 ```yaml
 vr:
   kp: 0.75
-  pos_ema_alpha: 0.3
-  ori_ema_alpha: 0.35
-  pos_deadzone_m: 0.001
-  rot_deadzone_deg: 0.3
-  max_ee_step_m: 0.004
+  pos_ema_alpha: 0.22
+  ori_ema_alpha: 0.25
+  pos_deadzone_m: 0.002
+  rot_deadzone_deg: 0.7
+  max_ee_step_m: 0.003
+  wrist_delta_limit_deg: 8.0
+  joint_deg_caps:
+    shoulder_pan: 5.0
+    shoulder_lift: 5.0
+    elbow_flex: 5.0
+    wrist_flex: 6.0
+    wrist_roll: 10.0
+    gripper: 15.0
+  joint_command_deadband_deg:
+    shoulder_pan: 0.18
+    shoulder_lift: 0.18
+    elbow_flex: 0.18
+    wrist_flex: 0.25
+    wrist_roll: 0.25
+    gripper: 0.0
+  joint_command_filter_weights: [0.4, 0.3, 0.2, 0.1]
 ```
+
+`wrist_flex`, `wrist_roll`, and `gripper` bypass the final command EMA/filter so
+wrist and gripper intent remains responsive. Translation joints use the command
+filter to reduce jitter. Recording stores the final commanded joint target after
+these same caps/deadbands/filters, so dataset labels match what the robot was
+asked to do.
 
 ## Safety
 

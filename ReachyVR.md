@@ -2,6 +2,13 @@
 
 This document explains how `reference/Reachy2Teleoperation` converts VR headset/controller tracking into Reachy 2 robot commands. The main focus is the path from Unity XR coordinates to Reachy Cartesian goals and, where visible in this repository, to joint angles.
 
+For the current XLeRobot implementation, use [docs/architecture.md](docs/architecture.md).
+XLeRobot keeps the Reachy-style operator basis
+`(unity.z, -unity.x, unity.y)`, but the Quest app sends controller poses to the
+workstation backend. The backend owns calibration, robot verification, SO-101
+IK, joint caps/deadbands/filtering, LeRobot recording, and PI0.5 inference
+command shaping.
+
 ## Short Version
 
 The application does not directly command arm joint angles for the real robot. It sends Cartesian end-effector targets:

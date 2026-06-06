@@ -4370,6 +4370,19 @@ class VRTeleopSession:
             self._last_task = (task or "").strip()
         return self.status()
 
+    def set_recording_root(self, root: Optional[str], repo_id: Optional[str] = None) -> dict:
+        """Persist the dataset storage root/repo id in config/xlerobot.yaml."""
+        with self._lock:
+            if self._recording or self._recording_armed:
+                raise RuntimeError("stop recording before changing dataset storage root")
+        cfg = _dataset.write_dataset_config(root=root, repo_id=repo_id)
+        resolved_root = _dataset.resolve_root(cfg.get("root"), str(cfg["repo_id"]))
+        with self._lock:
+            self._last_dataset_root = resolved_root
+            self._recording_repo_id = str(cfg["repo_id"])
+            self._last_error = None
+        return self.status()
+
     def delete_last_recorded_episode(self) -> dict:
         """Delete the most recently saved episode so operators can retry."""
         with self._recording_transition_lock:

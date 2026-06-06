@@ -405,6 +405,24 @@ def recording_task(body: dict[str, Any] | None = Body(default=None)) -> dict[str
     return vr_mod.SESSION.set_recording_task(str(payload.get("task") or ""))
 
 
+@router.post("/recording/root")
+def recording_root(body: dict[str, Any] | None = Body(default=None)) -> dict[str, Any]:
+    payload = body or {}
+    if "root" not in payload and "repo_id" not in payload:
+        raise HTTPException(status_code=400, detail="root or repo_id required")
+    try:
+        repo_id = payload.get("repo_id")
+        root = payload.get("root")
+        return vr_mod.SESSION.set_recording_root(
+            str(root) if root is not None else None,
+            repo_id=(str(repo_id) if repo_id is not None else None),
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except RuntimeError as exc:
+        raise _runtime_error(exc) from exc
+
+
 @router.post("/recording/delete_last")
 def recording_delete_last() -> dict[str, Any]:
     return vr_mod.SESSION.delete_last_recorded_episode()

@@ -473,6 +473,13 @@ export const api = {
     req<VRStatus>("/api/vr/recording/task", {
       method: "POST", body: JSON.stringify({ task }),
     }),
+  /** Persist dataset.root and optionally dataset.repo_id in config/xlerobot.yaml.
+   *  Empty root clears the override and returns to the Hugging Face LeRobot
+   *  cache default for the saved repo id. */
+  vrSetRecordingRoot: (root?: string, repoId?: string) =>
+    req<VRStatus>("/api/vr/recording/root", {
+      method: "POST", body: JSON.stringify({ root, repo_id: repoId }),
+    }),
   /** Delete the most recently saved episode from the active recording dataset. */
   vrDeleteLastRecordingEpisode: () =>
     req<VRStatus>("/api/vr/recording/delete_last", {

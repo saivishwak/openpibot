@@ -450,6 +450,35 @@ def load_dataset_config() -> dict[str, Any]:
     return defaults
 
 
+def write_dataset_config(*, root: str | None = None, repo_id: str | None = None) -> dict[str, Any]:
+    """Persist dataset recording config in config/xlerobot.yaml and return it."""
+    cfg_path = REPO_ROOT / "config" / "xlerobot.yaml"
+    cfg = yaml.safe_load(cfg_path.read_text()) if cfg_path.is_file() else {}
+    if not isinstance(cfg, dict):
+        cfg = {}
+    dataset_cfg = cfg.setdefault("dataset", {})
+    if not isinstance(dataset_cfg, dict):
+        dataset_cfg = {}
+        cfg["dataset"] = dataset_cfg
+    if root is not None:
+        cleaned_root = str(root or "").strip()
+        dataset_cfg["root"] = cleaned_root or None
+    if repo_id is not None:
+        cleaned_repo_id = str(repo_id or "").strip()
+        if not cleaned_repo_id:
+            raise ValueError("dataset repo_id cannot be empty")
+        if any(ch.isspace() for ch in cleaned_repo_id) or cleaned_repo_id.startswith("/") or cleaned_repo_id.endswith("/"):
+            raise ValueError("dataset repo_id must be a Hugging Face-style id like 'user/dataset-name'")
+        dataset_cfg["repo_id"] = cleaned_repo_id
+    cfg_path.write_text(yaml.safe_dump(cfg, sort_keys=False))
+    return load_dataset_config()
+
+
+def write_dataset_root(root: str) -> dict[str, Any]:
+    """Persist `dataset.root` in config/xlerobot.yaml and return the dataset config."""
+    return write_dataset_config(root=root)
+
+
 def resolve_root(root: Optional[str], repo_id: str) -> str:
     """Resolve the dataset root path. Handles ~ expansion and falls back to
     the HF default (`$HF_LEROBOT_HOME/<repo_id>` or

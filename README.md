@@ -1,15 +1,15 @@
 # OpenPIBot
 
-OpenPIBot is a dashboard and CLI for bimanual SO-101/XLeRobot workflows: VR teleoperation, LeRobot dataset recording, PI0.5 fine-tuning, and policy inference.
+OpenPIBot is a dashboard and CLI for bimanual SO-101/XLeRobot workflows: native Quest/OpenXR VR teleoperation, LeRobot dataset recording, PI0.5 fine-tuning, and policy inference.
 
 It combines a FastAPI backend, a React dashboard, hardware-aware robot runtime code, and focused scripts for training, dataset upload/visualization, and inference.
 
 ## Highlights
 
-- **VR teleoperation** with Meta Quest controllers, per-arm engagement, calibration profiles, and safety limits.
-- **Dataset recording** in LeRobot format with synchronized arm state and camera observations.
-- **PI0.5 training and inference** through local finetuned checkpoints or an optional package-managed OpenPI WebSocket policy server.
-- **Robot calibration tools** for home pose capture, VR frame calibration, and robot-verified calibration.
+- **Native Quest/OpenXR VR teleoperation** with Meta Quest controllers, per-arm engagement, calibration profiles, and safety limits.
+- **Dataset recording** in LeRobot format with synchronized present joint state, same-tick commanded actions, and camera observations.
+- **PI0.5 training and inference** through local finetuned checkpoints using the same config, robot loader, camera roles, joint order, and VR-style command shaping as recording.
+- **Robot calibration tools** for home pose capture, VR frame calibration, and robot-verified calibration before dataset-quality recording.
 - **Production-oriented backend** with structured API routes, job logs, diagnostics, and a single OpenPIBot server process.
 - **Clean dashboard** for control, calibration, recording, training, inference, cameras, diagnostics, and logs.
 
@@ -36,11 +36,13 @@ Open the dashboard at `http://localhost:5000`.
 
 Typical first run:
 
-1. Open `config/xlerobot.yaml` and set the serial ports, cameras, dataset repo, and robot profile.
+1. Open `config/xlerobot.yaml` and set the serial ports, dataset repo, and robot profile.
 2. Build the dashboard and start the backend with the commands above.
-3. Connect each arm from the Control page.
-4. Capture a home pose from Calibration.
-5. Open the VR endpoint on the Quest and start teleop/recording.
+3. Assign `head`, `left_wrist`, and `right_wrist` camera roles from the Cameras page.
+4. Connect each arm from the Control page.
+5. Capture a home pose from Calibration.
+6. Run VR calibration, robot verification, and the low-scale test before recording finetuning data.
+7. Open the native Quest app and start teleop/recording.
 
 ## Common Commands
 
@@ -79,7 +81,7 @@ Typical first run:
 ├── dashboard/             React/Tailwind dashboard source and build output
 ├── scripts/               Training, dataset, push, and inference utilities
 ├── config/                Robot profiles, camera config, calibration, home pose
-├── docs/                  Setup, teleop, calibration, recording, troubleshooting
+├── docs/                  Architecture, setup, teleop, calibration, recording, training, inference
 ├── reference/             Local reference docs/assets used by the app
 └── vendor/                LeRobot submodule plus local XLeRobot URDF assets
 ```
@@ -89,6 +91,7 @@ Typical first run:
 | Document | Covers |
 |---|---|
 | [docs/setup.md](docs/setup.md) | Installation, hardware configuration, motor calibration |
+| [docs/architecture.md](docs/architecture.md) | Current Quest/OpenXR -> recording -> finetuning -> inference architecture |
 | [docs/teleop.md](docs/teleop.md) | VR teleop workflow and controls |
 | [docs/calibration.md](docs/calibration.md) | Home pose, VR calibration, robot-verified calibration |
 | [docs/recording.md](docs/recording.md) | LeRobot dataset recording and upload |

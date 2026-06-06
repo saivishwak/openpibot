@@ -30,6 +30,12 @@ If moving your hand right makes the EE move sideways/back/down, the VR→robot f
 
 Look at `session_yaw_deg` on the Calibration card — it should match (or be close to) the angle you're standing at relative to the robot.
 
+The current native Quest app uses `quest_operator_frame`. If motion becomes
+wrong after restarting the backend, check that `config/vr_calibration.yaml` was
+captured with the current frame and that robot verification has been solved for
+the active calibration profile. Stale WebXR/legacy-frame calibration should be
+recaptured, not patched by hand.
+
 ## Wrist drifts when controller is still
 
 If you're seeing slow wrist drift even with your hand still, restart the OpenPIBot server and the native Quest app so both sides clear their controller anchors.
@@ -47,6 +53,44 @@ packets before integrating them. If the arm still jitters:
   A nonzero speed while your hand is still points to controller tracking noise;
   frequent IK rejects usually means the grip anchor or target is near the edge
   of the SO101 workspace.
+
+For policy inference jitter, first confirm the startup banner says
+`Clamp to present  : False`, `fps` matches `dataset.fps`, and the camera backend
+is `dashboard`. To test the raw policy with deployment smoothing disabled:
+
+```bash
+uv run python scripts/infer_pi05_finetuned.py \
+  --policy-path outputs/pi05_finetune/checkpoints/last/pretrained_model \
+  --task "Pick up the medicine and place it in the bowl" \
+  --episodes 1 \
+  --episode-time 60 \
+  --fps 30 \
+  --policy-ema-alpha=1 \
+  --command-ema-alpha=1 \
+  --replan-blend=1
+```
+
+If that reaches correctly but jitters, return to the defaults or lower
+`--command-ema-alpha`. If defaults do not leave home, raise
+`--command-ema-alpha` gradually.
+
+## Camera role is missing or empty
+
+Use the dashboard Cameras page. It lists configured cameras and unassigned V4L
+video devices; assign one device to each required role: `head`, `left_wrist`,
+and `right_wrist`. Recording and default inference both use those roles.
+
+If OpenCV warns that V4L2 cannot capture by name, make sure the configured role
+path resolves to an actual `/dev/video*` node and no other process owns the
+camera. Prefer `/dev/v4l/by-path/...` entries shown by the Cameras page.
+
+## Recording dataset config will not change
+
+The Recording page only saves **Dataset repo ID** and **Storage root** while
+recording is idle. Blank fields keep the configured values and show placeholders.
+Type a repo id and/or path, then press Enter from the repo field, blur the root
+field, or click the check button to persist `dataset.repo_id` and/or
+`dataset.root` in `config/xlerobot.yaml`.
 
 ## "Release for posing" doesn't release torque
 

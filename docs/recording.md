@@ -5,9 +5,13 @@ Captures bimanual SO-101 teleop demonstrations to a LeRobot v2 dataset. Use the 
 ## What gets recorded
 
 Each frame contains:
-- `action` — commanded joint positions for both arms (12-vector: 6 joints × 2 arms)
-- `observation.state` — present joint positions (same 12-vector)
-- `observation.images.<role>` — video stream per camera with a role assigned (head, left_wrist, right_wrist)
+- `action` — absolute commanded joint positions for both arms after the same VR
+  IK, per-joint caps, deadbands, and command filtering used by live teleop
+  (12-vector: 6 joints × 2 arms)
+- `observation.state` — present joint positions read from the robot at that
+  tick (same 12-vector)
+- `observation.images.<role>` — video stream per camera with a role assigned
+  (`head`, `left_wrist`, `right_wrist`)
 
 At 30 Hz, with 3 cameras at 640×480 RGB.
 
@@ -18,12 +22,20 @@ In `config/xlerobot.yaml`:
 ```yaml
 dataset:
   repo_id: <hf-user>/<dataset-name>   # e.g. saivishwak/xlerobot-vr-teleop
+  root: /optional/local/dataset/root   # optional; omit/null for HF cache default
   fps: 30
   push_to_hub: false                  # set true to push to HF after finalizing
   home_before_episode: true           # auto-home all arms at start of each episode
 ```
 
 Set camera roles on the **Cameras page** (not the Teleop page). Each camera needs a role for it to be included as an `observation.images.*` feature.
+
+The Recording page's **Dataset repo ID** and **Storage root** fields are editable
+while recording is idle. Blank fields keep the configured values and show the
+current values as placeholders. Entering a repo id and/or root path and saving
+writes `dataset.repo_id` and/or `dataset.root` into `config/xlerobot.yaml`;
+recording then uses those persisted values. Config changes are rejected while
+recording is active or armed.
 
 ## Recording flow
 
@@ -46,7 +58,15 @@ For quick manual testing, VR-only calibration can still drive the robot. For VLA
 
 ## Where it lives
 
-Episodes are written to `$HF_LEROBOT_HOME/<repo_id>/` (default `~/.cache/huggingface/lerobot/<repo_id>/`).
+Episodes are written to `dataset.root` when set, otherwise to
+`$HF_LEROBOT_HOME/<repo_id>/` (default
+`~/.cache/huggingface/lerobot/<repo_id>/`).
+
+Root resolution order:
+
+1. `dataset.root` in `config/xlerobot.yaml`
+2. `$HF_LEROBOT_HOME/<repo_id>`
+3. `~/.cache/huggingface/lerobot/<repo_id>`
 
 If `push_to_hub: true`, the dashboard recorder pushes to the Hub when recording finalizes (e.g. on emergency stop). With the default `push_to_hub: false`, upload manually after recording (see below).
 

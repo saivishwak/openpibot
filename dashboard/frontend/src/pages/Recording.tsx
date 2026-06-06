@@ -1,4 +1,4 @@
-import { Database, Home, Trash2 } from "lucide-react";
+import { Check, Database, Home, Trash2 } from "lucide-react";
 import { useEffect, useState } from "react";
 import useSWR from "swr";
 import { VRStatus, api, fetcher } from "../api";
@@ -10,8 +10,10 @@ export function Recording() {
   const info = data?.recording_info;
   const [task, setTask] = useState("");
   const [root, setRoot] = useState("");
+  const [repoId, setRepoId] = useState("");
   const [confirmDelete, setConfirmDelete] = useState(false);
   const [busyHome, setBusyHome] = useState(false);
+  const [savingDatasetConfig, setSavingDatasetConfig] = useState(false);
   const active = !!data?.recording;
   const connectedSides = data?.connected_sides ?? [];
   const readinessLabel = (readiness?: string) => readiness === "ready_to_record"
@@ -30,10 +32,28 @@ export function Recording() {
 
   const toggle = async (enabled: boolean) => {
     try {
-      await api.vrSetRecording(enabled, task.trim(), root.trim());
+      await api.vrSetRecording(enabled, task.trim());
       await mutate();
     } catch (err) {
       alert(String(err));
+    }
+  };
+
+  const saveDatasetConfig = async () => {
+    if (active || savingDatasetConfig) return;
+    const nextRoot = root.trim();
+    const nextRepoId = repoId.trim();
+    if (!nextRoot && !nextRepoId) return;
+    setSavingDatasetConfig(true);
+    try {
+      await api.vrSetRecordingRoot(nextRoot || undefined, nextRepoId || undefined);
+      setRoot("");
+      setRepoId("");
+      await mutate();
+    } catch (err) {
+      alert(String(err));
+    } finally {
+      setSavingDatasetConfig(false);
     }
   };
 
@@ -75,7 +95,7 @@ export function Recording() {
           </div>
         </div>
 
-        <div className="mt-4 grid gap-4 lg:grid-cols-2">
+        <div className="mt-4 grid gap-4 lg:grid-cols-3">
           <Field label="Task description" hint="Required; stored in LeRobot metadata and used as the language instruction.">
             <TextInput value={task} onChange={(e) => {
               const next = e.currentTarget.value;
@@ -83,8 +103,44 @@ export function Recording() {
               if (!active) api.vrSetRecordingTask(next.trim()).catch(() => undefined);
             }} disabled={active} placeholder="Pick the red block and place it in the bin" />
           </Field>
-          <Field label="Storage root" hint="Leave blank to use the Hugging Face LeRobot cache default.">
-            <TextInput value={root} onChange={(e) => setRoot(e.currentTarget.value)} disabled={active || (info?.episodes_saved ?? 0) > 0} placeholder={info?.root ?? ""} />
+          <Field label="Dataset repo ID" hint="Blank keeps the configured repo id. Enter user/dataset-name to update dataset.repo_id.">
+            <TextInput
+              value={repoId}
+              onChange={(e) => setRepoId(e.currentTarget.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") {
+                  e.preventDefault();
+                  saveDatasetConfig();
+                }
+              }}
+              disabled={active || savingDatasetConfig}
+              placeholder={info?.repo_id ?? "user/dataset-name"}
+            />
+          </Field>
+          <Field label="Storage root" hint="Blank shows the configured/default root. Save writes dataset.root and dataset.repo_id to config/xlerobot.yaml.">
+            <div className="flex gap-2">
+              <TextInput
+                value={root}
+                onChange={(e) => setRoot(e.currentTarget.value)}
+                onBlur={saveDatasetConfig}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter") {
+                    e.currentTarget.blur();
+                  }
+                }}
+                disabled={active || savingDatasetConfig}
+                placeholder={info?.root ?? ""}
+              />
+              <Button
+                type="button"
+                variant="secondary"
+                disabled={active || savingDatasetConfig || (!root.trim() && !repoId.trim())}
+                onMouseDown={(e) => e.preventDefault()}
+                onClick={saveDatasetConfig}
+              >
+                <Check size={16} />Save
+              </Button>
+            </div>
           </Field>
         </div>
         {(info?.calibration_blockers ?? []).length ? (

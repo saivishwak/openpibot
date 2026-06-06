@@ -2,11 +2,13 @@ import time
 import threading
 
 import pytest
+import yaml
 from fastapi import HTTPException
 
 from openpibot.server.routers import vr as vr_router
 from openpibot.server.runtime.native_quest import NativeQuestAdapter
 from openpibot.server.runtime import vr_teleop as vr_mod
+from openpibot.server.runtime import dataset as dataset_mod
 
 
 class _FakeRecorder:
@@ -171,11 +173,120 @@ def test_set_recording_task_cache_can_be_cleared():
     assert session._last_task == ""
 
 
+def test_write_dataset_config_persists_root_and_repo_id(tmp_path, monkeypatch):
+    cfg_dir = tmp_path / "config"
+    cfg_dir.mkdir()
+    cfg_path = cfg_dir / "xlerobot.yaml"
+    cfg_path.write_text(yaml.safe_dump({
+        "dataset": {
+            "repo_id": "old/repo",
+            "root": "/old/root",
+            "fps": 30,
+        }
+    }))
+    monkeypatch.setattr(dataset_mod, "REPO_ROOT", tmp_path)
+
+    cfg = dataset_mod.write_dataset_config(
+        root="/new/root",
+        repo_id="new-user/new-dataset",
+    )
+    written = yaml.safe_load(cfg_path.read_text())
+
+    assert cfg["repo_id"] == "new-user/new-dataset"
+    assert cfg["root"] == "/new/root"
+    assert written["dataset"]["repo_id"] == "new-user/new-dataset"
+    assert written["dataset"]["root"] == "/new/root"
+
+
+def test_set_recording_root_persists_config_and_updates_status(monkeypatch):
+    session = vr_mod.VRTeleopSession()
+    calls = []
+
+    def fake_write(*, root=None, repo_id=None):
+        calls.append((root, repo_id))
+        return {"repo_id": repo_id or "test/repo", "root": root, "fps": 30, "push_to_hub": False}
+
+    monkeypatch.setattr(vr_mod._dataset, "write_dataset_config", fake_write)
+    monkeypatch.setattr(vr_mod._dataset, "resolve_root", lambda root, repo_id: f"/resolved/{root.strip('/')}")
+    monkeypatch.setattr(session, "_recording_calibration_blockers", lambda: [])
+
+    status = session.set_recording_root("/tmp/xlerobot-data")
+
+    assert calls == [("/tmp/xlerobot-data", None)]
+    assert session._last_dataset_root == "/resolved/tmp/xlerobot-data"
+    assert session._recording_repo_id == "test/repo"
+    assert status["recording_info"]["root"] == "/resolved/tmp/xlerobot-data"
+
+
+def test_set_recording_root_can_update_repo_id_without_changing_root(monkeypatch):
+    session = vr_mod.VRTeleopSession()
+    calls = []
+
+    def fake_write(*, root=None, repo_id=None):
+        calls.append((root, repo_id))
+        return {"repo_id": repo_id, "root": "/tmp/current-root", "fps": 30, "push_to_hub": False}
+
+    monkeypatch.setattr(vr_mod._dataset, "write_dataset_config", fake_write)
+    monkeypatch.setattr(vr_mod._dataset, "resolve_root", lambda root, repo_id: f"/resolved/{repo_id}/{root.strip('/')}")
+    monkeypatch.setattr(session, "_recording_calibration_blockers", lambda: [])
+
+    status = session.set_recording_root(None, repo_id="new-user/new-dataset")
+
+    assert calls == [(None, "new-user/new-dataset")]
+    assert session._recording_repo_id == "new-user/new-dataset"
+    assert status["recording_info"]["repo_id"] == "new-user/new-dataset"
+
+
+def test_set_recording_root_rejects_while_recording(monkeypatch):
+    session = vr_mod.VRTeleopSession()
+    session._recording = True
+    monkeypatch.setattr(
+        vr_mod._dataset,
+        "write_dataset_config",
+        lambda root: pytest.fail("must not write config while recording"),
+    )
+
+    with pytest.raises(RuntimeError, match="stop recording"):
+        session.set_recording_root("/tmp/new-root")
+
+
 def test_recording_api_rejects_empty_task():
     with pytest.raises(HTTPException) as exc_info:
         vr_router.recording({"enabled": True, "task": "   "})
 
     assert exc_info.value.status_code == 400
+
+
+def test_recording_root_api_persists(monkeypatch):
+    session = vr_mod.VRTeleopSession()
+    monkeypatch.setattr(vr_router.vr_mod, "SESSION", session)
+    monkeypatch.setattr(
+        session,
+        "set_recording_root",
+        lambda root, repo_id=None: {"ok": True, "root": root, "repo_id": repo_id},
+    )
+
+    assert vr_router.recording_root({"root": "/tmp/data", "repo_id": "test/repo"}) == {
+        "ok": True,
+        "root": "/tmp/data",
+        "repo_id": "test/repo",
+    }
+
+
+def test_recording_root_api_accepts_repo_id_without_root(monkeypatch):
+    session = vr_mod.VRTeleopSession()
+    monkeypatch.setattr(vr_router.vr_mod, "SESSION", session)
+    monkeypatch.setattr(
+        session,
+        "set_recording_root",
+        lambda root, repo_id=None: {"ok": True, "root": root, "repo_id": repo_id},
+    )
+
+    assert vr_router.recording_root({"repo_id": "test/repo"}) == {
+        "ok": True,
+        "root": None,
+        "repo_id": "test/repo",
+    }
 
 
 def test_recording_task_api_caches_prompt(monkeypatch):

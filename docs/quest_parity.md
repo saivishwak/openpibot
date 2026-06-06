@@ -21,7 +21,7 @@ Full parity requires all of these to work together:
   controls gripper, A/X engages or switches active arm, Y toggles dual mode, and
   B requests recording.
 - Unity/OpenXR controller positions and rotations are converted into the backend
-  VR frame before calibration and control.
+  `quest_operator_frame` before calibration and control.
 - Head and wrist camera feeds render in the Quest app at usable latency.
 - Dashboard remains the setup and safety authority for robot connection,
   pairing, video health, recording blockers, and emergency stop.
@@ -72,7 +72,9 @@ The required equivalence is behavioral:
 
 ### Calibration And Verification
 
-- Unity/OpenXR position and rotation frames are converted consistently.
+- Unity/OpenXR position and rotation frames are converted consistently:
+  `operator = (unity.z, -unity.x, unity.y)` for positions and the same basis for
+  rotations.
 - Robot verification captures expected VR and robot deltas for each connected
   arm.
 - Low-scale tests must pass before recording is allowed.
@@ -101,6 +103,9 @@ The required equivalence is behavioral:
   cameras, or task text are incomplete.
 - Recorded episodes include joint actions, joint observations, and configured
   camera observations at the expected dataset FPS.
+- Recorded `action` values are the same-tick commanded joint targets after VR
+  IK, caps, deadbands, and command filtering, matching the inference shaping
+  contract.
 - A short manually inspected episode has controller intent matching robot motion.
 
 ## Verification Matrix

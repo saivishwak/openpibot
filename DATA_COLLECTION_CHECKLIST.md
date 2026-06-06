@@ -13,6 +13,9 @@ Goal: improve grasp reliability and make the policy consistently pick medicine b
 
 - [ ] Use the same home pose used in training/inference.
 - [ ] Keep camera mounts fixed (head, left wrist, right wrist) during the session.
+- [ ] Confirm all three camera roles are assigned on the dashboard Cameras page.
+- [ ] Confirm VR calibration, robot verification, and low-scale test are complete
+      for every connected arm before recording.
 - [ ] Keep table height and robot base position fixed.
 - [ ] Use the same medicine object category/size as prior demos.
 
@@ -76,6 +79,7 @@ Before accepting an episode:
 - [ ] Bowl placement is completed (release happens over bowl).
 - [ ] No camera dropout/glitch during key grasp/place moments.
 - [ ] No large accidental teleop spikes/collisions.
+- [ ] No obvious controller tracking jitter or wrist-axis inversion.
 
 If an episode fails one or more gates:
 
@@ -86,6 +90,8 @@ If an episode fails one or more gates:
 - [ ] Confirm episode count added and lengths look reasonable.
 - [ ] Spot-check first/middle/last episodes visually for consistency.
 - [ ] Verify task strings are correct and consistent.
+- [ ] Confirm the dataset repo ID and local dataset root are the intended ones
+      on the Recording page.
 - [ ] Run offline eval after upload/sync and compare against previous checkpoint behavior.
 
 ## 8) Retraining Guidance
@@ -93,6 +99,9 @@ If an episode fails one or more gates:
 - [ ] Retrain after each meaningful data batch (e.g., +20 episodes).
 - [ ] Compare checkpoints (`005000`, `010000`, `015000`, `020000`, `last`) in offline eval.
 - [ ] Keep best-performing checkpoint for on-robot tests.
+- [ ] For on-robot validation, test both balanced defaults and the no-extra-smoothing
+      inference preset:
+      `--policy-ema-alpha=1 --command-ema-alpha=1 --replan-blend=1`.
 
 ---
 

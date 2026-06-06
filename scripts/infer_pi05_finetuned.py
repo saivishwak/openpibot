@@ -55,9 +55,18 @@ _PER_TICK_DEG_CAPS: dict[str, float] = {
     "shoulder_lift": 5.0,
     "elbow_flex": 5.0,
     "wrist_flex": 6.0,
-    "wrist_roll": 6.0,
+    "wrist_roll": 10.0,
     "gripper": 15.0,
 }
+_JOINT_DEADBAND_DEG: dict[str, float] = {
+    "shoulder_pan": 0.18,
+    "shoulder_lift": 0.18,
+    "elbow_flex": 0.18,
+    "wrist_flex": 0.25,
+    "wrist_roll": 0.25,
+    "gripper": 0.0,
+}
+_FINAL_SMOOTHING_BYPASS = {"wrist_flex", "wrist_roll", "gripper"}
 _HOMING_TOL_DEG = 0.5
 _HOMING_KP = 0.75
 # VR recording uses KP=1.0 → action label is rate-limited absolute command (see _shape_action_like_recording).
@@ -68,6 +77,41 @@ def _load_yaml() -> dict[str, Any]:
     if not CONFIG_YAML.is_file():
         sys.exit(f"missing {CONFIG_YAML}")
     return yaml.safe_load(CONFIG_YAML.read_text()) or {}
+
+
+def _load_vr_control_shaping(cfg: dict[str, Any]) -> tuple[dict[str, float], dict[str, float]]:
+    """Load the command caps/deadbands used by VR recording.
+
+    Inference should shape policy actions like the dataset labels: per-tick
+    caps by joint, then tiny-command deadband by joint. Missing/invalid entries
+    keep the compiled defaults above.
+    """
+    vr_cfg = cfg.get("vr") if isinstance(cfg.get("vr"), dict) else {}
+    caps = dict(_PER_TICK_DEG_CAPS)
+    raw_caps = vr_cfg.get("joint_deg_caps") if isinstance(vr_cfg, dict) else None
+    if isinstance(raw_caps, dict):
+        for joint, value in raw_caps.items():
+            if joint in caps:
+                try:
+                    caps[joint] = max(0.1, min(30.0, float(value)))
+                except (TypeError, ValueError):
+                    pass
+
+    deadbands = dict(_JOINT_DEADBAND_DEG)
+    raw_deadbands = vr_cfg.get("joint_command_deadband_deg") if isinstance(vr_cfg, dict) else None
+    if isinstance(raw_deadbands, (int, float)):
+        value = max(0.0, min(5.0, float(raw_deadbands)))
+        for joint in deadbands:
+            if joint != "gripper":
+                deadbands[joint] = value
+    elif isinstance(raw_deadbands, dict):
+        for joint, value in raw_deadbands.items():
+            if joint in deadbands:
+                try:
+                    deadbands[joint] = max(0.0, min(5.0, float(value)))
+                except (TypeError, ValueError):
+                    pass
+    return caps, deadbands
 
 
 def _parse_args() -> argparse.Namespace:
@@ -234,10 +278,10 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument(
         "--joint-deadband-deg",
         type=float,
-        default=0.82,
+        default=None,
         help=(
-            "Suppress command updates smaller than this vs the previous filtered command (deg). "
-            "Too high (~1.0) can stall at home; too low (~0.6) is snappy but jittery."
+            "Override final command deadband for every joint (deg). "
+            "Default uses vr.joint_command_deadband_deg from config/xlerobot.yaml."
         ),
     )
     p.add_argument(
@@ -356,8 +400,8 @@ def _read_home_pose(cfg: dict[str, Any]) -> dict[str, float]:
     return {str(k): float(v) for k, v in hp.items()}
 
 
-def _cap_for_joint_key(key: str) -> float:
-    for suffix, cap in _PER_TICK_DEG_CAPS.items():
+def _cap_for_joint_key(key: str, caps: dict[str, float] | None = None) -> float:
+    for suffix, cap in (caps or _PER_TICK_DEG_CAPS).items():
         if f"_{suffix}.pos" in key:
             return cap
     return 2.0
@@ -373,6 +417,7 @@ def _shape_action_like_recording(
     last_sent: dict[str, float],
     *,
     kp: float,
+    caps: dict[str, float],
 ) -> dict[str, float]:
     """Match VR dataset labels: per-tick cap vs previous command, optional P blend.
 
@@ -382,7 +427,7 @@ def _shape_action_like_recording(
     """
     shaped: dict[str, float] = {}
     for key, target in policy_targets.items():
-        cap = _cap_for_joint_key(key)
+        cap = _cap_for_joint_key(key, caps)
         prev = last_sent.get(key, present.get(key, target))
         delta = max(-cap, min(cap, target - prev))
         clamped = prev + delta
@@ -420,13 +465,16 @@ def _top_joint_deltas(command: dict[str, float], present: dict[str, float], top_
 def _apply_joint_deadband(
     command: dict[str, float],
     reference: dict[str, float],
-    deadband_deg: float,
+    deadbands_deg: dict[str, float],
 ) -> dict[str, float]:
-    if deadband_deg <= 0:
-        return dict(command)
     out: dict[str, float] = {}
     for key, goal in command.items():
         ref = reference.get(key, goal)
+        deadband_deg = 0.0
+        for suffix, value in deadbands_deg.items():
+            if f"_{suffix}.pos" in key:
+                deadband_deg = float(value)
+                break
         out[key] = ref if abs(goal - ref) < deadband_deg else goal
     return out
 
@@ -457,6 +505,8 @@ def _blend_action_dict(
     new_cmd: dict[str, float],
     prev_cmd: dict[str, float],
     alpha: float,
+    *,
+    bypass_suffixes: set[str] | None = None,
 ) -> dict[str, float]:
     if alpha >= 0.999 or not prev_cmd:
         return dict(new_cmd)
@@ -464,6 +514,9 @@ def _blend_action_dict(
         return dict(prev_cmd)
     out: dict[str, float] = {}
     for key, goal in new_cmd.items():
+        if bypass_suffixes and any(f"_{suffix}.pos" in key for suffix in bypass_suffixes):
+            out[key] = goal
+            continue
         prev = prev_cmd.get(key, goal)
         out[key] = (1.0 - alpha) * prev + alpha * goal
     return out
@@ -487,6 +540,8 @@ def _ema_command(
     command: dict[str, float],
     prev_command: dict[str, float],
     alpha: float,
+    *,
+    bypass_suffixes: set[str] | None = None,
 ) -> dict[str, float]:
     if alpha >= 0.999:
         return dict(command)
@@ -494,6 +549,9 @@ def _ema_command(
         return dict(prev_command) if prev_command else dict(command)
     out: dict[str, float] = {}
     for key, goal in command.items():
+        if bypass_suffixes and any(f"_{suffix}.pos" in key for suffix in bypass_suffixes):
+            out[key] = goal
+            continue
         prev = prev_command.get(key, goal)
         out[key] = (1.0 - alpha) * prev + alpha * goal
     return out
@@ -570,6 +628,7 @@ def go_to_home_pose(
     fps: float,
     timeout_s: float,
     precise_sleep: Any,
+    caps: dict[str, float] | None = None,
     episode_deadline: float | None = None,
 ) -> None:
     """Rate-limited move to `robot.home_pose` joint targets (degrees)."""
@@ -597,7 +656,7 @@ def go_to_home_pose(
             clamped: dict[str, float] = {}
             converged = True
             for key, target in targets.items():
-                cap = _cap_for_joint_key(key)
+                cap = _cap_for_joint_key(key, caps)
                 prev = last_sent.get(key, present.get(key, target))
                 step = max(-cap, min(cap, target - prev))
                 clamped[key] = prev + step
@@ -719,6 +778,7 @@ def _safe_finish_episode(
     fps: float,
     home_timeout_s: float,
     precise_sleep: Any,
+    caps: dict[str, float],
     hold_cmd: dict[str, float] | None,
     hold_s: float = 0.5,
     episode_deadline: float | None = None,
@@ -751,6 +811,7 @@ def _safe_finish_episode(
                     fps=fps,
                     timeout_s=post_home_timeout,
                     precise_sleep=precise_sleep,
+                    caps=caps,
                     episode_deadline=episode_deadline,
                 )
             except Exception as exc:
@@ -760,6 +821,7 @@ def _safe_finish_episode(
 def _run_home_only(args: argparse.Namespace, cfg: dict[str, Any]) -> None:
     """Connect, homing only, disconnect — no policy."""
     home_pose = _read_home_pose(cfg)
+    caps, _deadbands = _load_vr_control_shaping(cfg)
     _ensure_xlerobot_import()
     from _xlerobot_loader import make_config, patch_motors_bus_lenient
     from lerobot.robots.xlerobot import XLerobot
@@ -777,6 +839,7 @@ def _run_home_only(args: argparse.Namespace, cfg: dict[str, Any]) -> None:
             fps=float(args.fps),
             timeout_s=float(args.home_timeout),
             precise_sleep=precise_sleep,
+            caps=caps,
         )
         print("Dry-run home complete.")
     except KeyboardInterrupt:
@@ -817,6 +880,13 @@ def _actions_to_robot_dict(action_row: torch.Tensor, joint_names: list[str]) -> 
 def main() -> None:
     cfg = _load_yaml()
     args = _parse_args()
+    vr_joint_caps, vr_joint_deadbands = _load_vr_control_shaping(cfg)
+    if args.joint_deadband_deg is not None:
+        override_deadband = max(0.0, min(5.0, float(args.joint_deadband_deg)))
+        vr_joint_deadbands = {
+            joint: (0.0 if joint == "gripper" else override_deadband)
+            for joint in vr_joint_deadbands
+        }
 
     if args.dry_run_home:
         print("=" * 60)
@@ -827,12 +897,12 @@ def main() -> None:
         _run_home_only(args, cfg)
         return
 
-    policy_path = pathlib.Path(args.policy_path).resolve()
-    if not policy_path.is_dir():
+    policy_path = pathlib.Path(args.policy_path).resolve() if args.policy_path else None
+    if policy_path is not None and not policy_path.is_dir():
         sys.exit(f"policy path not found: {policy_path}")
 
     print("=" * 60)
-    print(f"  Policy checkpoint : {policy_path}")
+    print(f"  Policy checkpoint : {policy_path or '(not required for --dry-run)'}")
     print(f"  Task              : {args.task}")
     ep_lim = [f"<= {args.episode_time}s wall-clock"]
     if args.episode_steps is not None:
@@ -869,7 +939,9 @@ def main() -> None:
     )
     print(f"  Policy EMA alpha  : {args.policy_ema_alpha}")
     print(f"  Command EMA alpha : {args.command_ema_alpha}")
-    print(f"  Joint deadband    : {args.joint_deadband_deg} deg")
+    print(f"  VR joint caps     : {vr_joint_caps}")
+    print(f"  Joint deadbands   : {vr_joint_deadbands}")
+    print(f"  EMA bypass joints : {sorted(_FINAL_SMOOTHING_BYPASS)}")
     print(f"  Camera backend    : {args.camera_backend}")
     print(
         f"  Camera preview    : {args.show_cameras} "
@@ -878,6 +950,9 @@ def main() -> None:
     print("=" * 60)
     if args.dry_run:
         return
+
+    if policy_path is None:
+        sys.exit("--policy-path is required for inference")
 
     home_pose = _read_home_pose(cfg) if not args.skip_home else {}
 
@@ -978,6 +1053,7 @@ def main() -> None:
                 fps=float(args.fps),
                 timeout_s=float(args.home_timeout),
                 precise_sleep=precise_sleep,
+                caps=vr_joint_caps,
             )
 
         for ep in range(args.episodes):
@@ -994,6 +1070,7 @@ def main() -> None:
                     fps=float(args.fps),
                     timeout_s=pre_home_timeout,
                     precise_sleep=precise_sleep,
+                    caps=vr_joint_caps,
                     episode_deadline=episode_deadline,
                 )
             _reset_policy_episode_state(
@@ -1088,7 +1165,10 @@ def main() -> None:
                             last_policy_smoothed if last_policy_smoothed else action_dict
                         )
                         action_dict = _ema_command(
-                            action_dict, policy_ref, float(args.policy_ema_alpha)
+                            action_dict,
+                            policy_ref,
+                            float(args.policy_ema_alpha),
+                            bypass_suffixes=_FINAL_SMOOTHING_BYPASS,
                         )
                         last_policy_smoothed = dict(action_dict)
                     if (
@@ -1097,13 +1177,17 @@ def main() -> None:
                         and args.replan_blend < 0.999
                     ):
                         action_dict = _blend_action_dict(
-                            action_dict, last_filtered, float(args.replan_blend)
+                            action_dict,
+                            last_filtered,
+                            float(args.replan_blend),
+                            bypass_suffixes=_FINAL_SMOOTHING_BYPASS,
                         )
                     shaped = _shape_action_like_recording(
                         action_dict,
                         present_dict,
                         last_sent,
                         kp=vr_kp,
+                        caps=vr_joint_caps,
                     )
                     final_cmd = shaped
                     if args.clamp_to_present:
@@ -1113,10 +1197,13 @@ def main() -> None:
                                 shaped, present_dict, float(max_rel_cfg)
                             )
                     final_cmd = _apply_joint_deadband(
-                        final_cmd, last_filtered, float(args.joint_deadband_deg)
+                        final_cmd, last_filtered, vr_joint_deadbands
                     )
                     final_cmd = _ema_command(
-                        final_cmd, last_filtered, float(args.command_ema_alpha)
+                        final_cmd,
+                        last_filtered,
+                        float(args.command_ema_alpha),
+                        bypass_suffixes=_FINAL_SMOOTHING_BYPASS,
                     )
                     if args.replan_on_miss_deg > 0 and last_filtered:
                         exec_err = _max_tracking_error_deg(
@@ -1207,6 +1294,7 @@ def main() -> None:
                     fps=float(args.fps),
                     home_timeout_s=float(args.home_timeout),
                     precise_sleep=precise_sleep,
+                    caps=vr_joint_caps,
                     hold_cmd=hold if hold else None,
                     episode_deadline=episode_deadline,
                     skip_home_after=bool(args.skip_home_after_episode),

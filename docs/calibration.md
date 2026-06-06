@@ -2,6 +2,10 @@
 
 Two independent setup steps, both done once per robot+user. Both persist to YAML.
 
+The production Quest app and backend use `quest_operator_frame`; this replaced
+the old WebXR-style frame. If a saved calibration was captured with a stale
+legacy frame, the backend rejects it and you must recalibrate.
+
 ## Home pose
 
 The pose every recorded episode starts from. Critical for VLA training: every demonstration must start from the same proprioception state, or the policy can't generalise.
@@ -93,9 +97,10 @@ Stage 1 is still useful for quick manual teleop, but training data should use th
 5. Click **Solve verification**. The backend fits a robot-verified translation matrix, keeps the stage-1 rotation for wrist/orientation, computes RMS residual error, and saves the result. If the solve fails, the card lists per-sample residuals so you can recapture the bad directions instead of guessing.
 6. Click **Start low-scale test**. Keep the controller still while starting; then hold the selected controller grip and move slowly while watching the real robot/camera. Click **Stop test** before recording.
 
-The runtime uses the verified translation matrix when available. The learned
-scale is already part of that 3×3 matrix at runtime; `translation_scale` is
-saved for diagnostics/UI only:
+The runtime uses the verified translation matrix when available. There is no
+recording-quality fallback to a guessed left/right mapping. The learned scale is
+already part of that 3×3 matrix at runtime; `translation_scale` is saved for
+diagnostics/UI only:
 
 ```text
 robot_delta = translation_vr_to_robot_matrix @ vr_delta

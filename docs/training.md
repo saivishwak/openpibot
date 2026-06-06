@@ -2,6 +2,9 @@
 
 This document covers the recommended training workflow for your VR teleop dataset.
 
+The training path assumes datasets recorded through the current OpenXR teleop
+architecture. For the full runtime contract, see [architecture.md](architecture.md).
+
 ## Fresh finetune from base model (recommended after new data)
 
 Use this when you recorded new episodes and want a clean run from `lerobot/pi05_base` (not resume).
@@ -68,6 +71,24 @@ uv run python scripts/infer_pi05_finetuned.py \
   --fps 30
 ```
 
+For a deployment check with extra inference smoothing disabled:
+
+```bash
+uv run python scripts/infer_pi05_finetuned.py \
+  --policy-path outputs/pi05_finetune_v2/checkpoints/last/pretrained_model \
+  --task "Pick up the medicine and place it in the bowl" \
+  --episodes 1 \
+  --episode-time 60 \
+  --fps 30 \
+  --policy-ema-alpha=1 \
+  --command-ema-alpha=1 \
+  --replan-blend=1
+```
+
+Those flags disable policy EMA, final command EMA, and first-action replan
+blend. The VR-style per-joint caps/deadbands from `config/xlerobot.yaml` still
+apply, matching the recorded action-label contract.
+
 ## Warm-start from a checkpoint (new run, not resume)
 
 Use this when you have new data (e.g. grasp-focused episodes) but want to keep weights from an earlier finetune. Pass your checkpoint as `--pretrained-path`, use a **new** `--output-dir`, and do **not** pass `--resume` (fresh optimizer + LR schedule).
@@ -96,6 +117,15 @@ Compare several checkpoints on the robot; you often do not need another full 50k
 ## CLI reference (`finetune_pi05.py`)
 
 Wrapper around `lerobot-train`. Defaults for `--dataset-repo-id` come from `config/xlerobot.yaml` → `dataset.repo_id`.
+
+The default rename map keeps the dataset layout compatible with PI0.5 while
+leaving `observation.state` and `action` in the project 12-joint order:
+
+```text
+observation.images.head        -> observation.images.base_0_rgb
+observation.images.left_wrist  -> observation.images.left_wrist_0_rgb
+observation.images.right_wrist -> observation.images.right_wrist_0_rgb
+```
 
 | Flag | Default | Description |
 |------|---------|-------------|

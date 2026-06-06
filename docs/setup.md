@@ -10,6 +10,9 @@ uv sync
 
 This prepares the OpenPIBot CLI, backend, dashboard runtime, LeRobot dataset tooling, and PI0.5 training/inference dependencies. The optional OpenPI WebSocket policy server is started through `uv` from a package-managed OpenPI runtime instead of a vendored checkout.
 
+See [architecture.md](architecture.md) for the current Quest/OpenXR teleop,
+recording, finetuning, and inference data path.
+
 ## Configure `config/xlerobot.yaml`
 
 Set five things:
@@ -20,15 +23,24 @@ Set five things:
      port_left_base:  /dev/ttyACM1
      port_right_head: /dev/ttyACM0
    ```
-2. **Camera paths** — find with `ls /dev/v4l/by-path/`.
-3. **Gripper convention** — if pulling the trigger opens (instead of closes), swap:
+2. **Camera roles** — assign `head`, `left_wrist`, and `right_wrist` from the
+   dashboard Cameras page. The page lists configured devices first and then all
+   visible V4L video devices. Manual YAML editing is still supported with
+   `/dev/v4l/by-path/...` paths.
+3. **Dataset repo and optional storage root** — for LeRobot recording.
+   `dataset.root` is optional. If omitted, recording uses the LeRobot/Hugging
+   Face default cache path; the Recording page can persist both `dataset.repo_id`
+   and `dataset.root` into this YAML while recording is idle.
+4. **Gripper convention** — if pulling the trigger opens (instead of closes), swap:
    ```yaml
    gripper:
      open_value: 0
      closed_value: 100
    ```
-4. **VR network ports** — defaults are 8443/8442. If your ISP blocks them, switch to 5443/5442.
-5. **Dataset repo** — for LeRobot recording. `<hf-user>/<dataset-name>`.
+5. **Quest pairing token and video settings** — set
+   `XLE_QUEST_PAIRING_TOKEN` before running the backend, and tune
+   `vr.quest_video` if headset camera streaming needs different ports,
+   bitrate, flip, or color settings.
 
 ## Motor calibration
 
