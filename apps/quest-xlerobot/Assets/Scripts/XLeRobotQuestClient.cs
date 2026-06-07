@@ -40,6 +40,7 @@ namespace XLeRobot.QuestTeleop
         private readonly Queue<string> pendingConnectionStates = new();
         private readonly Queue<string> pendingErrors = new();
         private readonly object pendingLock = new();
+        private bool operatorOriginCentered;
 
         public bool IsConnected => socket != null && socket.State == WebSocketState.Open;
 
@@ -117,6 +118,10 @@ namespace XLeRobot.QuestTeleop
 
         public void BindOperatorOrigin(Transform origin)
         {
+            if (operatorOrigin != origin)
+            {
+                operatorOriginCentered = false;
+            }
             operatorOrigin = origin;
         }
 
@@ -124,6 +129,11 @@ namespace XLeRobot.QuestTeleop
         {
             if (operatorOrigin == null || headset == null)
             {
+                return;
+            }
+            if (operatorOriginCentered)
+            {
+                Debug.Log("Quest operator origin already centered for this app session; preserving calibration frame.");
                 return;
             }
 
@@ -134,6 +144,7 @@ namespace XLeRobot.QuestTeleop
             // placed slightly behind/below the headset, near shoulder height.
             Vector3 headPosition = headset.position - headset.forward * 0.10f;
             operatorOrigin.position = new Vector3(headPosition.x, headPosition.y - 0.15f, headPosition.z);
+            operatorOriginCentered = true;
         }
 
         private async Task ConnectLoop(CancellationToken token)
