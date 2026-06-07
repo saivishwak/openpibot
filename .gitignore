@@ -170,6 +170,7 @@ apps/quest-xlerobot/Builds/
 apps/quest-xlerobot/Logs/
 apps/quest-xlerobot/UserSettings/
 apps/quest-xlerobot/.utmp/
+apps/quest-xlerobot/builds/
 
 # Local upstream/reference checkouts. These replace git submodules.
 reference/
