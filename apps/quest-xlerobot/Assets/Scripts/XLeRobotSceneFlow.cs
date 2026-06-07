@@ -154,7 +154,7 @@ namespace XLeRobot.QuestTeleop
 
         public void ApplyStatus(XLeRobotQuestStatus status)
         {
-            bool suspended = status == null || status.Stage == XLeRobotOperatorStage.Suspended || !string.IsNullOrEmpty(status.last_error);
+            bool suspended = status == null || status.Stage == XLeRobotOperatorStage.Suspended;
             if (overlay != null)
             {
                 overlay.SetActive(suspended);

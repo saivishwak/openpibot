@@ -37,6 +37,18 @@ _STRUCT_SIZE = 16 + 32 + 32 + 4 + 4 + 4 + 12  # 104
 _ROLES = ("head", "left_wrist", "right_wrist")
 
 
+def _valid_rgb_frame(frame: object) -> bool:
+    return (
+        isinstance(frame, np.ndarray)
+        and frame.dtype == np.uint8
+        and frame.ndim == 3
+        and frame.shape[2] == 3
+        and frame.shape[0] > 0
+        and frame.shape[1] > 0
+        and frame.size > 0
+    )
+
+
 @dataclass(frozen=True)
 class CameraSpec:
     name: str        # logical name from config (e.g. "head"), or "raw:videoN" for unassigned
@@ -169,7 +181,7 @@ def _write_config(cfg: dict) -> None:
     CONFIG_YAML.write_text(yaml.safe_dump(cfg, sort_keys=False))
 
 
-def enumerate_cameras() -> list[CameraSpec]:
+def _enumerate_cameras_impl() -> list[CameraSpec]:
     """Configured cameras first, then every visible unassigned V4L video device."""
     cfg = _read_config()
     cams_cfg = (cfg.get("cameras") or {})
@@ -242,14 +254,7 @@ def enumerate_cameras() -> list[CameraSpec]:
     return out
 
 
-def find_camera(cam_id: str) -> CameraSpec | None:
-    for c in enumerate_cameras():
-        if c.name == cam_id:
-            return c
-    return None
-
-
-def assign_role(by_path: str, role: str | None) -> dict:
+def _assign_role_impl(by_path: str, role: str | None) -> dict:
     """Set or clear a camera role in config/xlerobot.yaml. Returns the updated config."""
     if role is not None and role not in _ROLES:
         raise ValueError(f"role must be one of {_ROLES} or None, got {role!r}")
@@ -290,6 +295,8 @@ class CameraStream:
         self.cap: cv2.VideoCapture | None = None
         self.last_jpeg: bytes | None = None
         self.last_rgb: Any | None = None  # HWC uint8 RGB — policy path (no JPEG round-trip)
+        self.last_frame_at: float | None = None
+        self.last_frame_id: int = 0
         self.last_error: str | None = None
         self.lock = threading.Lock()
         self.subscribers = 0
@@ -362,18 +369,42 @@ class CameraStream:
             while not self.stop_evt.is_set():
                 t0 = time.monotonic()
                 ok, frame = self.cap.read()  # type: ignore[union-attr]
-                if not ok:
+                if not ok or not isinstance(frame, np.ndarray) or frame.size == 0:
                     consecutive_failures += 1
-                    self.last_error = "read() returned False"
+                    self.last_error = (
+                        "read() returned False"
+                        if not ok else
+                        f"read() returned empty frame shape={getattr(frame, 'shape', None)}"
+                    )
                     if consecutive_failures >= _READ_FAILS_BEFORE_RECOVER:
                         self._recover_capture()
                         break
                     time.sleep(0.05)
                     continue
                 consecutive_failures = 0
-                rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                try:
+                    rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                except Exception as e:
+                    consecutive_failures += 1
+                    self.last_error = f"invalid camera frame: {e}"
+                    if consecutive_failures >= _READ_FAILS_BEFORE_RECOVER:
+                        self._recover_capture()
+                        break
+                    time.sleep(0.05)
+                    continue
+                if not _valid_rgb_frame(rgb):
+                    consecutive_failures += 1
+                    self.last_error = f"invalid RGB frame shape={getattr(rgb, 'shape', None)} dtype={getattr(rgb, 'dtype', None)}"
+                    if consecutive_failures >= _READ_FAILS_BEFORE_RECOVER:
+                        self._recover_capture()
+                        break
+                    time.sleep(0.05)
+                    continue
+                consecutive_failures = 0
                 with self.lock:
                     self.last_rgb = rgb
+                    self.last_frame_at = time.monotonic()
+                    self.last_frame_id += 1
                     if self.encode_jpeg:
                         ok2, buf = cv2.imencode(
                             ".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 80]
@@ -401,13 +432,30 @@ class CameraStream:
             if self.subscribers == 0:
                 self.stop_evt.set()
 
-    def get_rgb(self, timeout: float = 2.0) -> np.ndarray | None:
+    def get_rgb(
+        self,
+        timeout: float = 2.0,
+        *,
+        max_age_s: float | None = None,
+        copy: bool = False,
+    ) -> np.ndarray | None:
         """Latest RGB frame (640×480 HWC uint8) for LeRobot / policy — not JPEG-compressed."""
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             with self.lock:
                 if self.last_rgb is not None:
-                    return self.last_rgb
+                    if max_age_s is None or (
+                        self.last_frame_at is not None
+                        and time.monotonic() - self.last_frame_at <= max_age_s
+                    ):
+                        if not _valid_rgb_frame(self.last_rgb):
+                            self.last_error = (
+                                "invalid cached RGB frame "
+                                f"shape={getattr(self.last_rgb, 'shape', None)} "
+                                f"dtype={getattr(self.last_rgb, 'dtype', None)}"
+                            )
+                            return None
+                        return self.last_rgb.copy() if copy else self.last_rgb
                 if self.last_error and (self.thread is None or not self.thread.is_alive()):
                     return None
             time.sleep(0.05)
@@ -419,6 +467,13 @@ class CameraStream:
             with self.lock:
                 if self.last_jpeg is not None:
                     return self.last_jpeg
+                if self.last_rgb is not None:
+                    bgr = cv2.cvtColor(self.last_rgb, cv2.COLOR_RGB2BGR)
+                    ok, buf = cv2.imencode(
+                        ".jpg", bgr, [cv2.IMWRITE_JPEG_QUALITY, 80]
+                    )
+                    if ok:
+                        return bytes(buf)
                 if self.last_error and (self.thread is None or not self.thread.is_alive()):
                     return None
             time.sleep(0.05)
@@ -433,116 +488,171 @@ class CameraStream:
             self.release()
 
 
-_REGISTRY: dict[str, CameraStream] = {}
-_REG_LOCK = threading.Lock()
-_SUSPENDED_ROLES: dict[str, str] = {}
+class CameraService:
+    """Single backend owner for camera enumeration and OpenCV capture streams.
+
+    All backend consumers must go through this service. The physical V4L device
+    is opened once per role by `CameraStream`; dashboard MJPEG, dataset
+    recording, inference, and Quest video consume snapshots from that same
+    stream instead of opening competing `/dev/video*` handles.
+    """
+
+    def __init__(self) -> None:
+        self._registry: dict[str, CameraStream] = {}
+        self._lock = threading.Lock()
+        self._suspended_roles: dict[str, str] = {}
+
+    def enumerate_cameras(self) -> list[CameraSpec]:
+        return _enumerate_cameras_impl()
+
+    def find_camera(self, cam_id: str) -> CameraSpec | None:
+        for c in self.enumerate_cameras():
+            if c.name == cam_id:
+                return c
+        return None
+
+    def assign_role(self, by_path: str, role: str | None) -> dict:
+        return _assign_role_impl(by_path, role)
+
+    def get_stream(self, cam_id: str) -> CameraStream | None:
+        spec = self.find_camera(cam_id)
+        if spec is None:
+            return None
+        if spec.role and spec.role in self._suspended_roles:
+            return None
+        with self._lock:
+            cached = self._registry.get(cam_id)
+            # If the underlying spec changed (e.g. user reassigned), drop the cached stream.
+            if cached is not None and cached.spec != spec:
+                cached.stop_evt.set()
+                del self._registry[cam_id]
+                cached = None
+            if cached is None:
+                self._registry[cam_id] = CameraStream(spec)
+            return self._registry[cam_id]
+
+    def reset_streams(self) -> None:
+        """Tear down all running captures (called after a config change)."""
+        with self._lock:
+            for s in self._registry.values():
+                s.stop_evt.set()
+            self._registry.clear()
+            self._suspended_roles.clear()
+
+    def suspend_capture_roles(self, roles: Iterable[str], *, reason: str = "") -> list[str]:
+        """Stop and block shared capture for roles owned by an external transport.
+
+        This is intentionally reserved for true external owners that must open
+        the V4L device themselves. Backend subsystems should normally share the
+        `CameraStream` returned by `get_stream` instead of using suspension.
+        """
+        wanted = {str(role) for role in roles if str(role) in _ROLES}
+        stopped: list[CameraStream] = []
+        with self._lock:
+            for role in wanted:
+                self._suspended_roles[role] = reason or "capture suspended"
+            for cam_id, stream in list(self._registry.items()):
+                if stream.spec.role in wanted:
+                    stream.subscribers = 0
+                    stream.stop_evt.set()
+                    stopped.append(stream)
+                    del self._registry[cam_id]
+
+        for stream in stopped:
+            if stream.thread is not None and stream.thread.is_alive():
+                stream.thread.join(timeout=2.0)
+            stream._close_cap()
+        return sorted(wanted)
+
+    def resume_capture_roles(self, roles: Iterable[str] | None = None) -> list[str]:
+        """Allow shared capture for the given roles again."""
+        with self._lock:
+            if roles is None:
+                resumed = sorted(self._suspended_roles)
+                self._suspended_roles.clear()
+                return resumed
+            wanted = {str(role) for role in roles if str(role) in _ROLES}
+            resumed = sorted(role for role in wanted if role in self._suspended_roles)
+            for role in resumed:
+                self._suspended_roles.pop(role, None)
+            return resumed
+
+    def suspended_capture_roles(self) -> dict[str, str]:
+        with self._lock:
+            return dict(self._suspended_roles)
+
+    def capture_suspension_reason(self, cam_id: str) -> str:
+        spec = self.find_camera(cam_id)
+        if spec is None or not spec.role:
+            return ""
+        return self._suspended_roles.get(spec.role, "")
+
+    def active_capture_roles(self) -> list[str]:
+        """Camera roles with a live shared stream subscriber."""
+        with self._lock:
+            out: list[str] = []
+            for stream in self._registry.values():
+                if stream.spec.role and stream.subscribers > 0:
+                    out.append(stream.spec.role)
+            return sorted(set(out))
+
+    def restart_stream(self, cam_id: str) -> CameraStream | None:
+        """Stop and recreate one camera stream."""
+        with self._lock:
+            old = self._registry.pop(cam_id, None)
+        if old is not None:
+            old.stop_evt.set()
+            if old.thread is not None and old.thread.is_alive():
+                old.thread.join(timeout=3.0)
+            old._close_cap()
+        return self.get_stream(cam_id)
+
+
+CAMERA_SERVICE = CameraService()
+
+
+def enumerate_cameras() -> list[CameraSpec]:
+    return CAMERA_SERVICE.enumerate_cameras()
+
+
+def find_camera(cam_id: str) -> CameraSpec | None:
+    return CAMERA_SERVICE.find_camera(cam_id)
+
+
+def assign_role(by_path: str, role: str | None) -> dict:
+    return CAMERA_SERVICE.assign_role(by_path, role)
 
 
 def get_stream(cam_id: str) -> CameraStream | None:
-    spec = find_camera(cam_id)
-    if spec is None:
-        return None
-    if spec.role and spec.role in _SUSPENDED_ROLES:
-        return None
-    with _REG_LOCK:
-        cached = _REGISTRY.get(cam_id)
-        # If the underlying spec changed (e.g. user reassigned), drop the cached stream.
-        if cached is not None and cached.spec != spec:
-            cached.stop_evt.set()
-            del _REGISTRY[cam_id]
-            cached = None
-        if cached is None:
-            _REGISTRY[cam_id] = CameraStream(spec)
-        return _REGISTRY[cam_id]
+    return CAMERA_SERVICE.get_stream(cam_id)
 
 
 def reset_streams() -> None:
-    """Tear down all running captures (called after a config change)."""
-    with _REG_LOCK:
-        for s in _REGISTRY.values():
-            s.stop_evt.set()
-        _REGISTRY.clear()
-        _SUSPENDED_ROLES.clear()
+    CAMERA_SERVICE.reset_streams()
 
 
 def suspend_capture_roles(roles: Iterable[str], *, reason: str = "") -> list[str]:
-    """Stop and block OpenCV/MJPEG capture for roles owned by another transport.
-
-    The Quest GStreamer bridge opens the same V4L2 devices directly. Browser
-    dashboard previews are long-lived MJPEG clients, so merely checking for
-    contention makes Quest video fragile. Suspending the role closes the OpenCV
-    handle and prevents immediate reacquire until the bridge stops.
-    """
-    wanted = {str(role) for role in roles if str(role) in _ROLES}
-    stopped: list[CameraStream] = []
-    with _REG_LOCK:
-        for role in wanted:
-            _SUSPENDED_ROLES[role] = reason or "capture suspended"
-        for cam_id, stream in list(_REGISTRY.items()):
-            if stream.spec.role in wanted:
-                stream.subscribers = 0
-                stream.stop_evt.set()
-                stopped.append(stream)
-                del _REGISTRY[cam_id]
-
-    for stream in stopped:
-        if stream.thread is not None and stream.thread.is_alive():
-            stream.thread.join(timeout=2.0)
-        stream._close_cap()
-    return sorted(wanted)
+    return CAMERA_SERVICE.suspend_capture_roles(roles, reason=reason)
 
 
 def resume_capture_roles(roles: Iterable[str] | None = None) -> list[str]:
-    """Allow OpenCV/MJPEG capture for the given roles again."""
-    with _REG_LOCK:
-        if roles is None:
-            resumed = sorted(_SUSPENDED_ROLES)
-            _SUSPENDED_ROLES.clear()
-            return resumed
-        wanted = {str(role) for role in roles if str(role) in _ROLES}
-        resumed = sorted(role for role in wanted if role in _SUSPENDED_ROLES)
-        for role in resumed:
-            _SUSPENDED_ROLES.pop(role, None)
-        return resumed
+    return CAMERA_SERVICE.resume_capture_roles(roles)
 
 
 def suspended_capture_roles() -> dict[str, str]:
-    with _REG_LOCK:
-        return dict(_SUSPENDED_ROLES)
+    return CAMERA_SERVICE.suspended_capture_roles()
 
 
 def capture_suspension_reason(cam_id: str) -> str:
-    spec = find_camera(cam_id)
-    if spec is None or not spec.role:
-        return ""
-    return _SUSPENDED_ROLES.get(spec.role, "")
+    return CAMERA_SERVICE.capture_suspension_reason(cam_id)
 
 
 def active_capture_roles() -> list[str]:
-    """Camera roles with a live OpenCV stream handle.
-
-    GStreamer opens the same V4L2 devices directly for Quest video. Reporting
-    active OpenCV consumers lets the Quest bridge avoid racing the MJPEG/policy
-    capture path for exclusive USB camera handles.
-    """
-    with _REG_LOCK:
-        out: list[str] = []
-        for stream in _REGISTRY.values():
-            if stream.spec.role and stream.subscribers > 0:
-                out.append(stream.spec.role)
-        return sorted(set(out))
+    return CAMERA_SERVICE.active_capture_roles()
 
 
 def restart_stream(cam_id: str) -> CameraStream | None:
-    """Stop and recreate one camera stream (e.g. after USB drop during inference)."""
-    with _REG_LOCK:
-        old = _REGISTRY.pop(cam_id, None)
-    if old is not None:
-        old.stop_evt.set()
-        if old.thread is not None and old.thread.is_alive():
-            old.thread.join(timeout=3.0)
-        old._close_cap()
-    return get_stream(cam_id)
+    return CAMERA_SERVICE.restart_stream(cam_id)
 
 
 def mjpeg_iter(cam_id: str, max_fps: int = 15):

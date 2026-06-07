@@ -269,7 +269,7 @@ namespace XLeRobot.QuestTeleop
                 + " | Stage: " + (latestStatus.stage ?? "unknown");
             string recordLine = "Arms: " + FormatRoles(latestStatus.connected_arms)
                 + " | Active: " + EmptyToDash(latestStatus.active_arm)
-                + " | Recording: " + (latestStatus.recording_active ? latestStatus.recording_frames + " frames" : "idle");
+                + " | Recording: " + RecordingLabel(latestStatus);
             string errorLine = FirstNonEmpty(lastQuestError, lastStateError, lastVideoError, latestStatus.LastError);
 
             diagnosticsText.text = teleopLine + "\n" + videoLine + "\n" + recordLine
@@ -820,6 +820,59 @@ namespace XLeRobot.QuestTeleop
                 return value ?? "";
             }
             return value.Substring(0, maxChars - 3) + "...";
+        }
+
+        private static string RecordingLabel(XLeRobotQuestStatus status)
+        {
+            if (status == null)
+            {
+                return "unknown";
+            }
+            if (status.recording_active)
+            {
+                return status.recording_frames + " frames";
+            }
+            if (status.recording_armed)
+            {
+                return string.IsNullOrEmpty(status.recording_notice)
+                    ? "armed"
+                    : "armed - " + Trim(status.recording_notice, 48);
+            }
+            string idle = "idle (" + status.recording_episodes_saved + " saved)";
+            if (status.recording_start_allowed)
+            {
+                return status.recording_anchor_pending
+                    ? idle + " - can start, anchors refresh on start"
+                    : idle + " - ready";
+            }
+            string blocker = FirstArrayValue(status.recording_start_blockers);
+            if (string.IsNullOrEmpty(blocker))
+            {
+                blocker = FirstArrayValue(status.recording_blockers);
+            }
+            if (!string.IsNullOrEmpty(blocker))
+            {
+                return idle + " - blocked: " + Trim(blocker, 48);
+            }
+            return string.IsNullOrEmpty(status.recording_notice)
+                ? idle
+                : idle + " - " + Trim(status.recording_notice, 48);
+        }
+
+        private static string FirstArrayValue(string[] values)
+        {
+            if (values == null)
+            {
+                return "";
+            }
+            for (int i = 0; i < values.Length; i++)
+            {
+                if (!string.IsNullOrEmpty(values[i]))
+                {
+                    return values[i];
+                }
+            }
+            return "";
         }
 
         private static int CalibrationStep(string state)

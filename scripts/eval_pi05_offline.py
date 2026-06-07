@@ -19,11 +19,16 @@ from typing import Any
 
 import numpy as np
 import torch
+import yaml
 
 from lerobot.common.control_utils import predict_action
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 from lerobot.policies.factory import make_pre_post_processors
 from _pi05_loader import load_pi05_policy_with_compat
+
+
+REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
+CONFIG_YAML = REPO_ROOT / "config" / "xlerobot.yaml"
 
 
 IMAGE_KEY_CANDIDATES: list[tuple[str, str]] = [
@@ -34,6 +39,8 @@ IMAGE_KEY_CANDIDATES: list[tuple[str, str]] = [
 
 
 def _parse_args() -> argparse.Namespace:
+    cfg = yaml.safe_load(CONFIG_YAML.read_text()) if CONFIG_YAML.is_file() else {}
+    ds_cfg = (cfg or {}).get("dataset") or {}
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument(
         "--policy-path",
@@ -42,8 +49,19 @@ def _parse_args() -> argparse.Namespace:
     )
     p.add_argument(
         "--dataset-repo-id",
-        default="saivishwak/xlerobot-vr-teleop",
+        default=str(ds_cfg.get("repo_id") or "saivishwak/xlerobot-vr-teleop"),
         help="LeRobot dataset repo id.",
+    )
+    p.add_argument(
+        "--dataset-root",
+        default=str(ds_cfg.get("root") or ""),
+        help="Local LeRobot dataset root. Defaults to config/xlerobot.yaml dataset.root.",
+    )
+    p.add_argument(
+        "--video-backend",
+        default="pyav",
+        choices=["pyav", "torchcodec", "video_reader"],
+        help="Dataset video decoder backend. Defaults to pyav to avoid local TorchCodec compatibility issues.",
     )
     p.add_argument(
         "--episodes",
@@ -167,7 +185,15 @@ def main() -> None:
     policy = load_pi05_policy_with_compat(policy_path, device)
     preprocessor, postprocessor = make_pre_post_processors(policy.config, pretrained_path=str(policy_path))
 
-    ds = LeRobotDataset(args.dataset_repo_id, episodes=episodes)
+    dataset_root = str(args.dataset_root or "").strip() or None
+    if dataset_root is not None:
+        dataset_root = str(pathlib.Path(dataset_root).expanduser())
+    ds = LeRobotDataset(
+        args.dataset_repo_id,
+        root=dataset_root,
+        episodes=episodes,
+        video_backend=args.video_backend,
+    )
     print(f"Loaded dataset split with {len(ds)} frames.")
 
     n = 0
@@ -239,4 +265,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

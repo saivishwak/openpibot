@@ -5,16 +5,62 @@ import { VRStatus, api, fetcher } from "../api";
 import { CameraPreviewGrid } from "../components/CameraPreviewGrid";
 import { Badge, Button, Card, ConfirmDialog, Field, Page, TextInput } from "../components/ui";
 
+type BadgeTone = "neutral" | "success" | "warning" | "danger" | "info";
+
+function recordingGateBadge(info?: VRStatus["recording_info"]): { label: string; tone: BadgeTone } {
+  if (!info) return { label: "loading", tone: "neutral" };
+  if (info.transition_active) {
+    return {
+      label: info.transition_target === false ? "stopping recording" : "starting recording",
+      tone: "info",
+    };
+  }
+  if (info.active) return { label: "recording", tone: "info" };
+  if (info.armed) return { label: "armed", tone: "warning" };
+  if (info.start_allowed) {
+    return info.anchor_pending
+      ? { label: "anchor refresh pending", tone: "success" }
+      : { label: "start allowed", tone: "success" };
+  }
+
+  const hardBlockers = info.start_blockers ?? info.calibration_blockers ?? [];
+  const verificationBlockers = info.verification_blockers ?? [];
+  const blockers = [...hardBlockers, ...verificationBlockers].map((item) => item.toLowerCase());
+  const has = (needle: string) => blockers.some((item) => item.includes(needle));
+
+  if (has("connect both")) return { label: "connect arms", tone: "warning" };
+  if (has("quest app")) return { label: "Quest required", tone: "warning" };
+  if (has("camera")) return { label: "camera setup required", tone: "warning" };
+  if (has("home pose")) return { label: "home required", tone: "warning" };
+  if (has("torque")) return { label: "torque required", tone: "warning" };
+  if (has("low-scale calibration test is still active")) return { label: "test active", tone: "info" };
+  if (has("low-scale calibration test not completed")) return { label: "low-scale test required", tone: "warning" };
+  if (verificationBlockers.length || has("robot verification")) return { label: "verification required", tone: "warning" };
+  if (hardBlockers.length) return { label: "recording blocked", tone: "warning" };
+  return { label: "checking readiness", tone: "neutral" };
+}
+
 export function Recording() {
   const { data, mutate } = useSWR<VRStatus>("/api/vr/status", fetcher, { refreshInterval: 1000 });
   const info = data?.recording_info;
   const [task, setTask] = useState("");
   const [root, setRoot] = useState("");
   const [repoId, setRepoId] = useState("");
+  const [taskError, setTaskError] = useState("");
   const [confirmDelete, setConfirmDelete] = useState(false);
+  const [busyRecording, setBusyRecording] = useState(false);
   const [busyHome, setBusyHome] = useState(false);
   const [savingDatasetConfig, setSavingDatasetConfig] = useState(false);
   const active = !!data?.recording;
+  const armed = !!data?.recording_armed || !!info?.armed;
+  const recordingLocked = active || armed;
+  const transitionActive = !!info?.transition_active;
+  const recordingBusy = recordingLocked || transitionActive;
+  const effectiveTask = task.trim() || info?.last_task?.trim() || info?.task_default?.trim() || "";
+  const hardBlockers = info?.start_blockers ?? info?.calibration_blockers ?? [];
+  const anchorBlockers = info?.anchor_blockers ?? [];
+  const startAllowed = !!info?.start_allowed;
+  const gateBadge = recordingGateBadge(info);
   const connectedSides = data?.connected_sides ?? [];
   const readinessLabel = (readiness?: string) => readiness === "ready_to_record"
     ? "ready"
@@ -31,16 +77,23 @@ export function Recording() {
   }, [info?.last_task, task]);
 
   const toggle = async (enabled: boolean) => {
+    if (enabled && !effectiveTask) {
+      setTaskError("Task description is required before starting an episode.");
+      return;
+    }
+    setBusyRecording(true);
     try {
-      await api.vrSetRecording(enabled, task.trim());
+      await api.vrSetRecording(enabled, effectiveTask);
       await mutate();
     } catch (err) {
       alert(String(err));
+    } finally {
+      setBusyRecording(false);
     }
   };
 
   const saveDatasetConfig = async () => {
-    if (active || savingDatasetConfig) return;
+    if (recordingBusy || savingDatasetConfig) return;
     const nextRoot = root.trim();
     const nextRepoId = repoId.trim();
     if (!nextRoot && !nextRepoId) return;
@@ -76,20 +129,23 @@ export function Recording() {
           <div>
             <h2 className="text-sm font-semibold">Episode Control</h2>
             <div className="mt-2 flex flex-wrap gap-2">
-              <Badge tone={active ? "info" : "neutral"}>{active ? "recording" : "idle"}</Badge>
+              <Badge tone={active ? "info" : armed ? "warning" : "neutral"}>{active ? "recording" : armed ? "armed" : "idle"}</Badge>
               <Badge tone="neutral">{info?.episodes_saved ?? 0} episodes saved</Badge>
-              <Badge tone={info?.calibration_ready ? "success" : "warning"}>{info?.calibration_ready ? "calibration ready" : "verification required"}</Badge>
+              {!recordingLocked || transitionActive ? <Badge tone={gateBadge.tone}>{gateBadge.label}</Badge> : null}
               {active ? <Badge tone="info">{info?.frames_in_current_episode ?? 0} frames</Badge> : null}
             </div>
           </div>
           <div className="flex flex-wrap gap-2">
-            <Button disabled={!active && !task.trim()} onClick={() => toggle(!active)}>
-              <Database size={16} />{active ? "Stop recording" : "Start recording"}
+            <Button
+              disabled={busyRecording || transitionActive || (!recordingLocked && !startAllowed)}
+              onClick={() => toggle(!recordingLocked)}
+            >
+              <Database size={16} />{active ? "Stop recording" : armed ? "Cancel recording" : "Start recording"}
             </Button>
-            <Button variant="secondary" disabled={active || busyHome || !homeReady} onClick={goHome}>
+            <Button variant="secondary" disabled={recordingBusy || busyHome || !homeReady} onClick={goHome}>
               <Home size={16} />Go home
             </Button>
-            <Button variant="secondary" disabled={active || (info?.episodes_saved ?? 0) < 1} onClick={() => setConfirmDelete(true)}>
+            <Button variant="secondary" disabled={recordingBusy || (info?.episodes_saved ?? 0) < 1} onClick={() => setConfirmDelete(true)}>
               <Trash2 size={16} />Delete last
             </Button>
           </div>
@@ -100,8 +156,9 @@ export function Recording() {
             <TextInput value={task} onChange={(e) => {
               const next = e.currentTarget.value;
               setTask(next);
-              if (!active) api.vrSetRecordingTask(next.trim()).catch(() => undefined);
-            }} disabled={active} placeholder="Pick the red block and place it in the bin" />
+              setTaskError("");
+              if (!recordingBusy) api.vrSetRecordingTask(next.trim()).catch(() => undefined);
+            }} disabled={recordingBusy} placeholder={info?.task_default || "Pick the red block and place it in the bin"} />
           </Field>
           <Field label="Dataset repo ID" hint="Blank keeps the configured repo id. Enter user/dataset-name to update dataset.repo_id.">
             <TextInput
@@ -113,7 +170,7 @@ export function Recording() {
                   saveDatasetConfig();
                 }
               }}
-              disabled={active || savingDatasetConfig}
+              disabled={recordingBusy || savingDatasetConfig}
               placeholder={info?.repo_id ?? "user/dataset-name"}
             />
           </Field>
@@ -128,13 +185,13 @@ export function Recording() {
                     e.currentTarget.blur();
                   }
                 }}
-                disabled={active || savingDatasetConfig}
+                disabled={recordingBusy || savingDatasetConfig}
                 placeholder={info?.root ?? ""}
               />
               <Button
                 type="button"
                 variant="secondary"
-                disabled={active || savingDatasetConfig || (!root.trim() && !repoId.trim())}
+                disabled={recordingBusy || savingDatasetConfig || (!root.trim() && !repoId.trim())}
                 onMouseDown={(e) => e.preventDefault()}
                 onClick={saveDatasetConfig}
               >
@@ -143,8 +200,15 @@ export function Recording() {
             </div>
           </Field>
         </div>
-        {(info?.calibration_blockers ?? []).length ? (
-          <p className="mt-3 text-sm text-warning">Recording blocked: {info?.calibration_blockers.join("; ")}</p>
+        {taskError ? (
+          <p className="mt-3 text-sm text-warning">{taskError}</p>
+        ) : null}
+        {hardBlockers.length ? (
+          <p className="mt-3 text-sm text-warning">Recording blocked: {hardBlockers.join("; ")}</p>
+        ) : anchorBlockers.length ? (
+          <p className="mt-3 text-sm text-muted-foreground">Start recording is available. The backend will refresh VR anchors from the latest controller poses: {anchorBlockers.join("; ")}</p>
+        ) : info?.notice ? (
+          <p className="mt-3 text-sm text-muted-foreground">{info.notice}</p>
         ) : null}
         <div className="mt-3 flex flex-wrap gap-2">
           {(["left", "right"] as const).map((side) => {

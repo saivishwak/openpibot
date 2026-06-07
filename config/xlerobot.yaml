@@ -7,26 +7,19 @@ robot:
   max_relative_target: 8.0
   use_degrees: true
   home_pose:
-    left_arm_shoulder_pan: 21.8462
-    left_arm_shoulder_lift: -91.1648
-    left_arm_elbow_flex: 84.3956
-    left_arm_wrist_flex: 42.2418
-    left_arm_wrist_roll: -5.4945
-    left_arm_gripper: 0.7644
-    right_arm_shoulder_pan: -35.6923
-    right_arm_shoulder_lift: -100.7033
-    right_arm_elbow_flex: 67.6044
-    right_arm_wrist_flex: 57.2308
-    right_arm_wrist_roll: 5.7582
+    left_arm_shoulder_pan: 22.0220
+    left_arm_shoulder_lift: -76.5714
+    left_arm_elbow_flex: 78.5934
+    left_arm_wrist_flex: 8.2198
+    left_arm_wrist_roll: -5.4066
+    left_arm_gripper: 0.5559
+    right_arm_shoulder_pan: -34.3736
+    right_arm_shoulder_lift: -81.2747
+    right_arm_elbow_flex: 84.0440
+    right_arm_wrist_flex: 15.5604
+    right_arm_wrist_roll: 5.4066
     right_arm_gripper: 0.6241
 cameras:
-  left_wrist:
-    type: opencv
-    path: /dev/v4l/by-path/pci-0000:0e:00.0-usb-0:4.4:1.0-video-index0
-    fps: 30
-    width: 640
-    height: 480
-    fourcc: MJPG
   head:
     type: opencv
     path: /dev/v4l/by-path/pci-0000:0e:00.0-usb-0:3:1.0-video-index0
@@ -35,6 +28,13 @@ cameras:
     height: 480
     fourcc: MJPG
   right_wrist:
+    type: opencv
+    path: /dev/v4l/by-path/pci-0000:0e:00.0-usb-0:4.4:1.0-video-index0
+    fps: 30
+    width: 640
+    height: 480
+    fourcc: MJPG
+  left_wrist:
     type: opencv
     path: /dev/v4l/by-path/pci-0000:0e:00.0-usb-0:4.1:1.0-video-index0
     fps: 30
@@ -54,6 +54,7 @@ pi05:
   control_fps: 30
 vr:
   kp: 0.75
+  homing_present_tolerance_deg: 4.0
   wrist_delta_limit_deg: 8.0
   pos_ema_alpha: 0.22
   ori_ema_alpha: 0.25

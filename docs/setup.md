@@ -70,9 +70,9 @@ Required for `/dev/ttyACM*` access. Without it the dashboard can't open the moto
 ## Run the dashboard
 
 ```bash
-uv run openpibot run --host 0.0.0.0
+uv run openpibot run --host 0.0.0.0 --log-file .openpibot/logs/server.log
 ```
 
-The run command installs frontend dependencies with `pnpm`, builds the dashboard, and starts the backend. Use `--no-build-dashboard` only when you are running the Vite dev server separately.
+The run command installs frontend dependencies with `pnpm`, builds the dashboard, starts the backend, and writes server logs to `.openpibot/logs/server.log`. Use `--no-build-dashboard` only when you are running the Vite dev server separately.
 
 That's it. Open the page, connect an arm, follow [teleop.md](teleop.md).

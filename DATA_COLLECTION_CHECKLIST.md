@@ -1,118 +1,87 @@
-# Data Collection Checklist (Medicine -> Bowl)
+# Data Collection Checklist: Pen -> Jar
 
-Use this checklist when recording new VR teleop demos for `saivishwak/xlerobot-vr-teleop`.
-Goal: improve grasp reliability and make the policy consistently pick medicine before placing into bowl.
+Dataset: `saivishwak/xlerobot-vr-pick-place-pen`
 
-## 1) Target Data Volume
+Primary eval task:
 
-- [ ] Collect **40-80 new successful episodes** (recommended total dataset: **55-95** episodes).
-- [ ] Keep at least **80% clean successes** (avoid too many failed/noisy episodes).
-- [ ] Record at existing settings (30 Hz, same joint order, same camera setup).
+`Pick up the pen and place it in the jar`
 
-## 2) Scene + Robot Setup Consistency
+Goal: improve grasp reliability. Keep only clean successful demonstrations.
 
-- [ ] Use the same home pose used in training/inference.
-- [ ] Keep camera mounts fixed (head, left wrist, right wrist) during the session.
-- [ ] Confirm all three camera roles are assigned on the dashboard Cameras page.
-- [ ] Confirm VR calibration, robot verification, and low-scale test are complete
-      for every connected arm before recording.
-- [ ] Keep table height and robot base position fixed.
-- [ ] Use the same medicine object category/size as prior demos.
+## 1) Target Data
 
-## 3) Episode Structure (Important)
+- [ ] Collect 80-120 successful episodes for the first fine-tune.
+- [ ] Use the exact task label above for the primary dataset.
+- [ ] Record at 30 Hz with the same 3 cameras: head, left_wrist, right_wrist.
+- [ ] Reject failed grasps, pushed pens, dropped pens, camera glitches, and collisions.
 
-Each episode should follow this timeline:
+## 2) Scene Setup
 
-1. **Home settle** (about 2 seconds)
-2. **Approach medicine**
-3. **Grasp medicine**
-4. **Lift and stabilize**
-5. **Move to bowl**
-6. **Place + release**
-7. **Retreat**
+- [ ] Same desk, robot base position, camera mounts, lighting, pen type, and jar type.
+- [ ] Pen and jar fully visible from head camera at episode start.
+- [ ] Wrist camera can see the gripper and pen during grasp.
+- [ ] Start every episode from verified home.
+- [ ] Complete Quest calibration, robot verification, and low-scale test before recording.
 
-Checklist:
+## 3) Episode Structure
 
-- [ ] Start from home and hold still for ~2s before moving.
-- [ ] Reach medicine first (do not move directly toward bowl first).
-- [ ] Ensure clear, decisive gripper close around medicine.
-- [ ] Lift after grasp (visible separation from table) before moving to bowl.
-- [ ] Place into bowl and open gripper clearly.
+Every accepted episode must contain:
 
-## 4) Data Mix (High Impact)
+- [ ] 1-2 s still at home.
+- [ ] Move to pen without touching it early.
+- [ ] Align gripper around the pen before closing.
+- [ ] Close gripper decisively on the pen.
+- [ ] Lift pen clear of desk before moving to jar.
+- [ ] Move above jar.
+- [ ] Lower pen into jar.
+- [ ] Open gripper clearly.
+- [ ] Retreat after release.
 
-Recommended split for new recordings:
+## 4) Collection Mix
 
-- [ ] **20-30 episodes** focused on approach + grasp quality.
-- [ ] **20-30 episodes** full medicine -> bowl trajectories.
+Use this mix for 100 episodes:
 
-Variation to include:
+- [ ] 50 full task episodes: pen starts in normal expected location.
+- [ ] 25 grasp-focused full task episodes: slower approach, pause before close, visible lift.
+- [ ] 15 pose variation episodes: pen rotated across the desk plane.
+- [ ] 10 position variation episodes: pen shifted within the expected workspace.
 
-- [ ] Medicine orientation variations.
-- [ ] Slight medicine position shifts.
-- [ ] Mild bowl position shifts.
-- [ ] Small lighting changes.
+Do not collect:
 
-Avoid:
+- [ ] Failed grasp attempts.
+- [ ] Episodes where the pen is only pushed or dragged.
+- [ ] Extreme pen/jar positions outside the test setup.
+- [ ] Fast jerky motions that saturate joint caps.
+- [ ] Episodes with no meaningful gripper motion.
 
-- [ ] Extreme scene changes outside expected deployment setup.
-- [ ] Fast jerky teleop that creates inconsistent action labels.
+## 5) Grasp Requirements
 
-## 5) Prompt/Task Labeling
+Accept only if:
 
-Current full-task label is:
-- `Pick up the medicine and place it in the bowl`
+- [ ] Gripper fingers are centered near the pen body, not the tip.
+- [ ] Gripper closes before lift.
+- [ ] Pen visibly leaves the desk.
+- [ ] Pen remains held during transfer.
+- [ ] Release happens over or inside the jar.
 
-To strengthen phase behavior in future data:
+Re-record if:
 
-- [ ] Consider collecting a subset with phase prompts:
-  - `Pick up the medicine bottle`
-  - `Place the medicine bottle in the bowl`
-- [ ] Keep wording stable within each subset (avoid too many paraphrases).
+- [ ] Pen rolls away before grasp.
+- [ ] Gripper closes beside the pen.
+- [ ] Pen slips during lift.
+- [ ] Pen hits jar rim and falls outside.
+- [ ] The episode is shorter than a complete task.
 
-## 6) Per-Episode Quality Gate
+## 6) After Recording
 
-Before accepting an episode:
-
-- [ ] Medicine is actually grasped (not just pushed/slid).
-- [ ] Medicine is visibly lifted.
-- [ ] Bowl placement is completed (release happens over bowl).
-- [ ] No camera dropout/glitch during key grasp/place moments.
-- [ ] No large accidental teleop spikes/collisions.
-- [ ] No obvious controller tracking jitter or wrist-axis inversion.
-
-If an episode fails one or more gates:
-
-- [ ] Re-record it (do not keep large numbers of low-quality attempts).
-
-## 7) Session-End Sanity Checks
-
-- [ ] Confirm episode count added and lengths look reasonable.
-- [ ] Spot-check first/middle/last episodes visually for consistency.
-- [ ] Verify task strings are correct and consistent.
-- [ ] Confirm the dataset repo ID and local dataset root are the intended ones
-      on the Recording page.
-- [ ] Run offline eval after upload/sync and compare against previous checkpoint behavior.
-
-## 8) Retraining Guidance
-
-- [ ] Retrain after each meaningful data batch (e.g., +20 episodes).
-- [ ] Compare checkpoints (`005000`, `010000`, `015000`, `020000`, `last`) in offline eval.
-- [ ] Keep best-performing checkpoint for on-robot tests.
-- [ ] For on-robot validation, test both balanced defaults and the no-extra-smoothing
-      inference preset:
-      `--policy-ema-alpha=1 --command-ema-alpha=1 --replan-blend=1`.
-
----
-
-If grasp remains unreliable after +40 clean episodes, prioritize additional grasp-centric episodes over adding more placement-only trajectories.
-
-
+- [ ] Confirm `meta/info.json` episode count increased by the expected number.
+- [ ] Check every episode has matching parquet rows and video frame counts.
+- [ ] Spot-check first, middle, and last episodes visually.
+- [ ] Check gripper action spans; reject episodes with near-zero gripper movement.
+- [ ] Run dataset preflight before fine-tuning.
 
 ## Current Progress
 
-| Label | Episodes |
-|-------|----------|
-| Pick up the medicine and place it in the bowl | 0-14 |
-| Pick up the medicine | 15-34, 45-49 |
-| Pick up the medicine and place in the bowl | 35-44 |
+| Task Label | Episodes |
+|---|---:|
+| Pick up the pen and place it in the jar | 0-1 |

@@ -27,10 +27,10 @@ It combines a FastAPI backend, a React dashboard, hardware-aware robot runtime c
 ```bash
 git submodule update --init vendor/lerobot
 uv sync
-uv run openpibot run
+uv run openpibot run --log-file .openpibot/logs/server.log
 ```
 
-`openpibot run` builds `dashboard/frontend` with `pnpm` before starting the backend. Use `--no-build-dashboard` if you are running a separate frontend dev server.
+`openpibot run` builds `dashboard/frontend` with `pnpm` before starting the backend and writes server logs to `.openpibot/logs/server.log` by default. Use `--no-build-dashboard` if you are running a separate frontend dev server.
 
 Open the dashboard at `http://localhost:5000`.
 
@@ -48,8 +48,8 @@ Typical first run:
 
 | Command | Purpose |
 |---|---|
-| `uv run openpibot run --host 0.0.0.0` | Build the dashboard and run the OpenPiBot backend on port 5000 |
-| `uv run openpibot run --reload --no-build-dashboard` | Run the backend with reload on port 5000 |
+| `uv run openpibot run --host 0.0.0.0 --log-file .openpibot/logs/server.log` | Build the dashboard and run the OpenPiBot backend on port 5000 with file logging |
+| `uv run openpibot run --reload --no-build-dashboard --log-file .openpibot/logs/server.log` | Run the backend with reload on port 5000 and write logs to file |
 | `pnpm --dir dashboard/frontend dev` | Run the Vite frontend dev server |
 | `pnpm --dir dashboard/frontend build` | Build the dashboard manually |
 | `uv run openpibot info` | Print project and robot configuration |

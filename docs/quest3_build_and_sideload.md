@@ -38,7 +38,7 @@ From the repository root:
 
 ```bash
 export XLE_QUEST_PAIRING_TOKEN="dev-quest-token"
-uv run openpibot run --no-build-dashboard
+uv run openpibot run --no-build-dashboard --log-file .openpibot/logs/server.log
 ```
 
 Open the dashboard from another browser tab:
@@ -259,8 +259,11 @@ vr:
 The Quest app includes `XLeRobotAndroidRtpVideoReceiver`, which listens on the
 configured UDP ports in Android Quest builds, depacketizes RTP/H.264, decodes
 with Android `MediaCodec`, and uploads decoded RGBA frames into Unity
-`Texture2D` surfaces. The optional Pollen/Reachy `GstreamerWebRTC` event adapter
-is still available for future WebRTC service integration.
+`Texture2D` surfaces. On the backend, Quest RTP is fed by the shared
+`CameraService` instead of opening `/dev/video*` directly, so headset video can
+stay on while LeRobot recording captures the same camera roles. The optional
+Pollen/Reachy `GstreamerWebRTC` event adapter is still available for future
+WebRTC service integration.
 
 If the camera feed is too dark in-headset, tune `brightness`, `contrast`, and
 `saturation` under `vr.quest_video`, then restart the backend or stop/start Quest

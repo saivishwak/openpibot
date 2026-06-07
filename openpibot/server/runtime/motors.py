@@ -208,7 +208,8 @@ class _ArmSession:
         prefixed keys for the OTHER arm are silently dropped (defensive — the bimanual
         wrapper routes per-side, but stray keys shouldn't crash).
 
-        Returns the dict that was actually sent (after bounds clamping).
+        Returns the dict that was actually sent (after bounds clamping and
+        SOFollower's max_relative_target safety clamping).
         """
         with self._lock:
             if self._arm is None:
@@ -228,8 +229,20 @@ class _ArmSession:
                 f"{pj.removeprefix(prefix)}.pos": v
                 for pj, v in clamped.items()
             }
-            self._arm.send_action(arm_action)
-            return clamped
+            sent_raw = self._arm.send_action(arm_action)
+            sent: dict[str, float] = {}
+            for raw_key, raw_val in sent_raw.items():
+                motor = str(raw_key).removesuffix(".pos")
+                pj = f"{prefix}{motor}"
+                if pj in clamped:
+                    sent[pj] = float(raw_val)
+
+            missing = sorted(set(clamped) - set(sent))
+            if missing:
+                raise RuntimeError(
+                    f"{self._side} arm send_action did not report sent goals for {missing}"
+                )
+            return sent
 
     # ── internals ─────────────────────────────────────────────────────────
     def _open_arm(self):
@@ -303,8 +316,8 @@ class _ArmSession:
                 for motor in arm.bus.motors:
                     if motor == "gripper":
                         continue
-                    arm.bus.write("P_Coefficient", motor, 20)
-            log.info("%s arm motors: P_Coefficient = 20 (was 16 from lerobot default)",
+                    arm.bus.write("P_Coefficient", motor, 24)
+            log.info("%s arm motors: P_Coefficient = 24 (was 16 from lerobot default)",
                      self._side)
         except Exception as e:
             log.warning("could not stiffen motor PID on %s: %s", self._side, e)

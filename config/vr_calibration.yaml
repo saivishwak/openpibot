@@ -202,7 +202,7 @@ profiles:
         fit_error_cm: 2.4239510219665386
         calibration_quality: good
         verified_at: '2026-06-06T12:14:24'
-        low_scale_test_completed: false
+        low_scale_test_completed: true
         robot_verified_samples:
         - label: forward
           robot_start: [0.19521379032763347, 0.09614728308179059, 0.05279759535941715]

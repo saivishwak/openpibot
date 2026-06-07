@@ -20,6 +20,16 @@ uv run python scripts/finetune_pi05.py \
 
 Notes:
 - Do not pass `--resume` for a fresh run.
+- The wrapper defaults `--dataset-root` from `config/xlerobot.yaml` and uses
+  `--video-backend pyav`, avoiding local TorchCodec/FFmpeg compatibility issues.
+- Before a long run, validate dataset loading and video decode:
+
+```bash
+uv run python scripts/finetune_pi05.py \
+  --dataset-repo-id saivishwak/xlerobot-vr-teleop-medicine-bowl \
+  --check-only
+```
+
 - Checkpoints are written under `outputs/pi05_finetune_v2/checkpoints/`.
 - Latest checkpoint path is `outputs/pi05_finetune_v2/checkpoints/last/pretrained_model`.
 
@@ -130,6 +140,8 @@ observation.images.right_wrist -> observation.images.right_wrist_0_rgb
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--dataset-repo-id` | yaml `dataset.repo_id` | Hugging Face / local LeRobot dataset id |
+| `--dataset-root` | yaml `dataset.root` | Local LeRobot dataset root; expanded before launching `lerobot-train` |
+| `--video-backend` | `pyav` | Dataset video decoder backend passed to training |
 | `--pretrained-path` | `lerobot/pi05_base` | Base or checkpoint to finetune from (HF id or local `.../pretrained_model`) |
 | `--output-dir` | `outputs/pi05_finetune` | Run directory; checkpoints under `<output-dir>/checkpoints/` |
 | `--job-name` | `pi05_finetune_xlerobot` | Training job name (logs / W&B) |
@@ -151,6 +163,8 @@ observation.images.right_wrist -> observation.images.right_wrist_0_rgb
 | `--resume` | off | Continue **same** run (optimizer + scheduler state from checkpoint) |
 | `--resume-from` | — | Checkpoint dir or `train_config.json` (default: `<output-dir>/checkpoints/last/...`) |
 | `--dry-run` | off | Print `lerobot-train` command without running |
+| `--check-only` | off | Validate dataset loading/decoding, then exit before training |
+| `--skip-dataset-check` | off | Skip the preflight dataset check before training |
 
 ### Training scope vs batch size
 

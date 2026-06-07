@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import time
 from typing import Any
 
@@ -12,6 +13,7 @@ from openpibot.server.runtime.native_quest import MAX_NATIVE_QUEST_PACKET_BYTES,
 from openpibot.server.runtime import quest_video_bridge
 
 router = APIRouter(prefix="/api/vr", tags=["vr"])
+log = logging.getLogger(__name__)
 
 QUEST_WS_OPERATOR_STATUS_INTERVAL_S = 0.5
 
@@ -389,12 +391,27 @@ def recording(body: dict[str, Any] | None = Body(default=None)) -> dict[str, Any
     payload = body or {}
     if "enabled" not in payload:
         raise HTTPException(status_code=400, detail="enabled required")
+    enabled = bool(payload["enabled"])
     task = str(payload.get("task") or "")
     root = str(payload.get("root") or "")
-    if bool(payload["enabled"]) and not task.strip():
-        raise HTTPException(status_code=400, detail="task description required before starting an episode")
-    vr_mod.SESSION.set_recording(bool(payload["enabled"]), task=task, root=root)
-    return vr_mod.SESSION.status()
+    log.info(
+        "HTTP recording request enabled=%s task_present=%s root_override=%s",
+        enabled,
+        bool(task.strip()),
+        bool(root.strip()),
+    )
+    ok = vr_mod.SESSION.set_recording(enabled, task=task, root=root, source="webapp")
+    status_out = vr_mod.SESSION.status()
+    if enabled and not ok:
+        info = status_out.get("recording_info") or {}
+        reason = (
+            status_out.get("last_error")
+            or info.get("notice")
+            or "recording did not start"
+        )
+        log.warning("HTTP recording start failed: %s", reason)
+        raise HTTPException(status_code=409, detail=str(reason))
+    return status_out
 
 
 @router.post("/recording/task")

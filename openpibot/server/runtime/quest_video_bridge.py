@@ -1,8 +1,9 @@
 """Quest video bridge descriptors for low-latency GStreamer/WebRTC streaming.
 
-The camera capture owner remains `runtime.cameras`. This module only resolves
-camera roles and builds explicit GStreamer launch descriptors that a Quest video
-bridge process can use without changing dataset/inference camera semantics.
+The camera capture owner is `runtime.cameras.CameraService`. Quest video shares
+that service with dashboard preview, LeRobot recording, and inference, then
+pipes JPEG frames into GStreamer for H.264/RTP publishing. It must not open the
+same `/dev/video*` devices directly.
 """
 from __future__ import annotations
 
@@ -144,6 +145,7 @@ class QuestVideoBridgeManager:
     def __init__(self) -> None:
         self._lock = threading.RLock()
         self._processes: dict[str, subprocess.Popen] = {}
+        self._pumpers: dict[str, tuple[threading.Thread, threading.Event]] = {}
         self._errors: dict[str, str] = {}
         self._quest_host: str | None = None
         self._started_at: float | None = None
@@ -163,8 +165,17 @@ class QuestVideoBridgeManager:
             missing = [role for role in expected_roles if role not in configured]
             gst_available = shutil.which("gst-launch-1.0") is not None
             running_roles = [role for role, proc in self._processes.items() if proc.poll() is None]
+            errored_roles = [
+                role for role in expected_roles
+                if role in self._errors and role in running_roles
+            ]
             return {
-                "ready": not missing and gst_available and len(running_roles) == len(expected_roles),
+                "ready": (
+                    not missing
+                    and not errored_roles
+                    and gst_available
+                    and len(running_roles) == len(expected_roles)
+                ),
                 "transport": "gstreamer-rtp-h264",
                 "gst_available": gst_available,
                 "running": bool(running_roles),
@@ -179,6 +190,7 @@ class QuestVideoBridgeManager:
                 "flip_method": config["flip_method"],
                 "running_roles": running_roles,
                 "missing_roles": missing,
+                "errored_roles": errored_roles,
                 "suspended_capture_roles": cameras.suspended_capture_roles(),
                 "receive_health": dict(self._receive_health),
                 "streams": [stream.to_dict() for stream in streams],
@@ -199,16 +211,19 @@ class QuestVideoBridgeManager:
             raise ValueError(f"roles must be from {configured_roles}, got {invalid}")
         with self._lock:
             self._reap_locked()
+            running_for_other_host = (
+                self._quest_host is not None
+                and self._quest_host != host
+                and any(proc.poll() is None for proc in self._processes.values())
+            )
+        if running_for_other_host:
+            self.stop()
+        with self._lock:
+            self._reap_locked()
             streams = {stream.role: stream for stream in discover_streams()}
             missing = [role for role in requested if role not in streams]
             if missing:
                 raise RuntimeError(f"missing camera roles: {', '.join(missing)}")
-            contended = sorted(set(requested) & set(cameras.active_capture_roles()))
-            if contended:
-                cameras.suspend_capture_roles(
-                    contended,
-                    reason="Quest RTP video is using this camera",
-                )
             self._quest_host = host
             self._started_at = time.time()
             try:
@@ -223,39 +238,70 @@ class QuestVideoBridgeManager:
                         port=stream.udp_port,
                         bitrate_kbps=config["bitrate_kbps"],
                     )
+                    stop_evt = threading.Event()
                     self._processes[role] = subprocess.Popen(
                         ["gst-launch-1.0", "-q", *shlex.split(command)],
+                        stdin=subprocess.PIPE,
                         stdout=subprocess.DEVNULL,
-                        stderr=subprocess.DEVNULL,
+                        stderr=subprocess.PIPE,
                     )
+                    thread = threading.Thread(
+                        target=self._pump_camera_frames,
+                        args=(role, stream, self._processes[role], stop_evt),
+                        daemon=True,
+                        name=f"quest-video-pump-{role}",
+                    )
+                    self._pumpers[role] = (thread, stop_evt)
+                    thread.start()
                     self._errors.pop(role, None)
             except Exception:
+                for thread, stop_evt in self._pumpers.values():
+                    stop_evt.set()
                 for proc in self._processes.values():
+                    try:
+                        if proc.stdin is not None:
+                            proc.stdin.close()
+                    except Exception:
+                        pass
                     if proc.poll() is None:
                         proc.terminate()
                 self._processes.clear()
+                self._pumpers.clear()
                 self._quest_host = None
                 self._started_at = None
-                cameras.resume_capture_roles(requested)
                 raise
             return self.status()
 
     def stop(self) -> dict[str, Any]:
         with self._lock:
-            roles_to_resume = list(_video_config()["roles"])
-            for proc in self._processes.values():
+            pumpers = list(self._pumpers.values())
+            processes = list(self._processes.values())
+            for _thread, stop_evt in pumpers:
+                stop_evt.set()
+            for proc in processes:
+                try:
+                    if proc.stdin is not None:
+                        proc.stdin.close()
+                except Exception:
+                    pass
                 if proc.poll() is None:
                     proc.terminate()
-            deadline = time.monotonic() + 2.0
-            for proc in self._processes.values():
-                while proc.poll() is None and time.monotonic() < deadline:
-                    time.sleep(0.05)
-                if proc.poll() is None:
-                    proc.kill()
+
+        deadline = time.monotonic() + 2.0
+        for proc in processes:
+            while proc.poll() is None and time.monotonic() < deadline:
+                time.sleep(0.05)
+            if proc.poll() is None:
+                proc.kill()
+        for thread, _stop_evt in pumpers:
+            if thread.is_alive():
+                thread.join(timeout=1.0)
+
+        with self._lock:
             self._processes.clear()
+            self._pumpers.clear()
             self._quest_host = None
             self._started_at = None
-            cameras.resume_capture_roles(roles_to_resume)
             return self.status()
 
     def report_receive_health(self, payload: dict[str, Any]) -> dict[str, Any]:
@@ -279,8 +325,86 @@ class QuestVideoBridgeManager:
         for role, proc in list(self._processes.items()):
             if proc.poll() is None:
                 continue
-            self._errors[role] = f"gst exited with code {proc.returncode}"
+            stderr = ""
+            try:
+                if proc.stderr is not None:
+                    stderr = proc.stderr.read().decode(errors="replace").strip()
+            except Exception:
+                stderr = ""
+            detail = f": {stderr[-500:]}" if stderr else ""
+            self._errors[role] = f"gst exited with code {proc.returncode}{detail}"
+            pumper = self._pumpers.pop(role, None)
+            if pumper is not None:
+                _thread, stop_evt = pumper
+                stop_evt.set()
             del self._processes[role]
+
+    def _pump_camera_frames(
+        self,
+        role: str,
+        stream: QuestVideoStream,
+        proc: subprocess.Popen,
+        stop_evt: threading.Event,
+    ) -> None:
+        period = 1.0 / max(int(stream.fps), 1)
+        camera_stream = None
+        try:
+            while not stop_evt.is_set() and proc.poll() is None:
+                t0 = time.monotonic()
+                if camera_stream is None or camera_stream.stop_evt.is_set():
+                    if camera_stream is not None:
+                        camera_stream.release()
+                        camera_stream = None
+                    camera_stream = cameras.get_stream(role)
+                    if camera_stream is None:
+                        with self._lock:
+                            self._errors[role] = "camera stream unavailable"
+                        self._terminate_process(proc)
+                        return
+                    camera_stream.acquire()
+                    if camera_stream.stop_evt.is_set():
+                        continue
+                jpeg = camera_stream.get_jpeg(timeout=1.0)
+                if jpeg is None:
+                    with self._lock:
+                        self._errors[role] = camera_stream.last_error or "camera produced no JPEG frame"
+                    time.sleep(min(period, 0.1))
+                    continue
+                try:
+                    if proc.stdin is None:
+                        break
+                    proc.stdin.write(jpeg)
+                    proc.stdin.flush()
+                    with self._lock:
+                        self._errors.pop(role, None)
+                except (BrokenPipeError, OSError, ValueError) as e:
+                    with self._lock:
+                        self._errors[role] = f"gst stdin closed: {e}"
+                    break
+                dt = time.monotonic() - t0
+                if dt < period:
+                    time.sleep(period - dt)
+        finally:
+            if camera_stream is not None:
+                camera_stream.release()
+            try:
+                if proc.stdin is not None:
+                    proc.stdin.close()
+            except Exception:
+                pass
+
+    @staticmethod
+    def _terminate_process(proc: subprocess.Popen) -> None:
+        try:
+            if proc.stdin is not None:
+                proc.stdin.close()
+        except Exception:
+            pass
+        try:
+            if proc.poll() is None:
+                proc.terminate()
+        except Exception:
+            pass
 
 
 _MANAGER = QuestVideoBridgeManager()
@@ -321,23 +445,19 @@ def _gst_launch_for_camera(
     port: int | None = None,
     bitrate_kbps: int | None = None,
 ) -> str:
-    caps_fourcc = "MJPG" if str(spec.fourcc).upper() in {"MJPG", "MJPEG"} else str(spec.fourcc).upper()
-    caps = (
-        f"video/x-raw,width={spec.width},height={spec.height},framerate={spec.fps}/1"
-        if caps_fourcc not in {"MJPG", "MJPEG"}
-        else f"image/jpeg,width={spec.width},height={spec.height},framerate={spec.fps}/1"
-    )
-    decode = "jpegdec ! " if caps_fourcc in {"MJPG", "MJPEG"} else ""
-    device_path = spec.path if hasattr(spec, "path") else spec.device_path
     transform = _video_transform_pipeline()
     encoder = _h264_encoder_pipeline(int(bitrate_kbps or QUEST_VIDEO_BITRATE_KBPS))
     pipeline = (
-        f"v4l2src device={device_path} do-timestamp=true ! "
-        f"{caps} ! {decode}videoconvert ! {transform}"
+        "fdsrc fd=0 do-timestamp=true ! "
+        "image/jpeg,framerate={fps}/1 ! "
+        "jpegparse ! jpegdec ! videoconvert ! videoscale ! videorate ! "
+        f"video/x-raw,width={spec.width},height={spec.height},framerate={spec.fps}/1 ! "
+        f"{transform}"
         "queue leaky=downstream max-size-buffers=1 ! "
+        "videoconvert ! "
         f"{encoder} ! "
         "rtph264pay config-interval=1 pt=96"
-    )
+    ).format(fps=spec.fps)
     if host is not None and port is not None:
         pipeline += f" ! udpsink host={host} port={port} sync=false async=false"
     return pipeline

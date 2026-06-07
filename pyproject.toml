@@ -24,6 +24,7 @@ dependencies = [
 
 [project.scripts]
 openpibot = "openpibot.cli:app"
+lerobot-dataset-viz = "openpibot.tools.lerobot_dataset_viz:main"
 
 [build-system]
 requires = ["hatchling"]

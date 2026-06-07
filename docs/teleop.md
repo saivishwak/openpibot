@@ -20,7 +20,7 @@ For the full end-to-end runtime path, see [architecture.md](architecture.md).
 ## Per-session flow
 
 1. **Set a pairing token** before starting the backend:
-   `XLE_QUEST_PAIRING_TOKEN=<shared-secret> uv run openpibot run`.
+   `XLE_QUEST_PAIRING_TOKEN=<shared-secret> uv run openpibot run --log-file .openpibot/logs/server.log`.
 2. **Open the dashboard**: `http://<workstation>:5000`. Click *Connect* on each arm you want to use.
 3. **Launch the OpenPiBot Quest app** on the headset. In the app, connect to the
    tokenized `ws://<workstation>:5000/api/vr/quest/ws?token=...` endpoint shown
@@ -41,7 +41,9 @@ For the full end-to-end runtime path, see [architecture.md](architecture.md).
 The native path uses backend-managed GStreamer H.264/RTP pipelines for low-latency
 camera delivery. Install `gst-launch-1.0` on the workstation and configure the
 `head`, `left_wrist`, and `right_wrist` camera roles before expecting video to be
-ready.
+ready. Quest video, dashboard preview, LeRobot recording, and inference all read
+from the backend `CameraService`; the Quest video bridge must not open `/dev/video*`
+directly or suspend the recording cameras.
 
 The headset default view is robot-camera-only on a dark operator scene. Quest
 passthrough is disabled so dataset operators focus on what the robot sees. Hold

@@ -35,6 +35,10 @@ import yaml
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 CONFIG_YAML = REPO_ROOT / "config" / "xlerobot.yaml"
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from openpibot.server.runtime.homing import JointHomingController
 
 # Must match openpibot/server/runtime/dataset.py JOINT_ORDER (LeRobot action / observation.state).
 _JOINTS_PER_ARM = (
@@ -68,9 +72,20 @@ _JOINT_DEADBAND_DEG: dict[str, float] = {
 }
 _FINAL_SMOOTHING_BYPASS = {"wrist_flex", "wrist_roll", "gripper"}
 _HOMING_TOL_DEG = 0.5
+_HOMING_PRESENT_TOL_DEG = 1.0
+_HOMING_SETTLE_TICKS = 5
 _HOMING_KP = 0.75
 # VR recording uses KP=1.0 → action label is rate-limited absolute command (see _shape_action_like_recording).
 _DEFAULT_VR_KP = 1.0
+
+
+def _normalize_joint_name(name: str) -> str:
+    return str(name).removesuffix(".pos")
+
+
+def _robot_pos_key(name: str) -> str:
+    base = _normalize_joint_name(name)
+    return f"{base}.pos"
 
 
 def _load_yaml() -> dict[str, Any]:
@@ -634,12 +649,13 @@ def go_to_home_pose(
     """Rate-limited move to `robot.home_pose` joint targets (degrees)."""
     targets = {f"{name}.pos": deg for name, deg in home_pose.items()}
     keys = list(targets.keys())
-    last_sent: dict[str, float] = {}
     dt = 1.0 / fps
     deadline = time.perf_counter() + timeout_s
     if episode_deadline is not None:
         deadline = min(deadline, episode_deadline)
     paused_lerobot_cams = False
+    controller: JointHomingController | None = None
+    last_step = None
 
     print(f"Homing to saved pose ({len(keys)} joints, timeout={timeout_s:.0f}s)...")
     if getattr(robot, "cameras", None):
@@ -652,26 +668,23 @@ def go_to_home_pose(
             loop_start = time.perf_counter()
             obs = _read_motor_observation(robot)
             present = {k: float(obs[k]) for k in keys if k in obs}
+            if controller is None:
+                controller = JointHomingController(
+                    targets=targets,
+                    present=present,
+                    cap_for_key=lambda key: _cap_for_joint_key(key, caps),
+                    kp=_HOMING_KP,
+                    command_tolerance_deg=_HOMING_TOL_DEG,
+                    present_tolerance_deg=_HOMING_PRESENT_TOL_DEG,
+                    settle_ticks=_HOMING_SETTLE_TICKS,
+                )
 
-            clamped: dict[str, float] = {}
-            converged = True
-            for key, target in targets.items():
-                cap = _cap_for_joint_key(key, caps)
-                prev = last_sent.get(key, present.get(key, target))
-                step = max(-cap, min(cap, target - prev))
-                clamped[key] = prev + step
-                if abs(clamped[key] - target) > _HOMING_TOL_DEG:
-                    converged = False
+            step = controller.step(present)
+            last_step = step
+            _send_positions(robot, step.command, present=present)
 
-            command = {
-                key: present.get(key, tgt) + _HOMING_KP * (tgt - present.get(key, tgt))
-                for key, tgt in clamped.items()
-            }
-            _send_positions(robot, command, present=present)
-            last_sent = dict(command)
-
-            if converged:
-                print("Home pose reached.")
+            if step.settled:
+                print(f"Home pose reached (max feedback error {step.max_present_error_deg:.2f} deg).")
                 return
 
             remaining = dt - (time.perf_counter() - loop_start)
@@ -681,7 +694,14 @@ def go_to_home_pose(
         if episode_deadline is not None and _episode_timed_out(episode_deadline):
             print("Warning: homing stopped (episode wall-clock limit).")
         else:
-            print("Warning: homing timed out; continuing anyway.")
+            if last_step is None:
+                print("Warning: homing timed out before a motor observation was available; continuing anyway.")
+            else:
+                joint = f" at {last_step.worst_present_joint}" if last_step.worst_present_joint else ""
+                print(
+                    "Warning: homing timed out; continuing anyway "
+                    f"(max feedback error {last_step.max_present_error_deg:.2f} deg{joint})."
+                )
     finally:
         if paused_lerobot_cams:
             from _opencv_camera_patch import resume_lerobot_cameras
@@ -874,7 +894,7 @@ def _actions_to_robot_dict(action_row: torch.Tensor, joint_names: list[str]) -> 
     row = action_row.detach().cpu().numpy().reshape(-1)
     if row.shape[0] != len(joint_names):
         raise ValueError(f"expected {len(joint_names)} action dims, got {row.shape[0]}")
-    return {f"{name}.pos": float(row[i]) for i, name in enumerate(joint_names)}
+    return {_robot_pos_key(name): float(row[i]) for i, name in enumerate(joint_names)}
 
 
 def main() -> None:
@@ -997,12 +1017,13 @@ def main() -> None:
     _verify_policy_checkpoint(policy_path, policy)
 
     policy_joint_names = list(policy.config.action_feature_names or [])
-    if len(policy_joint_names) != 12:
-        sys.exit(f"expected 12 action joints in checkpoint config, got {len(policy_joint_names)}")
-    if policy_joint_names != JOINT_ORDER:
+    normalized_policy_joint_names = [_normalize_joint_name(name) for name in policy_joint_names]
+    if len(normalized_policy_joint_names) != 12:
+        sys.exit(f"expected 12 action joints in checkpoint config, got {len(normalized_policy_joint_names)}")
+    if normalized_policy_joint_names != JOINT_ORDER:
         print(
             "Warning: checkpoint action_feature_names order differs from dataset "
-            f"JOINT_ORDER.\n  checkpoint: {policy_joint_names}\n  dataset:   {JOINT_ORDER}"
+            f"JOINT_ORDER.\n  checkpoint: {policy_joint_names}\n  normalized:{normalized_policy_joint_names}\n  dataset:   {JOINT_ORDER}"
         )
 
     preprocessor, postprocessor = make_pre_post_processors(

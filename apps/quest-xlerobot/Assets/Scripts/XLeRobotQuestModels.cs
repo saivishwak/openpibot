@@ -52,9 +52,13 @@ namespace XLeRobot.QuestTeleop
         public int native_quest_clients;
         public int native_quest_last_seen_ms;
         public bool recording_active;
+        public bool recording_armed;
         public int recording_frames;
         public int recording_episodes_saved;
         public bool recording_ready;
+        public bool recording_start_allowed;
+        public bool recording_anchor_pending;
+        public string recording_notice = "";
         public bool dual_mode;
         public bool engaged;
         public bool video_ready;
@@ -65,6 +69,8 @@ namespace XLeRobot.QuestTeleop
         public string[] video_running_roles = Array.Empty<string>();
         public string[] ready_blockers = Array.Empty<string>();
         public string[] recording_blockers = Array.Empty<string>();
+        public string[] recording_start_blockers = Array.Empty<string>();
+        public string[] recording_anchor_blockers = Array.Empty<string>();
         public string[] connected_arms = Array.Empty<string>();
         public string active_arm = "";
         public bool calibration_active;
@@ -102,7 +108,10 @@ namespace XLeRobot.QuestTeleop
 
         public bool NativeQuestReady => native_quest_ready;
         public bool RecordingActive => recording_active;
+        public bool RecordingArmed => recording_armed;
         public bool RecordingReady => recording_ready;
+        public bool RecordingStartAllowed => recording_start_allowed;
+        public bool RecordingAnchorPending => recording_anchor_pending;
         public bool VideoReady => video_ready;
         public bool VideoRunning => video_running;
         public bool CalibrationActive => calibration_active;

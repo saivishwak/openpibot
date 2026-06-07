@@ -373,7 +373,7 @@ namespace XLeRobot.QuestTeleop
             GameObject obj = new GameObject(name);
             obj.transform.SetParent(parent, false);
             RawImage image = obj.AddComponent<RawImage>();
-            image.color = Color.white;
+            image.color = new Color(0.015f, 0.02f, 0.028f, 1.0f);
             RectTransform rect = obj.GetComponent<RectTransform>();
             rect.anchoredPosition = position;
             rect.sizeDelta = size;

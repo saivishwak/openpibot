@@ -13,9 +13,10 @@ Episode boundary control:
   - `end_episode()` is called on the next falling edge.
   - `finalize()` flushes everything to disk and (optionally) pushes to the Hub.
 
-Camera frames come from `openpibot.server.runtime.cameras.get_stream(role).snapshot()`
-which returns JPEG bytes — we decode once per frame to keep CameraStream's
-existing single-frame producer architecture untouched.
+Camera frames come from episode-scoped `CameraStream` handles owned by the
+recorder while an episode is active. Recording reads fresh raw RGB snapshots
+directly; Quest/dashboard video may consume JPEG/H.264 from the same producer
+without becoming part of the dataset frame path.
 """
 from __future__ import annotations
 
@@ -26,9 +27,10 @@ import pathlib
 import shutil
 import threading
 import time
+from collections.abc import Mapping
 from typing import Any, Optional
 
-import cv2  # decode JPEG → numpy (BGR)
+import cv2
 import numpy as np
 import yaml
 
@@ -44,6 +46,7 @@ log = logging.getLogger(__name__)
 JOINT_ORDER: list[str] = [
     f"{side}_arm_{j}" for side in ("left", "right") for j in JOINTS_PER_ARM
 ]
+LEROBOT_JOINT_NAMES: list[str] = [f"{name}.pos" for name in JOINT_ORDER]
 REQUIRED_CAMERA_ROLES: tuple[str, ...] = ("head", "left_wrist", "right_wrist")
 
 
@@ -78,8 +81,10 @@ class DatasetRecorder:
         self._current_task: str = ""
         self._last_saved_episode_index: Optional[int] = None
         self._last_saved_episode_frames: int = 0
+        self._camera_streams: dict[str, cam_mod.CameraStream] = {}
+        self._last_end_reason: str = ""
 
-        features = self._build_features(JOINT_ORDER, self.camera_roles, self.camera_shape)
+        features = self._build_features(LEROBOT_JOINT_NAMES, self.camera_roles, self.camera_shape)
         resolved_root = pathlib.Path(resolve_root(str(root) if root else None, repo_id))
         has_info = (resolved_root / "meta" / "info.json").is_file()
         has_episode_meta = any((resolved_root / "meta" / "episodes").glob("*/*.parquet"))
@@ -88,7 +93,7 @@ class DatasetRecorder:
                 repo_id=repo_id,
                 root=str(resolved_root),
                 revision="main",
-                image_writer_threads=2,
+                image_writer_threads=0,
             )
         else:
             needs_create = True
@@ -121,7 +126,7 @@ class DatasetRecorder:
                                     isinstance(v, dict) and v.get("dtype") == "video"
                                     for v in (info.get("features") or {}).values()
                                 ),
-                                image_writer_threads=2,
+                                image_writer_threads=0,
                             )
                             self._dataset.finalize()
                             shutil.rmtree(backup, ignore_errors=True)
@@ -146,7 +151,7 @@ class DatasetRecorder:
                     root=str(resolved_root),
                     robot_type="xlerobot-bimanual-so101",
                     use_videos=True,                     # MP4-encode image streams
-                    image_writer_threads=2,              # async JPEG → video encode
+                    image_writer_threads=0,              # strict sync write; surface bad frames immediately
                 )
         self._episode_count = int(getattr(self._dataset.meta, "total_episodes", 0))
         if self._episode_count > 0:
@@ -213,14 +218,55 @@ class DatasetRecorder:
             return self._last_saved_episode_frames
 
     def start_episode(self, task: str = "") -> None:
+        acquired: dict[str, cam_mod.CameraStream] = {}
         with self._lock:
             if self._in_episode:
                 log.warning("start_episode called while already in episode; ignoring")
                 return
+            try:
+                acquired = self._acquire_camera_streams()
+            except Exception:
+                self._release_camera_streams(acquired)
+                raise
             self._in_episode = True
             self._frame_count = 0
             self._current_task = task or "bimanual-vr-teleop"
+            self._camera_streams = acquired
+            self._last_end_reason = ""
             log.info("episode %d started (task=%r)", self._episode_count + 1, self._current_task)
+
+    def _acquire_camera_streams(self) -> dict[str, cam_mod.CameraStream]:
+        streams: dict[str, cam_mod.CameraStream] = {}
+        try:
+            for role in self.camera_roles:
+                stream = cam_mod.get_stream(role)
+                if stream is None:
+                    raise RuntimeError(f"camera stream unavailable for role: {role}")
+                stream.acquire()
+                streams[role] = stream
+                frame = stream.get_rgb(timeout=3.0, max_age_s=1.0, copy=True)
+                normalized = _normalize_rgb_frame(frame, self.camera_shape)
+                problem = _camera_frame_problem(normalized, self.camera_shape)
+                if problem:
+                    detail = stream.last_error or "no fresh RGB frame"
+                    raise RuntimeError(f"camera {role} did not produce a valid fresh frame: {problem}; {detail}")
+            return streams
+        except Exception:
+            self._release_camera_streams(streams)
+            raise
+
+    @staticmethod
+    def _release_camera_streams(streams: Mapping[str, cam_mod.CameraStream]) -> None:
+        for role, stream in list(streams.items()):
+            try:
+                stream.release()
+            except Exception as e:
+                log.warning("release camera stream %s failed: %s", role, e)
+
+    def _take_camera_streams_locked(self) -> dict[str, cam_mod.CameraStream]:
+        streams = self._camera_streams
+        self._camera_streams = {}
+        return streams
 
     def end_episode(self) -> bool:
         """Save the current episode buffer to disk. Returns True if saved, False
@@ -231,14 +277,18 @@ class DatasetRecorder:
                 return False
             had_frames = self._frame_count > 0
             self._in_episode = False
+            streams = self._take_camera_streams_locked()
             if not had_frames:
                 # Discard empty buffer rather than save a 0-frame episode.
                 try: self._dataset.clear_episode_buffer()
                 except Exception as e: log.warning("clear_episode_buffer: %s", e)
+                self._release_camera_streams(streams)
+                self._last_end_reason = "episode discarded because no frames were captured"
                 log.info("episode discarded (0 frames)")
                 return False
             episode_count = self._episode_count + 1
             frame_count = self._frame_count
+        self._release_camera_streams(streams)
         # Save outside the lock — save_episode does I/O + may take a while
         # (especially with batch_encoding_size=1, the video gets encoded now).
         try:
@@ -250,9 +300,11 @@ class DatasetRecorder:
                 self._last_saved_episode_frames = frame_count
             log.info("episode %d saved (%d frames)",
                      episode_count, frame_count)
+            self._last_end_reason = ""
             return True
         except Exception as e:
             log.exception("save_episode failed: %s", e)
+            self._last_end_reason = f"save_episode failed: {e}"
             return False
 
     def add_frame(self, action: dict[str, float],
@@ -269,7 +321,7 @@ class DatasetRecorder:
                 return
             self._validate_joint_dict("action", action)
             self._validate_joint_dict("observation.state", present)
-            self._validate_camera_frames(camera_frames)
+            camera_frames = self._normalize_and_validate_camera_frames(camera_frames)
             action_vec  = self._joint_dict_to_array(action)
             present_vec = self._joint_dict_to_array(present)
 
@@ -282,9 +334,27 @@ class DatasetRecorder:
                 img = camera_frames.get(role)
                 frame[f"observation.images.{role}"] = img
 
-            with self._io_lock:
-                self._dataset.add_frame(frame)
+            try:
+                with self._io_lock:
+                    self._dataset.add_frame(frame)
+            except Exception as e:
+                raise RuntimeError(
+                    f"LeRobot add_frame rejected validated frame: {e}; "
+                    f"camera details: {self._camera_frame_details(camera_frames)}"
+                ) from e
             self._frame_count += 1
+            self._last_end_reason = ""
+
+    def grab_camera_frames(self) -> dict[str, Optional[np.ndarray]]:
+        with self._lock:
+            streams = dict(self._camera_streams)
+            expected_shape = self.camera_shape
+        return grab_camera_frames(streams=streams, expected_shape=expected_shape)
+
+    @property
+    def last_end_reason(self) -> str:
+        with self._lock:
+            return self._last_end_reason
 
     @staticmethod
     def _validate_joint_dict(label: str, joints: dict[str, float]) -> None:
@@ -309,15 +379,36 @@ class DatasetRecorder:
             raise RuntimeError(f"camera frames missing roles: {', '.join(missing)}")
         bad: list[str] = []
         for role in self.camera_roles:
-            img = camera_frames.get(role)
-            if not isinstance(img, np.ndarray):
-                bad.append(role)
-                continue
-            if img.shape != self.camera_shape or img.dtype != np.uint8:
-                bad.append(role)
+            problem = _camera_frame_problem(camera_frames.get(role), self.camera_shape)
+            if problem:
+                bad.append(f"{role}: {problem}")
         if bad:
             shape = "x".join(str(v) for v in self.camera_shape)
-            raise RuntimeError(f"camera frames invalid for roles {', '.join(bad)}; expected uint8 RGB shape {shape}")
+            raise RuntimeError(
+                "camera frames invalid; expected uint8 RGB shape "
+                f"{shape}; got " + "; ".join(bad)
+            )
+
+    def _normalize_and_validate_camera_frames(
+        self,
+        camera_frames: dict[str, Optional[np.ndarray]],
+    ) -> dict[str, np.ndarray]:
+        normalized: dict[str, np.ndarray] = {}
+        for role, frame in camera_frames.items():
+            normalized_frame = _normalize_rgb_frame(frame, self.camera_shape)
+            if isinstance(normalized_frame, np.ndarray):
+                normalized[role] = normalized_frame
+            else:
+                normalized[role] = normalized_frame  # type: ignore[assignment]
+        self._validate_camera_frames(normalized)
+        return normalized
+
+    @staticmethod
+    def _camera_frame_details(camera_frames: dict[str, Optional[np.ndarray]]) -> str:
+        return "; ".join(
+            f"{role}: {_camera_frame_detail(frame)}"
+            for role, frame in camera_frames.items()
+        )
 
     @staticmethod
     def _joint_dict_to_array(joints: dict[str, float]) -> np.ndarray:
@@ -335,12 +426,16 @@ class DatasetRecorder:
             if self._in_episode and self._frame_count > 0:
                 # Save the in-flight episode before finalizing.
                 self._in_episode = False
+                streams = self._take_camera_streams_locked()
                 try:
                     with self._io_lock:
                         self._dataset.save_episode()
                     self._episode_count += 1
                 except Exception as e:
                     log.warning("finalize: save_episode failed: %s", e)
+            else:
+                streams = self._take_camera_streams_locked()
+        self._release_camera_streams(streams)
         try:
             with self._io_lock:
                 self._dataset.finalize()
@@ -361,6 +456,8 @@ class DatasetRecorder:
             was_in_episode = self._in_episode
             self._in_episode = False
             self._frame_count = 0
+            streams = self._take_camera_streams_locked()
+        self._release_camera_streams(streams)
         if was_in_episode:
             try:
                 with self._io_lock:
@@ -382,42 +479,98 @@ class DatasetRecorder:
 
 # ─── helpers used by VRTeleopSession to build the recorder ─────────────────
 
-def grab_camera_frames() -> dict[str, Optional[np.ndarray]]:
+def grab_camera_frames(
+    *,
+    streams: Mapping[str, cam_mod.CameraStream] | None = None,
+    max_age_s: float = 0.5,
+    expected_shape: tuple[int, int, int] | None = None,
+) -> dict[str, Optional[np.ndarray]]:
     """Snapshot every role-assigned camera. Returns {role: RGB-ndarray-or-None}.
 
-    Uses the existing CameraStream singletons so we don't open a second
-    VideoCapture per camera. Decodes the latest JPEG to numpy via cv2.imdecode,
-    then converts OpenCV's BGR layout to RGB for LeRobot/PIL video encoding.
-    Subscriptions are reference-counted; we acquire while reading and release
-    afterwards (matches how `/camera/<id>/snapshot` works)."""
+    Dataset recording uses raw RGB frames from `CameraStream`, never the Quest
+    RTP/GStreamer path. Frames older than `max_age_s` are rejected so camera
+    stalls fail the strict recording instead of writing repeated stale images.
+    If `streams` is passed, the caller owns the stream subscriptions for the
+    whole episode. Otherwise this helper acquires/releases streams only for
+    this one snapshot."""
     out: dict[str, Optional[np.ndarray]] = {}
-    cams = cam_mod.enumerate_cameras()
-    for c in cams:
-        if not c.role:
-            continue
-        stream = cam_mod.get_stream(c.role)
+    if streams is None:
+        stream_items: list[tuple[str, cam_mod.CameraStream | None, bool]] = []
+        for c in cam_mod.enumerate_cameras():
+            if not c.role:
+                continue
+            stream_items.append((c.role, cam_mod.get_stream(c.role), True))
+    else:
+        stream_items = [(role, stream, False) for role, stream in streams.items()]
+
+    for role, stream, owns_subscription in stream_items:
         if stream is None:
-            out[c.role] = None
+            out[role] = None
             continue
-        stream.acquire()
+        if owns_subscription:
+            stream.acquire()
         try:
-            # Prefer raw RGB from the capture thread (matches LeRobot OpenCVCamera path).
-            img = stream.last_rgb
-            if img is None:
-                img = stream.get_rgb(timeout=0.5)
-            if img is None:
-                jpeg = stream.last_jpeg
-                if jpeg is None:
-                    out[c.role] = None
-                    continue
-                arr = np.frombuffer(jpeg, dtype=np.uint8)
-                img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
-                if img is not None:
-                    img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-            out[c.role] = img
+            frame = stream.get_rgb(timeout=0.5, max_age_s=max_age_s, copy=True)
+            out[role] = _normalize_rgb_frame(frame, expected_shape)
         finally:
-            stream.release()
+            if owns_subscription:
+                stream.release()
     return out
+
+
+def _normalize_rgb_frame(
+    frame: Optional[np.ndarray],
+    expected_shape: tuple[int, int, int] | None,
+) -> Optional[np.ndarray]:
+    """Return a contiguous uint8 RGB frame matching the dataset video feature.
+
+    V4L cameras can ignore requested capture dimensions. LeRobot video features
+    are fixed at dataset creation time, so recording normalizes valid RGB frames
+    to that shape before strict validation. Invalid dtype/channel count is left
+    unchanged so validation fails loudly instead of hiding corrupted camera data.
+    """
+    if frame is None or expected_shape is None:
+        return frame
+    if not isinstance(frame, np.ndarray):
+        return frame
+    if frame.dtype != np.uint8 or frame.ndim != 3 or frame.shape[2] != 3:
+        return frame
+    expected_h, expected_w, expected_c = expected_shape
+    if expected_c != 3:
+        return frame
+    if frame.shape[:2] != (expected_h, expected_w):
+        interpolation = (
+            cv2.INTER_AREA
+            if frame.shape[0] >= expected_h and frame.shape[1] >= expected_w
+            else cv2.INTER_LINEAR
+        )
+        frame = cv2.resize(frame, (expected_w, expected_h), interpolation=interpolation)
+    return np.ascontiguousarray(frame, dtype=np.uint8)
+
+
+def _camera_frame_detail(frame: object) -> str:
+    if not isinstance(frame, np.ndarray):
+        return "missing/non-array"
+    return f"dtype={frame.dtype} shape={tuple(frame.shape)} size={frame.size}"
+
+
+def _camera_frame_problem(
+    frame: object,
+    expected_shape: tuple[int, int, int],
+) -> str:
+    if not isinstance(frame, np.ndarray):
+        return "missing/non-array"
+    if frame.size <= 0:
+        return f"empty array dtype={frame.dtype} shape={tuple(frame.shape)}"
+    if frame.dtype != np.uint8:
+        return f"dtype={frame.dtype} shape={tuple(frame.shape)} size={frame.size}"
+    if frame.ndim != 3:
+        return f"dtype={frame.dtype} shape={tuple(frame.shape)} size={frame.size}"
+    if frame.shape != expected_shape:
+        return f"dtype={frame.dtype} shape={tuple(frame.shape)} size={frame.size}"
+    if not frame.flags["C_CONTIGUOUS"]:
+        return f"non-contiguous dtype={frame.dtype} shape={tuple(frame.shape)} size={frame.size}"
+    return ""
 
 
 def load_dataset_config() -> dict[str, Any]:
@@ -540,7 +693,7 @@ def delete_last_episode(repo_id: str, root: Optional[str]) -> tuple[int, str]:
                 root=str(resolved_root),
                 robot_type=str(dataset.meta.robot_type),
                 use_videos=bool(dataset.meta.video_keys),
-                image_writer_threads=2,
+                image_writer_threads=0,
             )
             ds_new.finalize()
             shutil.rmtree(backup_root, ignore_errors=True)

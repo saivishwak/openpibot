@@ -90,6 +90,11 @@ def run(
     port: int = typer.Option(5000, help="HTTP port for the dashboard/API."),
     reload: bool = typer.Option(False, "--reload", help="Enable uvicorn reload for development."),
     log_level: str = typer.Option("info", help="Uvicorn log level."),
+    log_file: pathlib.Path | None = typer.Option(
+        None,
+        "--log-file",
+        help="Write OpenPiBot server logs to this file.",
+    ),
     build_dashboard: bool = typer.Option(
         True,
         "--build-dashboard/--no-build-dashboard",
@@ -100,7 +105,7 @@ def run(
     if build_dashboard:
         _build_dashboard()
 
-    log_file = configure_logging()
+    log_file_path = configure_logging(level=log_level, log_file=log_file)
     ports = [port]
     if port in (80, 5000, 8000, 8020):
         ports.extend(p for p in range(8021, 8040) if p != port)
@@ -112,7 +117,7 @@ def run(
         os.environ["OPENPIBOT_HOST"] = host
         os.environ["OPENPIBOT_PORT"] = str(candidate)
         console.print(f"[green]OpenPiBot dashboard:[/green] http://127.0.0.1:{candidate}")
-        console.print(f"[dim]Logs:[/dim] {log_file}")
+        console.print(f"[dim]Logs:[/dim] {log_file_path}")
         uvicorn.run(
             "openpibot.server.app:create_app",
             factory=True,
@@ -120,6 +125,7 @@ def run(
             port=candidate,
             reload=reload,
             log_level=log_level,
+            log_config=None,
         )
         return
 

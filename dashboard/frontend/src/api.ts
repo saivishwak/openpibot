@@ -262,6 +262,8 @@ export interface VROperatorStatus {
   guidance: string;
   ready_blockers: string[];
   recording_blockers: string[];
+  recording_start_blockers: string[];
+  recording_anchor_blockers: string[];
   connection: {
     backend_ready: boolean;
     https_ready: boolean;
@@ -282,10 +284,18 @@ export interface VROperatorStatus {
   arm_panels: Record<ArmSide, VROperatorArmPanel>;
   recording: {
     active: boolean;
+    armed?: boolean;
     frames: number;
     episodes_saved: number;
     task: string;
+    notice?: string;
     ready: boolean;
+    start_allowed?: boolean;
+    anchor_pending?: boolean;
+    transition_active?: boolean;
+    transition_source?: string;
+    transition_target?: boolean | null;
+    transition_age_s?: number;
   };
   updated_at: number;
 }
@@ -306,6 +316,8 @@ export interface VRStatus {
   engaged: boolean;
   /** Whether dataset recording is currently active (toggled by B button or UI). */
   recording: boolean;
+  /** Compatibility flag for legacy armed recording state; normal starts open or block immediately. */
+  recording_armed?: boolean;
   /** Detail on the LeRobotDataset state. Useful for the UI's Recording card. */
   recording_info: {
     active: boolean;
@@ -313,13 +325,27 @@ export interface VRStatus {
     frames_in_current_episode: number;
     last_episode_index: number | null;
     last_episode_frames: number;
+    armed?: boolean;
     repo_id: string | null;
     /** Most-recent task description (from UI or previous session). */
     last_task: string;
+    /** Configured default task used by headset B-button starts when no UI task is cached. */
+    task_default?: string;
     /** Absolute filesystem path where datasets are/will be written. */
     root: string;
+    notice?: string;
     calibration_ready: boolean;
     calibration_blockers: string[];
+    start_allowed?: boolean;
+    start_blockers?: string[];
+    anchor_pending?: boolean;
+    anchor_blockers?: string[];
+    verification_ready?: boolean;
+    verification_blockers?: string[];
+    transition_active?: boolean;
+    transition_source?: string;
+    transition_target?: boolean | null;
+    transition_age_s?: number;
   };
   /** 0.1..1.0 — multiplier on VR delta caps */
   scale: number;
@@ -468,7 +494,7 @@ export const api = {
       method: "POST", body: JSON.stringify({ enabled, task, root }),
     }),
   /** Cache the current UI task text so Quest B-button recording starts use the
-   *  same prompt. Empty text clears the cached prompt and start is rejected. */
+   *  same prompt. Empty text clears the cache; dataset.task_default is then used. */
   vrSetRecordingTask: (task: string) =>
     req<VRStatus>("/api/vr/recording/task", {
       method: "POST", body: JSON.stringify({ task }),

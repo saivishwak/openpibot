@@ -1,3 +1,6 @@
+import time
+
+import numpy as np
 import yaml
 
 from openpibot.server.runtime import cameras
@@ -71,3 +74,90 @@ def test_opencv_capture_path_resolves_stable_symlink_to_video_node(monkeypatch):
     )
 
     assert cameras._opencv_capture_path("/dev/v4l/by-path/right-wrist") == "/dev/video4"
+
+
+def test_camera_service_owns_stream_registry_and_suspension(monkeypatch):
+    service = cameras.CameraService()
+    spec = cameras.CameraSpec(
+        name="head",
+        path="/dev/video0",
+        width=640,
+        height=480,
+        fps=30,
+        fourcc="MJPG",
+        role="head",
+    )
+    monkeypatch.setattr(cameras, "_enumerate_cameras_impl", lambda: [spec])
+
+    first = service.get_stream("head")
+    second = service.get_stream("head")
+
+    assert first is second
+    assert service.active_capture_roles() == []
+
+    assert service.suspend_capture_roles(["head"], reason="external owner") == ["head"]
+    assert service.suspended_capture_roles() == {"head": "external owner"}
+    assert service.get_stream("head") is None
+
+    assert service.resume_capture_roles(["head"]) == ["head"]
+    assert service.suspended_capture_roles() == {}
+    assert service.get_stream("head") is not None
+
+
+def test_camera_stream_rgb_snapshot_rejects_stale_frames():
+    stream = cameras.CameraStream(cameras.CameraSpec(
+        name="head",
+        path="/dev/video0",
+        width=2,
+        height=2,
+        fps=30,
+        fourcc="MJPG",
+        role="head",
+    ))
+    frame = np.ones((2, 2, 3), dtype=np.uint8)
+    with stream.lock:
+        stream.last_rgb = frame
+        stream.last_frame_at = time.monotonic() - 2.0
+
+    assert stream.get_rgb(timeout=0.01, max_age_s=0.1) is None
+
+
+def test_camera_stream_rgb_snapshot_returns_copy_when_requested():
+    stream = cameras.CameraStream(cameras.CameraSpec(
+        name="head",
+        path="/dev/video0",
+        width=2,
+        height=2,
+        fps=30,
+        fourcc="MJPG",
+        role="head",
+    ))
+    frame = np.ones((2, 2, 3), dtype=np.uint8)
+    with stream.lock:
+        stream.last_rgb = frame
+        stream.last_frame_at = time.monotonic()
+
+    out = stream.get_rgb(timeout=0.01, max_age_s=0.5, copy=True)
+
+    assert isinstance(out, np.ndarray)
+    assert out is not frame
+    out[0, 0, 0] = 9
+    assert frame[0, 0, 0] == 1
+
+
+def test_camera_stream_rgb_snapshot_rejects_empty_cached_frame():
+    stream = cameras.CameraStream(cameras.CameraSpec(
+        name="right_wrist",
+        path="/dev/video0",
+        width=2,
+        height=2,
+        fps=30,
+        fourcc="MJPG",
+        role="right_wrist",
+    ))
+    with stream.lock:
+        stream.last_rgb = np.array([], dtype=np.uint8)
+        stream.last_frame_at = time.monotonic()
+
+    assert stream.get_rgb(timeout=0.01, max_age_s=0.5) is None
+    assert "invalid cached RGB frame" in (stream.last_error or "")

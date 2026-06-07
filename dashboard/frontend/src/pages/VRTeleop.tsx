@@ -21,10 +21,12 @@ function operatorStageLabel(stage?: string) {
 
 function OperatorFlow({ status }: { status?: VRStatus }) {
   const operator = status?.operator;
+  const recordingStartAllowed = !!operator?.recording?.start_allowed;
   const blockers = [
     ...(operator?.ready_blockers ?? []),
-    ...(operator?.recording_blockers ?? []),
+    ...(operator?.recording_start_blockers ?? operator?.recording_blockers ?? []),
   ];
+  const anchorBlockers = operator?.recording_anchor_blockers ?? [];
   const headCamera = operator?.head_camera_url;
   return (
     <Card className={operator?.stage === "suspended" ? "border-danger bg-danger/5" : ""}>
@@ -43,8 +45,8 @@ function OperatorFlow({ status }: { status?: VRStatus }) {
             {operator?.connection?.websocket_clients ?? 0} headset client{operator?.connection?.websocket_clients === 1 ? "" : "s"}
           </Badge>
           <Badge tone={headCamera ? "success" : "warning"}>{headCamera ? "head camera ready" : "head camera missing"}</Badge>
-          <Badge tone={operator?.recording?.active ? "danger" : operator?.recording?.ready ? "success" : "warning"}>
-            {operator?.recording?.active ? `recording ${operator.recording.frames} frames` : operator?.recording?.ready ? "recording ready" : "recording blocked"}
+          <Badge tone={operator?.recording?.active ? "danger" : recordingStartAllowed ? "success" : "warning"}>
+            {operator?.recording?.active ? `recording ${operator.recording.frames} frames` : recordingStartAllowed ? "recording can start" : "recording blocked"}
           </Badge>
         </div>
       </div>
@@ -71,6 +73,9 @@ function OperatorFlow({ status }: { status?: VRStatus }) {
       </div>
       {blockers.length ? (
         <p className="mt-3 text-sm text-warning">Operator blockers: {blockers.join("; ")}</p>
+      ) : null}
+      {!blockers.length && anchorBlockers.length ? (
+        <p className="mt-3 text-sm text-muted-foreground">Recording start will refresh VR anchors from the latest controller poses: {anchorBlockers.join("; ")}</p>
       ) : null}
     </Card>
   );

@@ -47,6 +47,7 @@ from .motors import SESSION as MOTORS, ArmSide
 from . import cameras as _cameras
 from . import dataset as _dataset
 from . import home as _home
+from .homing import HomingStep, JointHomingController, normalized_joint_name
 from . import quest_video_bridge as _quest_video_bridge
 from . import vr_calibration as _vrcal
 from .native_quest import MAX_NATIVE_QUEST_PACKET_BYTES, NativeQuestAdapter, NativeQuestProtocolError
@@ -176,15 +177,18 @@ _WRIST_MOTOR_POLARITY: dict[str, dict[str, float]] = {
 }
 
 
-# Homing: per-joint tolerance (degrees) to declare "arrived". 1.5° on
-# Present_Position is OK in theory but the motor's internal PID has a small
-# deadband, so the physical position often settles a few degrees from the
-# commanded target and never converges to within 1.5° — making the UI hang on
-# "HOMING…" forever. We now check SOFTWARE convergence (last_sent_targets
-# equals the home target) instead, which is deterministic. The 0.5° threshold
-# below is just for the per-tick-clamped value, which converges exactly.
+# Homing: command trajectory is deterministic, but completion must be based on
+# measured joint feedback. Otherwise a slow/lagging arm can be reported homed
+# while still several ticks away from the saved pose.
 HOMING_TOL_DEG: float = 0.5
-HOMING_TIMEOUT_S: float = 15.0   # hard cap; if not converged by then, give up
+HOMING_PRESENT_TOL_DEG: float = 4.0
+HOMING_SETTLE_TICKS: int = 5
+HOMING_TIMEOUT_S: float = 45.0   # hard cap; if not physically settled by then, give up
+RECORDING_HOME_TIMEOUT_BUFFER_S: float = 2.0
+RECORDING_ANCHOR_INPUT_WAIT_S: float = 2.0
+RECORDING_MAX_CONSECUTIVE_CAMERA_SKIPS: int = 3
+RECORDING_MAX_CAMERA_SKIP_RATIO: float = 0.02
+RECORDING_MIN_SAMPLES_FOR_SKIP_RATIO: int = 150
 
 
 # --- SO101 analytical kinematics ---------------------------------------------
@@ -791,7 +795,7 @@ class _PerArm:
     # to compute the delta rotation at grip-release.
     cal_anchor_quat_for_wrist: Optional[tuple[float, float, float, float]] = None
     # Latest release quaternion latched from the last POSITION goal while in
-    # motioning_wrist_verify (fallback when IDLE goal omits rotation).
+    # motioning_wrist_verify; IDLE goals do not include rotation.
     cal_wrist_release_quat: Optional[tuple[float, float, float, float]] = None
     # Live wrist rotation since the step-4 anchor (degrees) — for wizard UI.
     cal_wrist_verify_deg: float = 0.0
@@ -832,11 +836,15 @@ class _PerArm:
     robot_verify_test_scale: float = ROBOT_VERIFY_TEST_SCALE
     # Homing state. While True, the drive loop drives this arm toward
     # `home_target` (a per-joint absolute target, in degrees), instead of the
-    # VR-driven target. Cleared automatically when all joints reach their target
-    # within HOMING_TOL_DEG.
+    # VR-driven target. Cleared after measured joint feedback settles at home.
     homing: bool = False
     home_target: dict[str, float] = field(default_factory=dict)
     home_start_t: float = 0.0   # monotonic seconds when homing began (timeout safety)
+    home_controller: JointHomingController | None = None
+    home_last_command_error_deg: float = 0.0
+    home_last_present_error_deg: float = 0.0
+    home_last_worst_joint: str = ""
+    home_next_progress_log_t: float = 0.0
     # User-facing knob: when True, mirror the LATERAL axis (left/right). Flips
     # shoulder_pan direction, wrist_roll, and wrist_flex direction all at once
     # (they all derive from the y-axis mapping). Read from config/xlerobot.yaml's
@@ -972,8 +980,8 @@ class VRTeleopSession:
             "right": _PerArm(side="right"),
         }
         # The arm that VR is currently driving in single-arm mode. In dual mode,
-        # both connected arms are driven and this remains the preferred fallback
-        # when dual mode is turned off.
+        # both connected arms are driven and this remains the preferred selected
+        # arm when dual mode is turned off.
         self._active_arm: Optional[ArmSide] = None
         self._dual_mode: bool = False
 
@@ -1009,20 +1017,31 @@ class VRTeleopSession:
         self._gripper_closed = DEFAULT_GRIPPER_CLOSED
         self._last_drive_tick: float = 0.0
         self._last_error: Optional[str] = None
+        self._recording_notice: str = ""
         # Recording state. B button on right controller OR UI toggle flip this.
         # `_recorder` is lazily created on first start (so a session that never
         # records pays no dataset cost).
         self._recording: bool = False
-        # A requested recording that is waiting for fresh post-home anchors before
-        # an episode is opened. No frames are written while armed.
+        # Compatibility/status bit for an older "armed until grip reset" flow.
+        # Normal recording start now refreshes anchors immediately from the
+        # latest Quest controller poses and either opens the episode or reports
+        # a hard blocker. No production path should leave this true.
         self._recording_armed: bool = False
         self._recording_pending_task: str = ""
         self._recording_pending_root: Optional[str] = None
         self._recorder: Optional[_dataset.DatasetRecorder] = None
         self._recording_transition_lock = threading.Lock()
+        self._recording_transition_active: bool = False
+        self._recording_transition_started_at: float = 0.0
+        self._recording_transition_source: str = ""
+        self._recording_transition_target: Optional[bool] = None
+        self._recording_button_thread: Optional[threading.Thread] = None
         self._episodes_saved: int = 0
         self._last_saved_episode_index: Optional[int] = None
         self._last_saved_episode_frames: int = 0
+        self._recording_camera_frame_skips: int = 0
+        self._recording_consecutive_camera_frame_skips: int = 0
+        self._recording_last_camera_skip_reason: str = ""
         # Last task string synced from the UI. Cached here so the Quest B button
         # can start an episode with the task the user typed on the web page.
         # Empty text clears the cache and recording start is rejected.
@@ -1070,7 +1089,7 @@ class VRTeleopSession:
         `vr.wrist_motor_polarity` block (per-arm motor polarity applied
         directly to wrist pitch/roll deltas)."""
         import yaml
-        global KP, WRIST_RAD_DELTA_LIMIT
+        global KP, WRIST_RAD_DELTA_LIMIT, HOMING_PRESENT_TOL_DEG
         global POS_EMA_ALPHA, ORI_EMA_ALPHA, POS_DEADZONE_M, ROT_DEADZONE_RAD, MAX_EE_STEP_M
         global JOINT_COMMAND_FILTER_WEIGHTS
         try:
@@ -1083,6 +1102,12 @@ class VRTeleopSession:
                 return max(lo, min(hi, float(value)))
 
             KP = _float_key("kp", KP, 0.0, 1.0)
+            HOMING_PRESENT_TOL_DEG = _float_key(
+                "homing_present_tolerance_deg",
+                HOMING_PRESENT_TOL_DEG,
+                0.5,
+                8.0,
+            )
             wrist_deg = _float_key("wrist_delta_limit_deg", math.degrees(WRIST_RAD_DELTA_LIMIT), 1.0, 30.0)
             WRIST_RAD_DELTA_LIMIT = math.radians(wrist_deg)
             POS_EMA_ALPHA = _float_key("pos_ema_alpha", POS_EMA_ALPHA, 0.0, 1.0)
@@ -1154,13 +1179,15 @@ class VRTeleopSession:
             log.info(
                 "VR smoothing loaded: homing_kp=%.2f pos_ema=%.2f ori_ema=%.2f "
                 "pos_deadzone=%.1fmm rot_deadzone=%.1f° max_ee_step=%.1fmm "
-                "wrist_cap=%.1f° joint_filter=%s wrist_motor_polarity(left)=(flex %+.0f, roll %+.0f) "
+                "wrist_cap=%.1f° homing_feedback_tol=%.1f° joint_filter=%s "
+                "wrist_motor_polarity(left)=(flex %+.0f, roll %+.0f) "
                 "wrist_motor_polarity(right)=(flex %+.0f, roll %+.0f)",
                 KP, POS_EMA_ALPHA, ORI_EMA_ALPHA,
                 POS_DEADZONE_M * 1000.0,
                 math.degrees(ROT_DEADZONE_RAD),
                 MAX_EE_STEP_M * 1000.0,
                 math.degrees(WRIST_RAD_DELTA_LIMIT),
+                HOMING_PRESENT_TOL_DEG,
                 tuple(round(w, 3) for w in JOINT_COMMAND_FILTER_WEIGHTS),
                 _WRIST_MOTOR_POLARITY["left"]["flex"], _WRIST_MOTOR_POLARITY["left"]["roll"],
                 _WRIST_MOTOR_POLARITY["right"]["flex"], _WRIST_MOTOR_POLARITY["right"]["roll"],
@@ -1634,6 +1661,62 @@ class VRTeleopSession:
                 blockers.append(f"{side} teleop anchor not fresh ({reason}); squeeze grip to reset after homing")
         return blockers
 
+    def _recording_anchor_refresh_blockers_locked(self, *, now: float) -> list[str]:
+        blockers: list[str] = []
+        for side in RECORDING_REQUIRED_SIDES:
+            arm = self._arms[side]
+            if not MOTORS.is_connected(side):
+                blockers.append(f"{side} arm is not connected")
+                continue
+            if not MOTORS.is_torque_enabled(side):
+                blockers.append(f"{side} torque is off")
+                continue
+            if arm.homing:
+                blockers.append(f"{side} arm is still homing")
+                continue
+            if arm.cal_state != "idle":
+                blockers.append(f"{side} VR calibration is still active")
+                continue
+            if not self._teleop_reset_anchors_enabled:
+                blockers.append(f"{side} teleop anchoring is disabled by verification/test mode")
+                continue
+            goal = arm.latest
+            if not goal.has_data:
+                blockers.append(f"{side} Quest controller pose missing")
+                continue
+            age_s = max(0.0, now - goal.received_at)
+            if age_s > GOAL_SKIP_AGE_S:
+                blockers.append(f"{side} Quest controller pose stale ({age_s * 1000:.0f} ms)")
+                continue
+            if goal.controller_position is None or goal.rotation_quat is None:
+                blockers.append(f"{side} Quest controller pose incomplete")
+        return blockers
+
+    def _refresh_recording_anchors_for_start(self) -> list[str]:
+        """Capture fresh recording anchors from current robot and Quest poses.
+
+        Pressing B should open an episode immediately after verification. The
+        old `armed` state required the operator to know to grip-reset both arms
+        after B. This method performs that deterministic reset itself from the
+        latest Quest controller pose and current URDF FK pose. If the required
+        pose data is not available, start is blocked with explicit reasons.
+        """
+        with self._lock:
+            blockers = self._recording_anchor_refresh_blockers_locked(now=time.time())
+            if blockers:
+                return blockers
+            refreshed: list[str] = []
+            for side in RECORDING_REQUIRED_SIDES:
+                try:
+                    self._capture_anchor(side)
+                    refreshed.append(side)
+                except Exception as exc:
+                    blockers.append(f"{side} recording anchor refresh failed: {exc}")
+            if blockers:
+                for side in refreshed:
+                    self._invalidate_teleop_anchor(side, "recording anchor refresh failed")
+        return blockers
+
     def _operator_status(
         self,
         arms_status: dict[str, Any],
@@ -1692,7 +1775,7 @@ class VRTeleopSession:
         else:
             stage = "mirror_ready"
             guidance = "Face the workspace, press Ready in VR, then hold A/X or use Engage to start teleop."
-        if self._last_error and self._engaged:
+        if self._last_error and self._engaged and self._last_error_suspends_teleop():
             stage = "suspended"
             guidance = self._last_error
 
@@ -1723,6 +1806,8 @@ class VRTeleopSession:
             "guidance": guidance,
             "ready_blockers": ready_blockers,
             "recording_blockers": list(recording_info.get("calibration_blockers") or []),
+            "recording_start_blockers": list(recording_info.get("start_blockers") or []),
+            "recording_anchor_blockers": list(recording_info.get("anchor_blockers") or []),
             "connection": {
                 "backend_ready": True,
                 "https_ready": False,
@@ -1742,10 +1827,55 @@ class VRTeleopSession:
                 "frames": int(recording_info.get("frames_in_current_episode") or 0),
                 "episodes_saved": int(recording_info.get("episodes_saved") or 0),
                 "task": str(recording_info.get("last_task") or ""),
+                "notice": str(recording_info.get("notice") or ""),
                 "ready": bool(recording_info.get("calibration_ready", False)),
+                "start_allowed": bool(recording_info.get("start_allowed", False)),
+                "anchor_pending": bool(recording_info.get("anchor_pending", False)),
+                "transition_active": bool(recording_info.get("transition_active", False)),
+                "transition_source": str(recording_info.get("transition_source") or ""),
+                "transition_target": recording_info.get("transition_target"),
+                "transition_age_s": recording_info.get("transition_age_s"),
             },
             "updated_at": now,
         }
+
+    def _recording_transition_status_locked(self) -> dict[str, Any]:
+        age_s = (
+            max(0.0, time.monotonic() - self._recording_transition_started_at)
+            if self._recording_transition_active and self._recording_transition_started_at
+            else 0.0
+        )
+        return {
+            "transition_active": bool(self._recording_transition_active),
+            "transition_source": self._recording_transition_source,
+            "transition_target": self._recording_transition_target,
+            "transition_age_s": age_s,
+        }
+
+    def _last_error_suspends_teleop(self) -> bool:
+        """Only control-path failures should put the operator flow in suspended.
+
+        Recording readiness/save messages must be visible diagnostics without
+        disabling the Quest operator surface or blocking A/X engagement.
+        """
+        err = (self._last_error or "").strip().lower()
+        if not err:
+            return False
+        non_suspending_prefixes = (
+            "recording ",
+            "record:",
+            "recorder init:",
+            "episode ",
+            "save_episode failed:",
+            "camera ",
+            "task description ",
+            "delete last episode ",
+            "stop recording ",
+        )
+        return not err.startswith(non_suspending_prefixes)
+
+    def _any_homing_locked(self) -> bool:
+        return any(arm.homing for arm in self._arms.values())
 
     def quest_bridge_status(self, *, public_base_url: str | None = None) -> dict[str, Any]:
         with self._lock:
@@ -1782,6 +1912,8 @@ class VRTeleopSession:
             "last_error": str(last_error or ""),
             "ready_blockers": list(operator.get("ready_blockers") or []),
             "recording_blockers": list(operator.get("recording_blockers") or []),
+            "recording_start_blockers": list(operator.get("recording_start_blockers") or []),
+            "recording_anchor_blockers": list(operator.get("recording_anchor_blockers") or []),
             "native_quest_ready": bool(connection.get("native_quest_ready", False)),
             "native_quest_clients": int(connection.get("native_quest_clients") or 0),
             "native_quest_last_seen_ms": connection.get("native_quest_last_seen_ms"),
@@ -1789,6 +1921,9 @@ class VRTeleopSession:
             "recording_active": bool(recording.get("active", False)),
             "recording_armed": bool(recording.get("armed", False)),
             "recording_ready": bool(recording.get("ready", False)),
+            "recording_start_allowed": bool(recording.get("start_allowed", False)),
+            "recording_anchor_pending": bool(recording.get("anchor_pending", False)),
+            "recording_notice": str(recording.get("notice") or ""),
             "recording_frames": int(recording.get("frames") or 0),
             "recording_episodes_saved": int(recording.get("episodes_saved") or 0),
             "active_arm": active_arm,
@@ -1971,15 +2106,17 @@ class VRTeleopSession:
                     }
 
             rec = self._recorder
-            recording_blockers = self._recording_calibration_blockers()
+            recording_readiness = self._recording_readiness()
+            recording_transition = self._recording_transition_status_locked()
             recording_info = {
                 "active": self._recording,
                 "armed": self._recording_armed,
                 "episodes_saved": (rec.episode_count if rec else self._episodes_saved),
                 "frames_in_current_episode": rec.frame_count_in_episode if rec else 0,
                 "last_task": self._last_task,
-                "calibration_ready": not recording_blockers,
-                "calibration_blockers": recording_blockers,
+                "notice": self._recording_notice,
+                **recording_readiness,
+                **recording_transition,
             }
             operator = self._operator_status(arms_status, recording_info, now)
             operator["calibration"] = calibration_summary
@@ -2162,17 +2299,24 @@ class VRTeleopSession:
             rec = self._recorder
             # If no recorder yet, compute what root WOULD be used (so the UI's
             # placeholder shows the actual default before first Start).
+            task_default = ""
             if self._last_dataset_root:
                 shown_root = self._last_dataset_root
+                try:
+                    task_default = str(_dataset.load_dataset_config().get("task_default") or "").strip()
+                except Exception:
+                    task_default = ""
             else:
                 try:
                     cfg_now = _dataset.load_dataset_config()
+                    task_default = str(cfg_now.get("task_default") or "").strip()
                     shown_root = _dataset.resolve_root(
                         cfg_now.get("root"), str(cfg_now["repo_id"]),
                     )
                 except Exception:
                     shown_root = ""
-            recording_blockers = self._recording_calibration_blockers()
+            recording_readiness = self._recording_readiness()
+            recording_transition = self._recording_transition_status_locked()
             recording_info = {
                 "active": self._recording,
                 "armed": self._recording_armed,
@@ -2186,9 +2330,11 @@ class VRTeleopSession:
                 ),
                 "repo_id": rec.repo_id if rec else self._recording_repo_id,
                 "last_task": self._last_task,
+                "task_default": task_default,
                 "root": shown_root,
-                "calibration_ready": not recording_blockers,
-                "calibration_blockers": recording_blockers,
+                "notice": self._recording_notice,
+                **recording_readiness,
+                **recording_transition,
             }
             # Per-arm home pose status (from YAML + live homing flag).
             try:
@@ -2650,6 +2796,9 @@ class VRTeleopSession:
         trig = bool(getattr(goal, "trigger", False))
         thumb = getattr(goal, "thumbstick", None) or {}
         btn = getattr(goal, "buttons", None) or {}
+        cur_buttons: dict[str, bool] = {}
+        prev_buttons: dict[str, bool] = {}
+        handle_buttons = False
         with self._lock:
             cur_buttons = {str(k): bool(v) for k, v in btn.items()}
             prev_buttons = arm.prev_buttons
@@ -2706,8 +2855,9 @@ class VRTeleopSession:
                     )
             if arm.cal_state != "idle":
                 self._advance_calibration(side, arm.latest)
-            if self._controller_buttons_enabled or arm.robot_verify_state != "idle":
-                self._handle_button_edges(side, cur_buttons, prev_buttons)
+            handle_buttons = self._controller_buttons_enabled or arm.robot_verify_state != "idle"
+        if handle_buttons:
+            self._handle_button_edges(side, cur_buttons, prev_buttons)
 
     # ── drive loop ──────────────────────────────────────────────────────────
     def _start_drive_loop(self) -> None:
@@ -2753,6 +2903,40 @@ class VRTeleopSession:
                 f"{side} calibrated SO101 URDF kinematics unavailable; cannot {context}. "
                 "Install/load the calibrated URDF path before robot verification or recording."
             )
+
+    def _homing_cap_for_key(self, key: str) -> float:
+        return PER_TICK_DEG_CAPS.get(normalized_joint_name(key), 1.0)
+
+    def _new_homing_controller(
+        self,
+        arm: _PerArm,
+        present: dict[str, float],
+    ) -> JointHomingController:
+        return JointHomingController(
+            targets=arm.home_target,
+            present=present,
+            cap_for_key=self._homing_cap_for_key,
+            kp=KP,
+            command_tolerance_deg=HOMING_TOL_DEG,
+            present_tolerance_deg=HOMING_PRESENT_TOL_DEG,
+            settle_ticks=HOMING_SETTLE_TICKS,
+        )
+
+    def _homing_step(self, arm: _PerArm, present: dict[str, float]) -> HomingStep:
+        if arm.home_controller is None:
+            arm.home_controller = self._new_homing_controller(arm, present)
+        return arm.home_controller.step(present)
+
+    def _homing_step_command(
+        self,
+        side: ArmSide,
+        arm: _PerArm,
+        present: dict[str, float],
+    ) -> tuple[dict[str, float], bool]:
+        """Compatibility wrapper for tests and older callers."""
+        del side
+        step = self._homing_step(arm, present)
+        return step.command, step.settled
 
     def _current_ee_transform(self, side: ArmSide) -> _np.ndarray:
         """Read current joints and return the estimated gripper-frame pose."""
@@ -2867,7 +3051,6 @@ class VRTeleopSession:
         arm.anchor_invalid_reason = ""
         log.info("[%s] VR anchor: EE=(%.3f, %.3f, %.3f) m (URDF FK)",
                  side, T_now[0, 3], T_now[1, 3], T_now[2, 3])
-        self._maybe_start_armed_recording_locked()
 
     def _drive_loop(self) -> None:
         """Per-tick: process RESETs for ALL connected arms (so each arm's anchor
@@ -2913,9 +3096,12 @@ class VRTeleopSession:
                     # the grip-press is consumed by the calibration state machine
                     # (via _advance_calibration in _drain_goals); we don't want to
                     # also anchor for teleop until calibration is done.
-                    if (reset_now or (goal.has_data and goal.mode == "reset")) \
-                            and arm.cal_state == "idle" \
-                            and self._teleop_reset_anchors_enabled:
+                    should_capture_anchor = (
+                        (reset_now or (goal.has_data and goal.mode == "reset"))
+                        and arm.cal_state == "idle"
+                        and self._teleop_reset_anchors_enabled
+                    )
+                    if should_capture_anchor:
                         with self._lock:
                             self._capture_anchor(side)
 
@@ -2932,55 +3118,67 @@ class VRTeleopSession:
                         with self._lock:
                             arm.homing = False
                             arm.home_target = {}
+                            arm.home_controller = None
+                            self._invalidate_teleop_anchor(side, "homing aborted: torque off")
                         continue
-                    prefix = f"{side}_arm_"
                     present = MOTORS.read_positions(side)
-                    clamped: dict[str, float] = {}
-                    # Software convergence = per-tick-clamped value == home target
-                    # for every joint. This converges exactly (no PID deadband)
-                    # whereas Present_Position can hover a few degrees off due to
-                    # the motor's internal PID; the latter caused the UI to never
-                    # clear "HOMING…" even after the arm physically arrived.
-                    converged = True
-                    for pj, target_deg in arm.home_target.items():
-                        cap = PER_TICK_DEG_CAPS.get(pj.removeprefix(prefix), 1.0)
-                        # Use the measured present pose as the integration base.
-                        # If low-level safety clamps a prior command, `last_sent_targets`
-                        # can drift from what the motors actually followed, which can
-                        # keep re-requesting too-large jumps during homing.
-                        prev = present.get(pj, target_deg)
-                        delta = max(-cap, min(cap, target_deg - prev))
-                        clamped[pj] = prev + delta
-                        if abs(clamped[pj] - target_deg) > HOMING_TOL_DEG:
-                            converged = False
-                    final: dict[str, float] = {}
-                    for pj, target in clamped.items():
-                        here = present.get(pj, target)
-                        final[pj] = here + KP * (target - here)
+                    step = self._homing_step(arm, present)
+                    arm.home_last_command_error_deg = step.max_command_error_deg
+                    arm.home_last_present_error_deg = step.max_present_error_deg
+                    arm.home_last_worst_joint = step.worst_present_joint
                     try:
-                        sent = MOTORS.send_action(side, final)
+                        sent = MOTORS.send_action(side, step.command)
                         arm.last_sent_targets = dict(sent)
                         arm.last_commanded_targets = dict(sent)
                     except Exception as e:
                         log.warning("[%s] homing send failed: %s", side, e)
                     elapsed = time.monotonic() - arm.home_start_t
-                    if converged or elapsed > HOMING_TIMEOUT_S:
+                    if time.monotonic() >= arm.home_next_progress_log_t:
+                        log.info(
+                            "[%s] homing progress %.1fs: command_error=%.2f deg "
+                            "feedback_error=%.2f deg worst=%s reached=%s settled=%s",
+                            side,
+                            elapsed,
+                            step.max_command_error_deg,
+                            step.max_present_error_deg,
+                            step.worst_present_joint or "none",
+                            step.present_reached,
+                            step.settled,
+                        )
+                        arm.home_next_progress_log_t = time.monotonic() + 2.0
+                    if step.settled or elapsed > HOMING_TIMEOUT_S:
                         with self._lock:
                             arm.homing = False
                             arm.home_target = {}
-                            if not converged:
-                                self._invalidate_teleop_anchor(side, "homing timed out")
-                        if converged:
-                            log.info("[%s] homing complete in %.1fs; arm at saved home_pose",
-                                     side, elapsed)
+                            arm.home_controller = None
+                            if not step.settled:
+                                self._invalidate_teleop_anchor(
+                                    side,
+                                    f"homing timed out (max error {step.max_present_error_deg:.1f} deg"
+                                    + (f" at {step.worst_present_joint}" if step.worst_present_joint else "")
+                                    + ")",
+                                )
+                        if step.settled:
+                            log.info(
+                                "[%s] homing complete in %.1fs; max feedback error %.2f deg",
+                                side,
+                                elapsed,
+                                step.max_present_error_deg,
+                            )
                         else:
-                            log.warning("[%s] homing TIMED OUT after %.1fs; "
-                                        "arm may not have reached the saved pose",
-                                        side, elapsed)
+                            log.warning(
+                                "[%s] homing TIMED OUT after %.1fs; max feedback error %.2f deg at %s",
+                                side,
+                                elapsed,
+                                step.max_present_error_deg,
+                                step.worst_present_joint or "unknown joint",
+                            )
 
                 # Commands sent during this tick become the dataset action for
-                # the same tick. Arms not commanded fall back to present state.
+                # the same tick. Passive no-op arms use their present state.
                 commanded_this_tick: dict[ArmSide, dict[str, float]] = {}
+                expected_driven_this_tick: list[ArmSide] = []
+                expected_held_this_tick: list[ArmSide] = []
 
                 # Phase 2: command the active arm if engaged + calibrated. In
                 # dual mode, run the same per-arm path for both connected arms.
@@ -2991,9 +3189,13 @@ class VRTeleopSession:
                 else:
                     drive_sides = []
                 if not engaged or not drive_sides:
-                    # Still record idle/passive ticks; they become hold/no-op
+                    # Still record idle/passive ticks; they become no-op
                     # frames with action equal to present state.
-                    self._record_frame_if_active(commanded_this_tick=commanded_this_tick)
+                    self._record_frame_if_active(
+                        commanded_this_tick=commanded_this_tick,
+                        expected_driven_sides=expected_driven_this_tick,
+                        expected_held_sides=expected_held_this_tick,
+                    )
                     next_tick = self._sleep_until(next_tick)
                     continue
                 for drive_side in drive_sides:
@@ -3009,10 +3211,12 @@ class VRTeleopSession:
                     arm = self._arms[drive_side]
                     with self._lock:
                         goal = arm.latest
+                    controls_arm = arm.calibrated
 
                     # Watchdog: skip if last goal too stale (controller put down).
                     goal_age = now - goal.received_at if goal.has_data else 1e9
                     if not goal.has_data or goal_age > GOAL_SKIP_AGE_S:
+                        disengaged = False
                         with self._lock:
                             if arm.stale_since is None:
                                 arm.stale_since = now
@@ -3020,17 +3224,22 @@ class VRTeleopSession:
                                 self._engaged = False
                                 self._active_arm = None
                                 self._dual_mode = False
+                                disengaged = True
                                 arm.robot_verify_test_active = False
                                 self._restore_robot_verify_test_scale_if_idle()
                                 self._restore_vr_control_inputs_if_idle()
                                 log.warning("[%s] VR goals stale for >1s; auto-disengaged", drive_side)
+                        if controls_arm and not disengaged:
+                            expected_held_this_tick.append(drive_side)
                         continue
                     arm.stale_since = None
                     if goal.mode != "position":
                         # Grip release sends IDLE: hold last commanded targets; the
                         # per-tick joint cap below already prevents drift.
+                        if controls_arm:
+                            expected_held_this_tick.append(drive_side)
                         continue
-                    if not arm.calibrated:
+                    if not controls_arm:
                         continue
 
                     # Build joint targets from the latest VR controller pose.
@@ -3065,6 +3274,7 @@ class VRTeleopSession:
                     arm.last_sent_targets = dict(sent)
                     arm.last_commanded_targets = dict(sent)
                     commanded_this_tick[drive_side] = dict(sent)
+                    expected_driven_this_tick.append(drive_side)
 
                     # Debug: per-arm gripper trigger/target/sent/present log (1Hz).
                     self._debug_log_gripper(drive_side, goal, arm.targets,
@@ -3073,7 +3283,11 @@ class VRTeleopSession:
                 # Dataset capture: one frame per drive tick when recording is on.
                 # Capture after motor writes so `action` is the command from this
                 # tick, not the previous tick.
-                self._record_frame_if_active(commanded_this_tick=commanded_this_tick)
+                self._record_frame_if_active(
+                    commanded_this_tick=commanded_this_tick,
+                    expected_driven_sides=expected_driven_this_tick,
+                    expected_held_sides=expected_held_this_tick,
+                )
 
             except Exception as e:
                 log.exception("drive loop error: %s", e)
@@ -3260,18 +3474,28 @@ class VRTeleopSession:
 
                 arm.home_target = bounded_target
                 self._invalidate_teleop_anchor(s, "homing changed robot pose")
+                arm.pending_rel_position = (0.0, 0.0, 0.0)
                 # IMPORTANT: seed from present pose. If stale last_sent_targets
                 # are reused (e.g. from an earlier VR drive), homing can
                 # incorrectly mark itself converged immediately even though the
                 # arm is far from home.
                 arm.last_sent_targets = {pj: present.get(pj, v) for pj, v in bounded_target.items()}
+                arm.last_commanded_targets = dict(arm.last_sent_targets)
                 arm.command_filter.reset(arm.last_sent_targets)
+                arm.home_controller = self._new_homing_controller(arm, present)
                 arm.homing = True
                 arm.home_start_t = time.monotonic()
-                # While homing, don't accept VR drive on this arm.
-                if self._active_arm == s:
-                    self._engaged = False
-                    self._active_arm = None
+                arm.home_last_command_error_deg = 0.0
+                arm.home_last_present_error_deg = 0.0
+                arm.home_last_worst_joint = ""
+                arm.home_next_progress_log_t = arm.home_start_t + 1.0
+                arm.stale_since = None
+                # Homing owns the robot until it finishes. Clear all live-control
+                # ownership, including dual mode, so a connected Quest client can
+                # keep streaming without fighting the home trajectory.
+                self._engaged = False
+                self._active_arm = None
+                self._dual_mode = False
                 log.info("[%s] go_home started; %d joint targets queued", s, len(bounded_target))
         return self.status()
 
@@ -3291,6 +3515,7 @@ class VRTeleopSession:
             if arm.homing:
                 arm.homing = False
                 arm.home_target = {}
+                arm.home_controller = None
             MOTORS.release_torque_for_posing(side)
             # Invalidate the anchor — joint pose just changed unpredictably.
             self._invalidate_teleop_anchor(side, "torque released for hand posing")
@@ -3323,6 +3548,7 @@ class VRTeleopSession:
                 if arm.homing:
                     arm.homing = False
                     arm.home_target = {}
+                    arm.home_controller = None
                     self._invalidate_teleop_anchor(s, "homing cancelled")
                     log.info("[%s] homing cancelled", s)
         return self.status()
@@ -3331,10 +3557,25 @@ class VRTeleopSession:
         """Block until all `sides` finish homing (or timeout). Returns True if
         all finished, False if timeout hit. Caller MUST NOT hold `self._lock`."""
         deadline = time.monotonic() + timeout_s
+        next_log = time.monotonic() + 2.0
         while time.monotonic() < deadline:
             with self._lock:
                 if all(not self._arms[s].homing for s in sides):
+                    log.info("wait_for_homing complete for %s", sides)
                     return True
+                if time.monotonic() >= next_log:
+                    pending = []
+                    for s in sides:
+                        arm = self._arms[s]
+                        if arm.homing:
+                            pending.append(
+                                f"{s}: feedback_error={arm.home_last_present_error_deg:.2f} deg "
+                                f"worst={arm.home_last_worst_joint or 'unknown'}"
+                            )
+                    if pending:
+                        log.info("wait_for_homing pending %.1fs remaining: %s",
+                                 max(0.0, deadline - time.monotonic()), "; ".join(pending))
+                    next_log = time.monotonic() + 2.0
             time.sleep(0.05)
         log.warning("wait_for_homing timeout after %.1fs; arms=%s", timeout_s, sides)
         return False
@@ -4276,8 +4517,14 @@ class VRTeleopSession:
         if not self._controller_buttons_enabled:
             return
 
+        with self._lock:
+            any_homing = self._any_homing_locked()
+
         dual_btn = DUAL_MODE_BUTTON_BY_SIDE.get(side)
         if dual_btn and dual_btn in pressed_edges:
+            if any_homing:
+                log.info("[%s] %s ignored for dual mode while homing", side, dual_btn)
+                return
             other_face_held = any(
                 cur_btn.get(name, False)
                 for name in ("X", "Y")
@@ -4300,6 +4547,9 @@ class VRTeleopSession:
         # A/X edge → single-arm engage toggle.
         engage_btn = ENGAGE_BUTTON_BY_SIDE.get(side)
         if engage_btn and engage_btn in pressed_edges:
+            if any_homing:
+                log.info("[%s] %s ignored for engage while homing", side, engage_btn)
+                return
             if self._arms[side].cal_state != "idle":
                 log.info("[%s] %s ignored for engage during calibration", side, engage_btn)
                 return
@@ -4355,14 +4605,78 @@ class VRTeleopSession:
 
     def _handle_record_button(self, side: ArmSide) -> None:
         """B button on right controller was just pressed → toggle dataset recording."""
-        log.info("[%s] B button → toggle recording", side)
         with self._lock:
             armed = self._recording_armed
             active = self._recording
+            transitioning = self._recording_transition_active
+        log.info(
+            "[%s] B button -> toggle recording (active=%s armed=%s transitioning=%s)",
+            side,
+            active,
+            armed,
+            transitioning,
+        )
         if armed and not active:
-            self.set_recording(False)
+            target = False
         else:
-            self.set_recording(not active)
+            target = not active
+        self._request_recording_transition_async(target, source=f"quest-{side}-button")
+
+    def _request_recording_transition_async(self, enabled: bool, *, source: str) -> bool:
+        """Run a controller-requested recording transition off the ingest thread."""
+        with self._lock:
+            if self._recording_transition_active or self._recording_transition_lock.locked():
+                age_s = (
+                    time.monotonic() - self._recording_transition_started_at
+                    if self._recording_transition_started_at else 0.0
+                )
+                self._recording_notice = (
+                    "recording transition already in progress"
+                    + (f" from {self._recording_transition_source}" if self._recording_transition_source else "")
+                )
+                log.info(
+                    "recording %s request from %s ignored; transition already active "
+                    "(source=%s target=%s age=%.1fs)",
+                    "start" if enabled else "stop",
+                    source,
+                    self._recording_transition_source or "unknown",
+                    self._recording_transition_target,
+                    age_s,
+                )
+                return False
+            thread = self._recording_button_thread
+            if thread is not None and thread.is_alive():
+                log.info("recording %s request from %s ignored; prior button worker still running",
+                         "start" if enabled else "stop", source)
+                return False
+            self._recording_notice = (
+                f"recording {'start' if enabled else 'stop'} requested from {source}"
+            )
+
+        def worker() -> None:
+            try:
+                ok = self.set_recording(enabled, source=source)
+                log.info(
+                    "recording %s request from %s completed ok=%s",
+                    "start" if enabled else "stop",
+                    source,
+                    ok,
+                )
+            except Exception as exc:
+                with self._lock:
+                    self._last_error = f"recording {source}: {exc}"
+                    self._recording_notice = self._last_error
+                log.exception("recording transition worker failed from %s", source)
+
+        thread = threading.Thread(
+            target=worker,
+            daemon=True,
+            name=f"recording-{source}",
+        )
+        with self._lock:
+            self._recording_button_thread = thread
+        thread.start()
+        return True
 
     def set_recording_task(self, task: str) -> dict:
         """Cache the UI task text for future B-button recording starts."""
@@ -4372,16 +4686,27 @@ class VRTeleopSession:
 
     def set_recording_root(self, root: Optional[str], repo_id: Optional[str] = None) -> dict:
         """Persist the dataset storage root/repo id in config/xlerobot.yaml."""
-        with self._lock:
-            if self._recording or self._recording_armed:
-                raise RuntimeError("stop recording before changing dataset storage root")
-        cfg = _dataset.write_dataset_config(root=root, repo_id=repo_id)
-        resolved_root = _dataset.resolve_root(cfg.get("root"), str(cfg["repo_id"]))
-        with self._lock:
-            self._last_dataset_root = resolved_root
-            self._recording_repo_id = str(cfg["repo_id"])
-            self._last_error = None
-        return self.status()
+        if not self._recording_transition_lock.acquire(blocking=False):
+            raise RuntimeError(
+                "wait for the recording transition to finish before changing dataset storage root"
+            )
+        try:
+            with self._lock:
+                if self._recording_transition_active:
+                    raise RuntimeError(
+                        "wait for the recording transition to finish before changing dataset storage root"
+                    )
+                if self._recording or self._recording_armed:
+                    raise RuntimeError("stop recording before changing dataset storage root")
+            cfg = _dataset.write_dataset_config(root=root, repo_id=repo_id)
+            resolved_root = _dataset.resolve_root(cfg.get("root"), str(cfg["repo_id"]))
+            with self._lock:
+                self._last_dataset_root = resolved_root
+                self._recording_repo_id = str(cfg["repo_id"])
+                self._last_error = None
+            return self.status()
+        finally:
+            self._recording_transition_lock.release()
 
     def delete_last_recorded_episode(self) -> dict:
         """Delete the most recently saved episode so operators can retry."""
@@ -4473,8 +4798,50 @@ class VRTeleopSession:
             "arms": arms,
         }
 
+    def _recording_effective_task(self, task: str = "") -> str:
+        effective = (task or "").strip() or self._last_task
+        if effective:
+            return effective
+        try:
+            cfg = _dataset.load_dataset_config()
+            return str(cfg.get("task_default") or "").strip()
+        except Exception:
+            return ""
+
+    def _recording_start_failed(self, message: str) -> bool:
+        with self._lock:
+            self._last_error = message
+            self._recording = False
+            self._recording_armed = False
+            self._recording_pending_task = ""
+            self._recording_pending_root = None
+            self._recording_notice = message
+        log.warning(message)
+        return False
+
+    def _wait_for_recording_anchor_inputs(self, timeout_s: float) -> list[str]:
+        deadline = time.monotonic() + max(0.0, float(timeout_s))
+        blockers: list[str] = []
+        while True:
+            with self._lock:
+                blockers = self._recording_anchor_refresh_blockers_locked(now=time.time())
+            if not blockers:
+                return []
+            pose_only_blockers = all("Quest controller pose" in b for b in blockers)
+            if not pose_only_blockers or time.monotonic() >= deadline:
+                return blockers
+            time.sleep(0.05)
+
     def _start_recording_episode_locked(self, task: str, root: Optional[str] = None) -> bool:
-        """Open a strict LeRobot episode. Caller holds the session lock."""
+        """Open a strict LeRobot episode.
+
+        The recording transition lock is held by the caller, but the session
+        status lock is intentionally not held while creating the dataset and
+        warming cameras. Camera open/warm-up can take seconds; holding the
+        status lock there makes the dashboard appear stuck.
+        """
+        rec = None
+        created_rec = False
         try:
             cfg = _dataset.load_dataset_config()
             roles, shape = _dataset.role_camera_list()
@@ -4496,8 +4863,19 @@ class VRTeleopSession:
                 effective_root, str(cfg["repo_id"]),
             )
             self._recording_repo_id = str(cfg["repo_id"])
-            if self._recorder is None:
-                self._recorder = _dataset.DatasetRecorder(
+            log.info(
+                "recording recorder init: repo_id=%s root=%s fps=%s roles=%s shape=%s push_to_hub=%s",
+                cfg.get("repo_id"),
+                self._last_dataset_root,
+                cfg.get("fps"),
+                roles,
+                shape,
+                cfg.get("push_to_hub"),
+            )
+            with self._lock:
+                rec = self._recorder
+            if rec is None:
+                rec = _dataset.DatasetRecorder(
                     repo_id=str(cfg["repo_id"]),
                     fps=int(cfg["fps"]),
                     camera_roles=roles,
@@ -4505,46 +4883,96 @@ class VRTeleopSession:
                     root=effective_root,
                     push_to_hub=bool(cfg["push_to_hub"]),
                 )
-            if hasattr(self._recorder, "write_recording_context"):
-                self._recorder.write_recording_context(self._recording_context_metadata(task))
-            self._recorder.start_episode(task=task)
-            self._episodes_saved = self._recorder.episode_count
-            self._last_saved_episode_index = getattr(self._recorder, "last_saved_episode_index", None)
-            self._last_saved_episode_frames = int(getattr(self._recorder, "last_saved_episode_frames", 0))
-            self._recording = True
-            self._recording_armed = False
-            self._recording_pending_task = ""
-            self._recording_pending_root = None
-            self._last_error = None
+                created_rec = True
+            if hasattr(rec, "write_recording_context"):
+                rec.write_recording_context(self._recording_context_metadata(task))
+            rec.start_episode(task=task)
+            with self._lock:
+                self._recorder = rec
+                self._episodes_saved = rec.episode_count
+                self._last_saved_episode_index = getattr(rec, "last_saved_episode_index", None)
+                self._last_saved_episode_frames = int(getattr(rec, "last_saved_episode_frames", 0))
+                self._recording = True
+                self._recording_armed = False
+                self._recording_pending_task = ""
+                self._recording_pending_root = None
+                self._last_error = None
+                self._recording_notice = ""
+                self._recording_camera_frame_skips = 0
+                self._recording_consecutive_camera_frame_skips = 0
+                self._recording_last_camera_skip_reason = ""
             log.info("strict recording episode opened (task=%r)", task)
             return True
         except Exception as e:
-            self._last_error = f"recorder init: {e}"
-            self._recording = False
-            log.exception("could not start dataset recorder")
-            return False
+            if created_rec and rec is not None:
+                try:
+                    rec.finalize()
+                except Exception as finalize_exc:
+                    log.warning("finalize failed after recorder init error: %s", finalize_exc)
+            with self._lock:
+                if created_rec and self._recorder is rec:
+                    self._recorder = None
+                self._last_error = f"recorder init: {e}"
+                self._recording = False
+                self._recording_armed = False
+                self._recording_pending_task = ""
+                self._recording_pending_root = None
+                self._recording_notice = self._last_error
+                log.exception("could not start dataset recorder for task=%r", task)
+                return False
 
-    def _maybe_start_armed_recording_locked(self) -> None:
-        """Open a pending episode once all post-home anchors are fresh."""
-        if not self._recording_armed or self._recording:
-            return
-        blockers = self._recording_calibration_blockers()
-        if blockers:
-            self._last_error = "recording armed: " + "; ".join(blockers)
-            return
-        task = self._recording_pending_task
-        root = self._recording_pending_root
-        if not task:
-            self._recording_armed = False
-            self._last_error = "task description required before starting an episode"
-            return
-        self._start_recording_episode_locked(task, root=root)
-
-    def set_recording(self, enabled: bool, task: str = "",
-                       home_first: Optional[bool] = None,
-                       root: Optional[str] = None) -> bool:
+    def set_recording(
+        self,
+        enabled: bool,
+        task: str = "",
+        home_first: Optional[bool] = None,
+        root: Optional[str] = None,
+        *,
+        source: str = "api",
+    ) -> bool:
+        started = time.monotonic()
         with self._recording_transition_lock:
-            return self._set_recording_locked(enabled, task=task, home_first=home_first, root=root)
+            with self._lock:
+                self._recording_transition_active = True
+                self._recording_transition_started_at = started
+                self._recording_transition_source = source
+                self._recording_transition_target = bool(enabled)
+            log.info(
+                "recording transition begin source=%s enabled=%s task_present=%s root_override=%s",
+                source,
+                bool(enabled),
+                bool((task or "").strip()),
+                bool((root or "").strip()),
+            )
+            try:
+                result = self._set_recording_locked(
+                    enabled,
+                    task=task,
+                    home_first=home_first,
+                    root=root,
+                )
+                with self._lock:
+                    active = self._recording
+                    notice = self._recording_notice
+                    last_error = self._last_error
+                log.info(
+                    "recording transition end source=%s enabled=%s result=%s active=%s "
+                    "elapsed=%.2fs notice=%r error=%r",
+                    source,
+                    bool(enabled),
+                    result,
+                    active,
+                    time.monotonic() - started,
+                    notice,
+                    last_error,
+                )
+                return result
+            finally:
+                with self._lock:
+                    self._recording_transition_active = False
+                    self._recording_transition_source = ""
+                    self._recording_transition_target = None
+                    self._recording_transition_started_at = 0.0
 
     def _set_recording_locked(self, enabled: bool, task: str = "",
                               home_first: Optional[bool] = None,
@@ -4557,31 +4985,46 @@ class VRTeleopSession:
         in config/xlerobot.yaml), move every connected arm to its saved home
         pose before opening the new episode. Ensures consistent training data.
         """
-        effective_task = (task or "").strip() or self._last_task
+        if enabled:
+            with self._lock:
+                if self._recording:
+                    return True
+
+        effective_task = self._recording_effective_task(task)
         if enabled and not effective_task:
-            self._last_error = "task description required before starting an episode"
-            log.warning(self._last_error)
-            return self._recording
+            return self._recording_start_failed(
+                "task description required before starting an episode"
+            )
 
         if enabled:
-            blockers = self._recording_calibration_blockers()
-            anchor_blockers = self._recording_anchor_blockers()
-            non_anchor_blockers = [b for b in blockers if b not in anchor_blockers]
-            if non_anchor_blockers:
-                self._last_error = "recording blocked: " + "; ".join(blockers)
-                log.warning(self._last_error)
-                return self._recording
+            readiness = self._recording_readiness()
+            if readiness["start_blockers"]:
+                log.warning(
+                    "recording start blocked before homing: %s",
+                    "; ".join(readiness["start_blockers"]),
+                )
+                return self._recording_start_failed(
+                    "recording blocked: " + "; ".join(readiness["start_blockers"])
+                )
 
         # Resolve home_first from config if not explicitly set.
-        if home_first is None:
+        if enabled and home_first is None:
             try:
                 cfg = _dataset.load_dataset_config()
                 home_first = bool(cfg.get("home_before_episode", False))
-            except Exception:
-                home_first = False
+                log.info("recording start config: home_before_episode=%s repo_id=%s root=%s",
+                         home_first, cfg.get("repo_id"), cfg.get("root"))
+            except Exception as exc:
+                log.exception("recording start config read failed")
+                return self._recording_start_failed(
+                    f"recording config read failed: {exc}"
+                )
+        elif home_first is None:
+            home_first = False
 
         # If starting recording AND home_first AND have home pose AND arms
         # connected: home them BEFORE opening the episode. Block until done.
+        auto_homed = False
         if enabled and home_first:
             with self._lock:
                 sides_to_home = list(MOTORS.connected_sides)
@@ -4591,61 +5034,122 @@ class VRTeleopSession:
                 try:
                     self.go_home(side=None)  # all connected
                 except Exception as e:
-                    log.warning("auto-home before recording failed: %s", e)
-                # Wait outside the lock; the drive loop runs the homing.
-                self.wait_for_homing(sides_to_home, timeout_s=15.0)
+                    return self._recording_start_failed(
+                        f"recording auto-home failed: {e}"
+                    )
+                auto_homed = True
+                # Wait outside the lock; the drive loop owns homing motion.
+                homed = self.wait_for_homing(
+                    sides_to_home,
+                    timeout_s=HOMING_TIMEOUT_S + RECORDING_HOME_TIMEOUT_BUFFER_S,
+                )
+                if not homed:
+                    with self._lock:
+                        still_homing = [
+                            side for side in sides_to_home if self._arms[side].homing
+                        ]
+                    detail = ", ".join(still_homing or sides_to_home)
+                    log.warning("recording auto-home did not finish: %s", detail)
+                    return self._recording_start_failed(
+                        "recording blocked: homing did not finish before opening episode "
+                        f"({detail})"
+                    )
+                with self._lock:
+                    home_failures = [
+                        f"{side}: {self._arms[side].anchor_invalid_reason}"
+                        for side in sides_to_home
+                        if self._arms[side].anchor_invalid_reason.startswith(
+                            ("homing timed out", "homing aborted")
+                        )
+                    ]
+                if home_failures:
+                    log.warning("recording auto-home reported failures: %s", "; ".join(home_failures))
+                    return self._recording_start_failed(
+                        "recording blocked: auto-home failed ("
+                        + "; ".join(home_failures)
+                        + ")"
+                    )
 
-            blockers = self._recording_calibration_blockers()
-            anchor_blockers = self._recording_anchor_blockers()
-            non_anchor_blockers = [b for b in blockers if b not in anchor_blockers]
-            if non_anchor_blockers:
-                self._last_error = "recording blocked: " + "; ".join(blockers)
-                log.warning(self._last_error)
-                return self._recording
+            readiness = self._recording_readiness()
+            if readiness["start_blockers"]:
+                log.warning(
+                    "recording start blocked after auto-home: %s",
+                    "; ".join(readiness["start_blockers"]),
+                )
+                return self._recording_start_failed(
+                    "recording blocked: " + "; ".join(readiness["start_blockers"])
+                )
 
         if enabled:
-            blockers = self._recording_calibration_blockers()
-            anchor_blockers = self._recording_anchor_blockers()
-            non_anchor_blockers = [b for b in blockers if b not in anchor_blockers]
-            if non_anchor_blockers:
-                self._last_error = "recording blocked: " + "; ".join(blockers)
-                log.warning(self._last_error)
-                return self._recording
-            if anchor_blockers:
-                with self._lock:
-                    self._recording_armed = True
-                    self._recording_pending_task = effective_task
-                    self._recording_pending_root = (root or "").strip() or None
-                    self._last_task = effective_task
-                    self._last_error = (
-                        "recording armed: waiting for fresh post-home VR anchors; "
-                        + "; ".join(anchor_blockers)
+            readiness = self._recording_readiness()
+            if readiness["start_blockers"]:
+                log.warning(
+                    "recording start blocked before anchor refresh: %s",
+                    "; ".join(readiness["start_blockers"]),
+                )
+                return self._recording_start_failed(
+                    "recording blocked: " + "; ".join(readiness["start_blockers"])
+                )
+            if auto_homed:
+                log.info("recording start: waiting for fresh Quest controller poses after auto-home")
+                anchor_input_blockers = self._wait_for_recording_anchor_inputs(
+                    RECORDING_ANCHOR_INPUT_WAIT_S
+                )
+                if anchor_input_blockers:
+                    log.warning(
+                        "recording start blocked waiting for anchor inputs: %s",
+                        "; ".join(anchor_input_blockers),
                     )
-                log.info(self._last_error)
-                return self._recording
+                    return self._recording_start_failed(
+                        "recording blocked: " + "; ".join(anchor_input_blockers)
+                    )
+            log.info("recording start: refreshing teleop anchors")
+            anchor_refresh_blockers = self._refresh_recording_anchors_for_start()
+            if anchor_refresh_blockers:
+                log.warning(
+                    "recording start blocked refreshing anchors: %s",
+                    "; ".join(anchor_refresh_blockers),
+                )
+                return self._recording_start_failed(
+                    "recording blocked: " + "; ".join(anchor_refresh_blockers)
+                )
+            readiness = self._recording_readiness()
+            if readiness["calibration_blockers"]:
+                log.warning(
+                    "recording start blocked after anchor refresh: %s",
+                    "; ".join(readiness["calibration_blockers"]),
+                )
+                return self._recording_start_failed(
+                    "recording blocked: " + "; ".join(readiness["calibration_blockers"])
+                )
 
+        if enabled:
+            with self._lock:
+                self._last_task = effective_task
+            return self._start_recording_episode_locked(
+                effective_task,
+                root=(root or "").strip() or None,
+            )
+
+        rec = None
         with self._lock:
-            if not enabled and self._recording_armed and not self._recording:
+            if self._recording_armed and not self._recording:
                 self._recording_armed = False
                 self._recording_pending_task = ""
                 self._recording_pending_root = None
                 self._last_error = None
+                self._recording_notice = ""
                 return False
-            if bool(enabled) == self._recording:
+            if not self._recording:
                 return self._recording
-            if effective_task and enabled:
-                self._last_task = effective_task
-            if enabled:
-                self._start_recording_episode_locked(effective_task, root=(root or "").strip() or None)
-            else:
-                # End the in-flight episode. Capture writes finish on the
-                # recorder's internal lock; we don't hold ours during the actual
-                # save (which can take seconds for video encoding).
-                self._recording = False
-                self._recording_armed = False
-                self._recording_pending_task = ""
-                self._recording_pending_root = None
-                rec = self._recorder
+            # End the in-flight episode. Capture writes finish on the
+            # recorder's internal lock; we don't hold ours during the actual
+            # save (which can take seconds for video encoding).
+            self._recording = False
+            self._recording_armed = False
+            self._recording_pending_task = ""
+            self._recording_pending_root = None
+            rec = self._recorder
         # Save the episode OUTSIDE the session lock — `end_episode` flushes
         # frames + may invoke video encoding which can take a while.
         if not enabled and rec is not None:
@@ -4661,7 +5165,40 @@ class VRTeleopSession:
                 with self._lock:
                     if self._recorder is rec:
                         self._recorder = None
+                    self._last_error = None
+                    self._recording_notice = "episode saved"
+            else:
+                reason = getattr(rec, "last_end_reason", "") or "episode was not saved"
+                with self._lock:
+                    self._last_error = reason
+                    self._recording_notice = reason
         return self._recording
+
+    def _recording_readiness(self) -> dict[str, Any]:
+        """Split hard recording blockers from auto-refreshable anchor blockers.
+
+        Fresh post-home VR anchors are not a hard start blocker anymore:
+        pressing Start/B refreshes both anchors from the latest Quest controller
+        poses immediately before the episode opens. These blockers are kept in
+        status as operator diagnostics. Missing/stale Quest controller poses are
+        checked by `_refresh_recording_anchors_for_start` and become hard
+        start errors at the moment of recording start.
+        """
+        blockers = self._recording_calibration_blockers()
+        anchor_blockers = self._recording_anchor_blockers()
+        anchor_blocker_set = set(anchor_blockers)
+        start_blockers = [b for b in blockers if b not in anchor_blocker_set]
+        verification_blockers = self._recording_verification_blockers()
+        return {
+            "calibration_ready": not blockers,
+            "calibration_blockers": blockers,
+            "start_allowed": not start_blockers,
+            "start_blockers": start_blockers,
+            "anchor_pending": bool(anchor_blockers),
+            "anchor_blockers": anchor_blockers,
+            "verification_ready": not verification_blockers,
+            "verification_blockers": verification_blockers,
+        }
 
     def _recording_calibration_blockers(self) -> list[str]:
         """Return reasons dataset recording should not start yet."""
@@ -4708,26 +5245,50 @@ class VRTeleopSession:
                 blockers.append(f"{side} low-scale calibration test is still active")
             if arm.cal_confidence != "good":
                 blockers.append(f"{side} VR-only calibration confidence is {arm.cal_confidence}")
-            if arm.robot_verify_quality != "good":
-                if arm.robot_verify_quality in ("warn", "needs_recapture", "poor"):
-                    detail = f" residual {arm.robot_verify_fit_error_cm:.1f} cm" if arm.robot_verify_fit_error_cm is not None else ""
-                    blockers.append(f"{side} robot verification needs recapture{detail}")
-                elif arm.robot_verify_samples:
-                    missing = self._missing_robot_verification_labels(arm)
-                    suffix = f"; missing {', '.join(missing)}" if missing else "; solve verification"
-                    blockers.append(f"{side} robot verification incomplete{suffix}")
-                else:
-                    blockers.append(f"{side} robot verification missing")
-            elif arm.robot_verify_fit_error_cm is None:
-                blockers.append(f"{side} robot verification has no residual")
-            elif arm.robot_verify_fit_error_cm > ROBOT_VERIFY_PASS_ERROR_CM:
-                blockers.append(
-                    f"{side} robot verification residual {arm.robot_verify_fit_error_cm:.1f} cm"
-                )
-            elif not arm.robot_verify_test_completed:
-                blockers.append(f"{side} low-scale calibration test not completed")
+            verification_blocker = self._recording_robot_verification_blocker(
+                side, arm, include_active_test=False
+            )
+            if verification_blocker:
+                blockers.append(verification_blocker)
         blockers.extend(self._recording_anchor_blockers())
         return blockers
+
+    def _recording_verification_blockers(self) -> list[str]:
+        blockers: list[str] = []
+        for side in RECORDING_REQUIRED_SIDES:
+            blocker = self._recording_robot_verification_blocker(side, self._arms[side])
+            if blocker:
+                blockers.append(blocker)
+        return blockers
+
+    def _recording_robot_verification_blocker(
+        self,
+        side: ArmSide,
+        arm: _PerArm,
+        *,
+        include_active_test: bool = True,
+    ) -> str | None:
+        if include_active_test and arm.robot_verify_test_active:
+            return f"{side} low-scale calibration test is still active"
+        if arm.robot_verify_quality != "good":
+            if arm.robot_verify_quality in ("warn", "needs_recapture", "poor"):
+                detail = (
+                    f" residual {arm.robot_verify_fit_error_cm:.1f} cm"
+                    if arm.robot_verify_fit_error_cm is not None else ""
+                )
+                return f"{side} robot verification needs recapture{detail}"
+            if arm.robot_verify_samples:
+                missing = self._missing_robot_verification_labels(arm)
+                suffix = f"; missing {', '.join(missing)}" if missing else "; solve verification"
+                return f"{side} robot verification incomplete{suffix}"
+            return f"{side} robot verification missing"
+        if arm.robot_verify_fit_error_cm is None:
+            return f"{side} robot verification has no residual"
+        if arm.robot_verify_fit_error_cm > ROBOT_VERIFY_PASS_ERROR_CM:
+            return f"{side} robot verification residual {arm.robot_verify_fit_error_cm:.1f} cm"
+        if not arm.robot_verify_test_completed:
+            return f"{side} low-scale calibration test not completed"
+        return None
 
     def _recording_anchor_blockers(self) -> list[str]:
         connected = list(MOTORS.connected_sides)
@@ -4735,19 +5296,73 @@ class VRTeleopSession:
             return []
         return self._fresh_anchor_blockers(list(RECORDING_REQUIRED_SIDES))
 
+    @staticmethod
+    def _is_skippable_recording_camera_error(message: str) -> bool:
+        lowered = message.lower()
+        return (
+            "camera frames invalid" in lowered
+            or "camera frames missing roles" in lowered
+        )
+
+    def _skip_recording_camera_tick_or_abort(self, reason: str) -> None:
+        with self._lock:
+            now = time.time()
+            rec = self._recorder
+            if not (self._recording and rec is not None and rec.in_episode):
+                return
+            self._recording_camera_frame_skips += 1
+            self._recording_consecutive_camera_frame_skips += 1
+            self._recording_last_camera_skip_reason = reason
+            saved_frames = int(getattr(rec, "frame_count_in_episode", 0) or 0)
+            total_samples = saved_frames + self._recording_camera_frame_skips
+            skip_ratio = (
+                self._recording_camera_frame_skips / total_samples
+                if total_samples > 0 else 1.0
+            )
+            over_consecutive = (
+                self._recording_consecutive_camera_frame_skips
+                > RECORDING_MAX_CONSECUTIVE_CAMERA_SKIPS
+            )
+            over_ratio = (
+                total_samples >= RECORDING_MIN_SAMPLES_FOR_SKIP_RATIO
+                and skip_ratio > RECORDING_MAX_CAMERA_SKIP_RATIO
+            )
+            if over_consecutive or over_ratio:
+                detail = (
+                    "recording camera unstable: "
+                    f"skipped {self._recording_camera_frame_skips}/{total_samples} frame ticks "
+                    f"({skip_ratio * 100:.1f}%), "
+                    f"consecutive={self._recording_consecutive_camera_frame_skips}; "
+                    f"last={reason}"
+                )
+                self._abort_active_recording_locked(detail)
+                return
+            self._recording_notice = (
+                "camera frame skipped "
+                f"({self._recording_camera_frame_skips}/{total_samples}); "
+                f"{reason}"
+            )
+        log.warning("recording skipped incomplete camera tick: %s", reason)
+
     def _record_frame_if_active(
         self,
         commanded_this_tick: Optional[dict[ArmSide, dict[str, float]]] = None,
+        expected_driven_sides: Optional[list[ArmSide]] = None,
+        expected_held_sides: Optional[list[ArmSide]] = None,
     ) -> None:
         """If recording is on and an episode is active, append one frame.
 
-        Action = same-tick commanded joint positions for arms moved this tick,
-        with passive arms falling back to present joint positions.
+        Action = same-tick commanded joint positions for arms moved this tick.
+        Engaged arms that are holding due to IDLE/stale controller input reuse
+        their last command; passive arms use present joint positions as no-op.
         Observation.state = present joint positions (both arms).
         Observation.images.<role> = latest snapshot from each configured camera.
-        Missing arm or camera data aborts the active strict recording episode.
+        Missing arm/motor data aborts the active strict recording episode.
+        Isolated camera-frame misses are skipped within a strict per-episode
+        budget; repeated camera misses abort and discard the episode.
         """
         with self._lock:
+            now = time.time()
             rec = self._recorder
             if not (self._recording and rec is not None and rec.in_episode):
                 return
@@ -4761,24 +5376,62 @@ class VRTeleopSession:
             if set(connected) != set(RECORDING_REQUIRED_SIDES):
                 self._abort_active_recording_locked("connected arms changed during recording")
                 return
-            expected_driven: list[ArmSide] = []
-            if self._engaged:
+            expected_driven: list[ArmSide] = list(expected_driven_sides or [])
+            expected_held: list[ArmSide] = list(expected_held_sides or [])
+            held_command_by_side: dict[ArmSide, dict[str, float]] = {}
+            if expected_driven_sides is None and expected_held_sides is None and self._engaged:
                 candidates = connected if self._dual_mode else (
                     [self._active_arm] if self._active_arm in connected else []
                 )
                 for s in candidates:
                     arm = self._arms[s]
-                    if (
-                        arm.latest.mode == "position"
-                        and self._teleop_anchor_fresh(s)
+                    goal = arm.latest
+                    goal_age = now - goal.received_at if goal.has_data else 1e9
+                    controls_arm = (
+                        arm.calibrated
                         and MOTORS.is_torque_enabled(s)
                         and not arm.homing
+                    )
+                    if controls_arm:
+                        prefix = f"{s}_arm_"
+                        held = {
+                            f"{prefix}{j}": float(arm.last_commanded_targets[f"{prefix}{j}"])
+                            for j in _motors.JOINTS_PER_ARM
+                            if f"{prefix}{j}" in arm.last_commanded_targets
+                        }
+                        if len(held) == len(_motors.JOINTS_PER_ARM):
+                            held_command_by_side[s] = held
+                    if (
+                        controls_arm
+                        and goal.has_data
+                        and goal_age <= GOAL_SKIP_AGE_S
+                        and goal.mode == "position"
                     ):
                         expected_driven.append(s)
+                    elif controls_arm:
+                        expected_held.append(s)
+            for s in expected_held:
+                arm = self._arms[s]
+                if not (arm.calibrated and MOTORS.is_torque_enabled(s) and not arm.homing):
+                    continue
+                prefix = f"{s}_arm_"
+                held = {
+                    f"{prefix}{j}": float(arm.last_commanded_targets[f"{prefix}{j}"])
+                    for j in _motors.JOINTS_PER_ARM
+                    if f"{prefix}{j}" in arm.last_commanded_targets
+                }
+                if len(held) == len(_motors.JOINTS_PER_ARM):
+                    held_command_by_side[s] = held
             missing_driven = [s for s in expected_driven if not commanded_by_side.get(s)]
             if missing_driven:
                 self._abort_active_recording_locked(
                     "missing same-tick motor command for driven arm(s): " + ", ".join(missing_driven)
+                )
+                return
+            missing_held = [s for s in expected_held if not held_command_by_side.get(s)]
+            if missing_held:
+                self._abort_active_recording_locked(
+                    "missing held motor command for controlled arm(s): " + ", ".join(missing_held)
                 )
                 return
         # Outside lock: read present positions (bus I/O) + camera snapshots.
@@ -4792,20 +5445,32 @@ class VRTeleopSession:
             prefix = f"{s}_arm_"
             if commanded_by_side.get(s):
                 action_dict.update(commanded_by_side[s])
+            elif held_command_by_side.get(s):
+                action_dict.update(held_command_by_side[s])
             else:
                 for j in _motors.JOINTS_PER_ARM:
                     key = f"{prefix}{j}"
                     if key in present_dict:
                         action_dict[key] = float(present_dict[key])
         try:
-            cam_frames = _dataset.grab_camera_frames()
+            if hasattr(rec, "grab_camera_frames"):
+                cam_frames = rec.grab_camera_frames()
+            else:
+                cam_frames = _dataset.grab_camera_frames()
         except Exception as e:
             self._abort_recording_due_to_error(f"record: grab_camera_frames failed: {e}")
             return
         try:
             rec.add_frame(action_dict, present_dict, cam_frames)
         except Exception as e:
-            self._abort_recording_due_to_error(f"record: strict frame rejected: {e}")
+            reason = f"record: strict frame rejected: {e}"
+            if self._is_skippable_recording_camera_error(str(e)):
+                self._skip_recording_camera_tick_or_abort(reason)
+                return
+            self._abort_recording_due_to_error(reason)
+            return
+        with self._lock:
+            self._recording_consecutive_camera_frame_skips = 0
 
     def _abort_active_recording_locked(self, reason: str) -> None:
         """Abort the current episode without saving. Caller holds self._lock."""
@@ -4814,6 +5479,7 @@ class VRTeleopSession:
         self._recording_pending_task = ""
         self._recording_pending_root = None
         self._last_error = reason
+        self._recording_notice = reason
         rec = self._recorder
         if rec is not None and hasattr(rec, "discard_episode"):
             try:
@@ -4870,7 +5536,7 @@ class VRTeleopSession:
           5. Calibrated SO101 URDF IK for pan/lift/elbow in LeRobot motor
              degrees; large jumps are rejected and the previous solution is
              reused. Missing URDF kinematics holds the target instead of
-             issuing fallback commands.
+             issuing uncalibrated commands.
           6. Wrist flex/roll come directly from the smoothed orientation delta
              (no IK, no EMA) so they stay snappy.
           7. The drive loop rate-caps every joint, applies weighted filtering
