@@ -54,6 +54,41 @@ def _load_yaml() -> dict[str, Any]:
     return yaml.safe_load(CONFIG_YAML.read_text()) or {}
 
 
+def _load_recording_joint_caps(cfg: dict[str, Any]) -> dict[str, float]:
+    """Load the same per-tick action caps used by VR recording."""
+    caps = dict(RECORDING_PER_TICK_DEG_CAPS)
+    vr_cfg = cfg.get("vr") if isinstance(cfg, dict) else None
+    raw_caps = vr_cfg.get("joint_deg_caps") if isinstance(vr_cfg, dict) else None
+    if isinstance(raw_caps, dict):
+        for joint, value in raw_caps.items():
+            if joint in caps:
+                try:
+                    caps[joint] = max(0.1, min(30.0, float(value)))
+                except (TypeError, ValueError) as e:
+                    raise SystemExit(f"invalid vr.joint_deg_caps.{joint}: {value!r}") from e
+    return caps
+
+
+def _load_robot_max_relative_target(cfg: dict[str, Any]) -> float | dict[str, float] | None:
+    robot_cfg = cfg.get("robot") if isinstance(cfg, dict) else None
+    raw_target = robot_cfg.get("max_relative_target") if isinstance(robot_cfg, dict) else None
+    if raw_target is None:
+        return None
+    if isinstance(raw_target, (int, float)):
+        return max(0.0, float(raw_target))
+    if isinstance(raw_target, dict):
+        out: dict[str, float] = {}
+        for key, value in raw_target.items():
+            suffix = _joint_suffix(str(key))
+            if suffix in RECORDING_PER_TICK_DEG_CAPS:
+                try:
+                    out[suffix] = max(0.0, float(value))
+                except (TypeError, ValueError) as e:
+                    raise SystemExit(f"invalid robot.max_relative_target.{key}: {value!r}") from e
+        return out
+    sys.exit(f"invalid robot.max_relative_target: {raw_target!r}")
+
+
 def _parse_args() -> argparse.Namespace:
     cfg = _load_yaml()
     ds = cfg.get("dataset") or {}
@@ -348,7 +383,12 @@ def _preflight_dataset(args: argparse.Namespace, rename_map: dict[str, str]) -> 
         sys.exit("dataset preflight failed: rename_map source keys missing: " + ", ".join(missing_rename))
 
     _preflight_xlerobot_joint_metadata(ds.meta.features)
-    _preflight_action_continuity(ds)
+    cfg = _load_yaml()
+    _preflight_action_continuity(
+        ds,
+        _load_recording_joint_caps(cfg),
+        _load_robot_max_relative_target(cfg),
+    )
 
     sample_indices = sorted(set([0, len(ds) // 2, len(ds) - 1]))
     for idx in sample_indices:
@@ -414,11 +454,18 @@ def _preflight_xlerobot_joint_metadata(features: dict[str, Any]) -> None:
         )
 
 
-def _preflight_action_continuity(ds: Any) -> None:
+def _preflight_action_continuity(
+    ds: Any,
+    recording_joint_caps: dict[str, float],
+    max_relative_target: float | dict[str, float] | None = None,
+) -> None:
     actions = np.asarray(ds.hf_dataset["action"], dtype=np.float32)
+    states = np.asarray(ds.hf_dataset["observation.state"], dtype=np.float32)
     episode_index = np.asarray(ds.hf_dataset["episode_index"], dtype=np.int64)
     if actions.ndim != 2 or actions.shape[1] != len(XLEROBOT_JOINT_ORDER):
         sys.exit(f"dataset preflight failed: expected action matrix Nx12, got {actions.shape}")
+    if states.shape != actions.shape:
+        sys.exit(f"dataset preflight failed: expected observation.state matrix {actions.shape}, got {states.shape}")
     if len(actions) < 2:
         return
 
@@ -427,12 +474,22 @@ def _preflight_action_continuity(ds: Any) -> None:
     same_episode = episode_index[1:] == episode_index[:-1]
     deltas = np.abs(np.diff(actions, axis=0))
     caps = np.asarray(
-        [RECORDING_PER_TICK_DEG_CAPS.get(_joint_suffix(name), 1.0) for name in normalized_names],
+        [recording_joint_caps.get(_joint_suffix(name), 1.0) for name in normalized_names],
         dtype=np.float32,
     )
+    max_rel = _max_relative_target_array(normalized_names, max_relative_target)
     # Small margin avoids false positives from float encoding and older cap tweaks,
     # while still catching action/state fallback jumps.
-    over = (deltas > (caps[None, :] + 0.75)) & same_episode[:, None]
+    raw_over = (deltas > (caps[None, :] + 0.75)) & same_episode[:, None]
+    if max_rel is not None:
+        action_state_delta = np.abs(actions - states)
+        safety_clip_active = (
+            (action_state_delta[:-1] >= (max_rel[None, :] - 0.75))
+            | (action_state_delta[1:] >= (max_rel[None, :] - 0.75))
+        )
+        over = raw_over & ~safety_clip_active
+    else:
+        over = raw_over
     if not over.any():
         return
 
@@ -459,6 +516,23 @@ def _preflight_action_continuity(ds: Any) -> None:
         "with the fixed recorder before finetuning.\n"
         + details
     )
+
+
+def _max_relative_target_array(
+    normalized_names: list[str],
+    max_relative_target: float | dict[str, float] | None,
+) -> np.ndarray | None:
+    if max_relative_target is None:
+        return None
+    if isinstance(max_relative_target, (int, float)):
+        return np.full(len(normalized_names), float(max_relative_target), dtype=np.float32)
+    values: list[float] = []
+    for name in normalized_names:
+        suffix = _joint_suffix(name)
+        if suffix not in max_relative_target:
+            return None
+        values.append(float(max_relative_target[suffix]))
+    return np.asarray(values, dtype=np.float32)
 
 
 def main() -> None:

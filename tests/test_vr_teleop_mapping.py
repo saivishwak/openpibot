@@ -34,6 +34,7 @@ def _six_axis_samples(matrix):
 class _FakeKinematics:
     def __init__(self):
         self._analytical = vr._SO101Kin()
+        self.ik_seeds = []
 
     def forward_kinematics(self, q_deg):
         q = np.asarray(q_deg, dtype=float)
@@ -45,10 +46,12 @@ class _FakeKinematics:
             reach * math.sin(pan_rad),
             z,
         )
-        pitch = float(q[1] + q[2] + q[3])
+        wrist_flex = float(q[3]) if q.shape[0] > 3 else 0.0
+        wrist_roll = float(q[4]) if q.shape[0] > 4 else 0.0
+        pitch = float(q[1] + q[2] + wrist_flex)
         T[:3, :3] = vr._R.from_euler(
             "zyx",
-            [float(q[0]), pitch, float(q[4])],
+            [float(q[0]), pitch, wrist_roll],
             degrees=True,
         ).as_matrix()
         return T
@@ -62,6 +65,7 @@ class _FakeKinematics:
         orientation_weight=0.0,
     ):
         q = np.asarray(q_seed, dtype=float).copy()
+        self.ik_seeds.append(q.copy())
         tx, ty, tz = np.asarray(target_T[:3, 3], dtype=float)
         q[0] = math.degrees(math.atan2(float(ty), float(tx)))
         q[1], q[2] = self._analytical.inverse(math.hypot(float(tx), float(ty)), float(tz))
@@ -139,6 +143,7 @@ def _mark_recording_ready(session, monkeypatch):
     for side in ("left", "right"):
         arm = session._arms[side]
         _mark_urdf_available(arm)
+        _mark_wrist_axes(arm)
         arm.cal_confidence = "good"
         arm.robot_verify_quality = "good"
         arm.robot_verify_fit_error_cm = 0.0
@@ -148,6 +153,11 @@ def _mark_recording_ready(session, monkeypatch):
         arm.calibrated = True
         arm.anchor_generation = arm.pose_generation
         arm.anchor_invalid_reason = ""
+
+
+def _mark_wrist_axes(arm):
+    arm.wrist_pitch_canonical = (1.0, 0.0, 0.0)
+    arm.wrist_roll_canonical = (0.0, 0.0, -1.0)
 
 
 def _configure_compute_target_arm(session, monkeypatch, *, side="right", matrix=None):
@@ -162,8 +172,7 @@ def _configure_compute_target_arm(session, monkeypatch, *, side="right", matrix=
     arm.controller_anchor_T = vr._pose_matrix_from_vr((0.0, 0.0, 0.0), (0.0, 0.0, 0.0, 1.0))
     arm.anchor_ee_pos = (0.20, 0.0, 0.05)
     arm.anchor_R_robot = np.eye(3)
-    arm.smoothed_R_target = np.eye(3)
-    arm.target_R_robot = np.eye(3)
+    _mark_wrist_axes(arm)
     arm.anchor = vr._AnchorPose(
         shoulder_lift_deg=-60.0,
         elbow_flex_deg=45.0,
@@ -171,6 +180,9 @@ def _configure_compute_target_arm(session, monkeypatch, *, side="right", matrix=
         wrist_roll_deg=0.0,
         captured=True,
     )
+    arm.last_body_q_sol = np.array([0.0, -60.0, 45.0], dtype=float)
+    arm.last_q_sol = np.array([0.0, -60.0, 45.0, 20.0, 0.0], dtype=float)
+    arm.last_q_filtered = arm.last_q_sol.copy()
     return arm
 
 
@@ -392,8 +404,7 @@ def test_left_verified_runtime_keeps_forward_axis_when_solved_matrix_is_degenera
     arm.controller_anchor_T = vr._pose_matrix_from_vr((0.0, 0.0, 0.0), (0.0, 0.0, 0.0, 1.0))
     arm.anchor_ee_pos = (0.20, 0.0, 0.05)
     arm.anchor_R_robot = np.eye(3)
-    arm.smoothed_R_target = np.eye(3)
-    arm.target_R_robot = np.eye(3)
+    _mark_wrist_axes(arm)
     arm.anchor = vr._AnchorPose(
         shoulder_lift_deg=-60.0,
         elbow_flex_deg=45.0,
@@ -615,8 +626,7 @@ def test_compute_targets_reconciles_clamped_offset(monkeypatch):
     arm.controller_anchor_T = vr._pose_matrix_from_vr((0.0, 0.0, 0.0), (0.0, 0.0, 0.0, 1.0))
     arm.anchor_ee_pos = (0.20, 0.0, 0.05)
     arm.anchor_R_robot = np.eye(3)
-    arm.smoothed_R_target = np.eye(3)
-    arm.target_R_robot = np.eye(3)
+    _mark_wrist_axes(arm)
     arm.anchor = vr._AnchorPose(
         shoulder_lift_deg=-60.0,
         elbow_flex_deg=45.0,
@@ -654,8 +664,7 @@ def test_compute_targets_ignores_packet_delta_when_world_pose_is_static(monkeypa
     arm.controller_anchor_T = vr._pose_matrix_from_vr((0.0, 0.0, 0.0), (0.0, 0.0, 0.0, 1.0))
     arm.anchor_ee_pos = (0.20, 0.0, 0.05)
     arm.anchor_R_robot = np.eye(3)
-    arm.smoothed_R_target = np.eye(3)
-    arm.target_R_robot = np.eye(3)
+    _mark_wrist_axes(arm)
     arm.anchor = vr._AnchorPose(
         shoulder_lift_deg=-60.0,
         elbow_flex_deg=45.0,
@@ -759,8 +768,7 @@ def test_compute_targets_uses_absolute_controller_displacement_over_packet_batch
     arm.controller_anchor_T = vr._pose_matrix_from_vr((0.0, 0.0, 0.0), (0.0, 0.0, 0.0, 1.0))
     arm.anchor_ee_pos = (0.20, 0.0, 0.05)
     arm.anchor_R_robot = np.eye(3)
-    arm.smoothed_R_target = np.eye(3)
-    arm.target_R_robot = np.eye(3)
+    _mark_wrist_axes(arm)
     arm.pending_rel_position = (0.0012, 0.0, 0.0)
     arm.anchor = vr._AnchorPose(
         shoulder_lift_deg=-60.0,
@@ -797,8 +805,7 @@ def test_compute_targets_caps_large_relative_position_spike(monkeypatch):
     arm.controller_anchor_T = vr._pose_matrix_from_vr((0.0, 0.0, 0.0), (0.0, 0.0, 0.0, 1.0))
     arm.anchor_ee_pos = (0.20, 0.0, 0.05)
     arm.anchor_R_robot = np.eye(3)
-    arm.smoothed_R_target = np.eye(3)
-    arm.target_R_robot = np.eye(3)
+    _mark_wrist_axes(arm)
     arm.anchor = vr._AnchorPose(
         shoulder_lift_deg=-60.0,
         elbow_flex_deg=45.0,
@@ -829,9 +836,6 @@ def test_wrist_roll_position_jitter_does_not_move_arm_joints(monkeypatch):
     monkeypatch.setattr(vr, "POS_EMA_ALPHA", 1.0)
     monkeypatch.setattr(vr, "MAX_EE_STEP_M", 1.0)
     monkeypatch.setattr(vr, "POS_DEADZONE_M", 0.002)
-    monkeypatch.setattr(vr, "ORI_EMA_ALPHA", 1.0)
-    monkeypatch.setattr(vr, "ROT_DEADZONE_RAD", 0.0)
-    monkeypatch.setattr(vr, "WRIST_RAD_DELTA_LIMIT", math.radians(45.0))
     monkeypatch.setitem(
         vr._WRIST_MOTOR_POLARITY,
         "right",
@@ -880,14 +884,11 @@ def test_wrist_roll_position_jitter_does_not_move_arm_joints(monkeypatch):
     assert arm.targets.wrist_roll > 5.0
 
 
-def test_wrist_roll_cap_is_not_reduced_by_translation_scale(monkeypatch):
+def test_direct_wrist_roll_uses_full_controller_rotation_independent_of_translation_scale(monkeypatch):
     session = vr.VRTeleopSession()
     arm = _configure_compute_target_arm(session, monkeypatch, matrix=np.eye(3))
     arm.vr_ctrl_to_ee = vr._R.identity()
     monkeypatch.setattr(vr, "POS_DEADZONE_M", 0.0)
-    monkeypatch.setattr(vr, "ORI_EMA_ALPHA", 1.0)
-    monkeypatch.setattr(vr, "ROT_DEADZONE_RAD", 0.0)
-    monkeypatch.setattr(vr, "WRIST_RAD_DELTA_LIMIT", math.radians(8.0))
     monkeypatch.setitem(
         vr._WRIST_MOTOR_POLARITY,
         "right",
@@ -908,7 +909,140 @@ def test_wrist_roll_cap_is_not_reduced_by_translation_scale(monkeypatch):
         scale=0.2,
     )
 
-    assert arm.last_diag["wrist_delta_deg"][1] == pytest.approx(8.0, abs=0.2)
+    assert arm.last_diag["wrist_mapping_source"] == "direct_controller_rotation"
+    assert arm.last_diag["wrist_delta_deg"][1] == pytest.approx(math.degrees(0.5), abs=1e-6)
+    assert arm.targets.wrist_roll == pytest.approx(math.degrees(0.5), abs=1e-6)
+
+
+def test_direct_wrist_flex_does_not_follow_body_ik(monkeypatch):
+    class BodyChangingKinematics(_FakeKinematics):
+        def inverse_kinematics(
+            self,
+            q_seed,
+            target_T,
+            *,
+            position_weight=1.0,
+            orientation_weight=0.0,
+        ):
+            q = np.asarray(q_seed, dtype=float).copy()
+            q[:3] = np.array([12.0, -30.0, 60.0], dtype=float)
+            return q
+
+    session = vr.VRTeleopSession()
+    arm = _configure_compute_target_arm(session, monkeypatch, matrix=np.eye(3))
+    arm.kinematics = BodyChangingKinematics()
+    arm.last_q_sol = np.array([10.0, -35.0, 55.0, 20.0, 0.0], dtype=float)
+    arm.last_body_q_sol = arm.last_q_sol[:3].copy()
+    arm.last_q_filtered = arm.last_q_sol.copy()
+
+    session._compute_targets_from_vr(
+        "right",
+        vr._LatestGoal(
+            received_at=1.0,
+            has_data=True,
+            mode="position",
+            controller_position=(0.05, 0.0, 0.0),
+            rotation_quat=(0.0, 0.0, 0.0, 1.0),
+            trigger=False,
+        ),
+        scale=1.0,
+    )
+
+    assert (arm.targets.shoulder_pan, arm.targets.shoulder_lift, arm.targets.elbow_flex) == pytest.approx(
+        (12.0, -30.0, 60.0)
+    )
+    assert arm.targets.wrist_flex == pytest.approx(20.0)
+    assert arm.targets.wrist_roll == pytest.approx(0.0)
+    assert arm.last_diag["wrist_delta_deg"] == pytest.approx([0.0, 0.0])
+
+
+@pytest.mark.parametrize("side", ["left", "right"])
+def test_compute_targets_seeds_body_ik_without_direct_wrist_values(monkeypatch, side):
+    class BodySeedRecordingKinematics(_FakeKinematics):
+        def inverse_kinematics(
+            self,
+            q_seed,
+            target_T,
+            *,
+            position_weight=1.0,
+            orientation_weight=0.0,
+        ):
+            q = np.asarray(q_seed, dtype=float).copy()
+            self.ik_seeds.append(q.copy())
+            assert q.shape == (len(vr._BODY_IK_JOINT_ORDER),)
+            return np.array([12.0, -30.0, 60.0], dtype=float)
+
+    session = vr.VRTeleopSession()
+    arm = _configure_compute_target_arm(session, monkeypatch, side=side, matrix=np.eye(3))
+    arm.kinematics = BodySeedRecordingKinematics()
+    arm.last_body_q_sol = np.array([10.0, -35.0, 55.0], dtype=float)
+    arm.last_q_sol = np.array([10.0, -35.0, 55.0, 85.0, -75.0], dtype=float)
+    arm.last_q_filtered = arm.last_q_sol.copy()
+
+    session._compute_targets_from_vr(
+        side,
+        vr._LatestGoal(
+            received_at=1.0,
+            has_data=True,
+            mode="position",
+            controller_position=(0.05, 0.0, 0.0),
+            rotation_quat=(0.0, 0.0, 0.0, 1.0),
+            trigger=False,
+        ),
+        scale=1.0,
+    )
+
+    assert len(arm.kinematics.ik_seeds) == 1
+    np.testing.assert_allclose(arm.kinematics.ik_seeds[0], [10.0, -35.0, 55.0])
+    np.testing.assert_allclose(arm.last_body_q_sol, [12.0, -30.0, 60.0])
+    np.testing.assert_allclose(arm.last_q_sol[:3], [12.0, -30.0, 60.0])
+    assert arm.last_q_sol[3] == pytest.approx(20.0)
+    assert arm.last_q_sol[4] == pytest.approx(0.0)
+
+
+def test_capture_anchor_requires_wrist_axes(monkeypatch):
+    session = vr.VRTeleopSession()
+    monkeypatch.setattr(vr, "MOTORS", _BoundsOnlyMotors())
+    monkeypatch.setattr(vr, "_load_urdf_kinematics", lambda: _FakeKinematics())
+
+    arm = session._arms["right"]
+    arm.latest = vr._LatestGoal(
+        received_at=1.0,
+        has_data=True,
+        mode="reset",
+        controller_position=(0.1, 0.2, 0.3),
+        rotation_quat=(0.0, 0.0, 0.0, 1.0),
+    )
+
+    with pytest.raises(RuntimeError, match="wrist pitch/roll calibration missing"):
+        session._capture_anchor("right")
+
+    assert arm.calibrated is False
+    assert "wrist pitch/roll calibration missing" in arm.anchor_invalid_reason
+
+
+def test_capture_anchor_requires_controller_pose(monkeypatch):
+    session = vr.VRTeleopSession()
+    monkeypatch.setattr(vr, "MOTORS", _BoundsOnlyMotors())
+    monkeypatch.setattr(vr, "_load_urdf_kinematics", lambda: _FakeKinematics())
+
+    arm = session._arms["right"]
+    _mark_wrist_axes(arm)
+    arm.latest = vr._LatestGoal(
+        received_at=1.0,
+        has_data=True,
+        mode="reset",
+        controller_position=(0.1, 0.2, 0.3),
+        rotation_quat=None,
+    )
+
+    with pytest.raises(RuntimeError, match="controller pose missing during reset"):
+        session._capture_anchor("right")
+
+    assert arm.calibrated is False
+    assert arm.controller_anchor_T is None
+    assert arm.vr_ctrl_to_ee is None
+    assert "controller pose missing during reset" in arm.anchor_invalid_reason
 
 
 def test_capture_anchor_sets_controller_to_ee_frame(monkeypatch):
@@ -918,6 +1052,7 @@ def test_capture_anchor_sets_controller_to_ee_frame(monkeypatch):
     monkeypatch.setattr(vr, "_load_urdf_kinematics", lambda: _FakeKinematics())
 
     arm = session._arms["right"]
+    _mark_wrist_axes(arm)
     arm.latest = vr._LatestGoal(
         received_at=1.0,
         has_data=True,
@@ -941,6 +1076,7 @@ def test_capture_anchor_resets_quality_metrics(monkeypatch):
     monkeypatch.setattr(vr, "_load_urdf_kinematics", lambda: _FakeKinematics())
 
     arm = session._arms["right"]
+    _mark_wrist_axes(arm)
     arm.quality_ticks = 12
     arm.quality_ik_rejects = 3
     arm.quality_offset_speed_ema_mps = 0.42
@@ -977,8 +1113,7 @@ def test_dual_arm_relative_offsets_are_independent(monkeypatch):
         arm.controller_anchor_T = vr._pose_matrix_from_vr((0.0, 0.0, 0.0), (0.0, 0.0, 0.0, 1.0))
         arm.anchor_ee_pos = (0.20, 0.0, 0.05)
         arm.anchor_R_robot = np.eye(3)
-        arm.smoothed_R_target = np.eye(3)
-        arm.target_R_robot = np.eye(3)
+        _mark_wrist_axes(arm)
         arm.anchor = vr._AnchorPose(
             shoulder_lift_deg=-60.0,
             elbow_flex_deg=45.0,
@@ -1005,7 +1140,7 @@ def test_dual_arm_relative_offsets_are_independent(monkeypatch):
     np.testing.assert_allclose(session._arms["right"].vr_offset_accum, (0.01, 0.0, 0.0))
 
 
-def test_invert_lateral_keeps_controller_to_ee_wrist_alignment(monkeypatch):
+def test_direct_wrist_ignores_lateral_invert_and_controller_to_ee_alignment(monkeypatch):
     session = vr.VRTeleopSession()
     monkeypatch.setattr(vr, "MOTORS", _BoundsOnlyMotors())
     monkeypatch.setattr(vr, "POS_EMA_ALPHA", 1.0)
@@ -1020,8 +1155,7 @@ def test_invert_lateral_keeps_controller_to_ee_wrist_alignment(monkeypatch):
     arm.vr_ctrl_to_ee = vr._R.from_euler("z", 90, degrees=True)
     arm.anchor_ee_pos = (0.20, 0.0, 0.05)
     arm.anchor_R_robot = np.eye(3)
-    arm.smoothed_R_target = np.eye(3)
-    arm.target_R_robot = np.eye(3)
+    _mark_wrist_axes(arm)
     arm.anchor = vr._AnchorPose(
         shoulder_lift_deg=-60.0,
         elbow_flex_deg=45.0,
@@ -1049,8 +1183,8 @@ def test_invert_lateral_keeps_controller_to_ee_wrist_alignment(monkeypatch):
         pitch_canonical=arm.wrist_pitch_canonical,
         roll_canonical=arm.wrist_roll_canonical,
     )
-    expected_pitch = arm.vr_ctrl_to_ee.apply(pitch_axis)
-    np.testing.assert_allclose(arm.last_diag["wrist_axes"]["pitch"], expected_pitch, atol=1e-6)
+    np.testing.assert_allclose(arm.last_diag["wrist_axes"]["pitch"], pitch_axis, atol=1e-6)
+    assert arm.last_diag["wrist_mapping_source"] == "direct_controller_rotation"
 
 
 @pytest.mark.parametrize(
@@ -1085,6 +1219,68 @@ def test_positive_wrist_motor_polarity_preserves_calibrated_direction(monkeypatc
     )
 
     assert arm.last_diag["wrist_delta_deg"][delta_index] > 0.0
+
+
+def test_left_direct_wrist_roll_preserves_calibrated_clockwise_direction(monkeypatch):
+    session = vr.VRTeleopSession()
+    arm = _configure_compute_target_arm(session, monkeypatch, side="left", matrix=np.eye(3))
+    arm.wrist_roll_canonical = (0.0, 0.0, -1.0)
+    monkeypatch.setitem(
+        vr._WRIST_MOTOR_POLARITY,
+        "left",
+        {"flex": 1.0, "roll": 1.0},
+    )
+
+    # The left controller's local frame is mirrored, so runtime transposes the
+    # raw controller delta before projecting onto the left effective roll axis.
+    # Positive left roll polarity must still preserve the calibrated clockwise
+    # roll direction at the robot wrist.
+    quat = vr._R.from_rotvec(np.array([0.0, 0.0, -0.20], dtype=float)).as_quat()
+    session._compute_targets_from_vr(
+        "left",
+        vr._LatestGoal(
+            received_at=1.0,
+            has_data=True,
+            mode="position",
+            rel_position=(0.0, 0.0, 0.0),
+            controller_position=(0.0, 0.0, 0.0),
+            rotation_quat=tuple(float(v) for v in quat),
+            trigger=False,
+        ),
+        scale=1.0,
+    )
+
+    assert arm.last_diag["wrist_delta_deg"][1] == pytest.approx(math.degrees(0.20), abs=1e-6)
+    assert arm.targets.wrist_roll == pytest.approx(math.degrees(0.20), abs=1e-6)
+
+
+def test_left_direct_wrist_flex_preserves_calibrated_yaw_direction(monkeypatch):
+    session = vr.VRTeleopSession()
+    arm = _configure_compute_target_arm(session, monkeypatch, side="left", matrix=np.eye(3))
+    arm.wrist_pitch_canonical = (1.0, 0.0, 0.0)
+    monkeypatch.setitem(
+        vr._WRIST_MOTOR_POLARITY,
+        "left",
+        {"flex": -1.0, "roll": 1.0},
+    )
+
+    quat = vr._R.from_rotvec(np.array([-0.20, 0.0, 0.0], dtype=float)).as_quat()
+    session._compute_targets_from_vr(
+        "left",
+        vr._LatestGoal(
+            received_at=1.0,
+            has_data=True,
+            mode="position",
+            rel_position=(0.0, 0.0, 0.0),
+            controller_position=(0.0, 0.0, 0.0),
+            rotation_quat=tuple(float(v) for v in quat),
+            trigger=False,
+        ),
+        scale=1.0,
+    )
+
+    assert arm.last_diag["wrist_delta_deg"][0] == pytest.approx(math.degrees(0.20), abs=1e-6)
+    assert arm.targets.wrist_flex == pytest.approx(20.0 + math.degrees(0.20), abs=1e-6)
 
 
 def test_robot_verification_capture_uses_absolute_controller_delta(monkeypatch):
@@ -1520,6 +1716,7 @@ def test_status_exposes_reachy_style_operator_summary(monkeypatch):
     for side in ("left", "right"):
         arm = session._arms[side]
         _mark_urdf_available(arm)
+        _mark_wrist_axes(arm)
         arm.cal_confidence = "good"
         arm.robot_verify_quality = "good"
         arm.robot_verify_fit_error_cm = 0.0

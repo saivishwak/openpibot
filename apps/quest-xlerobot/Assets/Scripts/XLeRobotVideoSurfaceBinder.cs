@@ -15,6 +15,8 @@ namespace XLeRobot.QuestTeleop
         [SerializeField] private Renderer leftWristRenderer;
         [SerializeField] private Renderer rightWristRenderer;
         [SerializeField] private bool flipHeadHorizontally = true;
+        [SerializeField] private bool flipLeftWristHorizontally = true;
+        [SerializeField] private bool flipRightWristHorizontally = true;
 
         public void BindRawImages(RawImage head, RawImage leftWrist, RawImage rightWrist)
         {
@@ -37,12 +39,12 @@ namespace XLeRobot.QuestTeleop
 
         public void SetLeftWristTexture(Texture texture)
         {
-            Apply(leftWristImage, leftWristRenderer, texture, false);
+            Apply(leftWristImage, leftWristRenderer, texture, flipLeftWristHorizontally);
         }
 
         public void SetRightWristTexture(Texture texture)
         {
-            Apply(rightWristImage, rightWristRenderer, texture, false);
+            Apply(rightWristImage, rightWristRenderer, texture, flipRightWristHorizontally);
         }
 
         private static void Apply(RawImage image, Renderer rendererTarget, Texture texture, bool flipHorizontally)

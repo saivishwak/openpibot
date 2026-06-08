@@ -18,6 +18,8 @@ def test_robot_verification_persists_separately_from_vr_direction(tmp_path, monk
         up_motion_m=0.11,
         left_motion_m=0.09,
         confidence="good",
+        wrist_pitch_anchor_local=(1.0, 0.0, 0.0),
+        wrist_roll_anchor_local=(0.0, 0.0, -1.0),
     )
     cal.write_robot_verification_for_arm(
         "right",
@@ -48,6 +50,67 @@ def test_robot_verification_persists_separately_from_vr_direction(tmp_path, monk
     assert cal.translation_scale_for_arm("right") == pytest.approx(0.5)
     np.testing.assert_allclose(cal.matrix_for_arm("right"), base)
     np.testing.assert_allclose(cal.verified_matrix_for_arm("right"), base)
+
+
+def test_vr_direction_persistence_requires_wrist_axes(tmp_path, monkeypatch):
+    cfg_path = tmp_path / "vr_calibration.yaml"
+    monkeypatch.setattr(cal, "CFG_PATH", cfg_path)
+
+    with pytest.raises(ValueError, match="wrist_pitch_anchor_local is required"):
+        cal.write_for_arm("right", np.eye(3), wrist_roll_anchor_local=(0.0, 0.0, -1.0))
+
+
+def test_status_requires_both_wrist_axes_for_ready(tmp_path, monkeypatch):
+    cfg_path = tmp_path / "vr_calibration.yaml"
+    monkeypatch.setattr(cal, "CFG_PATH", cfg_path)
+    cfg_path.write_text(yaml.safe_dump({
+        "active_profile": "default",
+        "profiles": {
+            "default": {
+                "right": {
+                    "calibration_mode": "vr_direction",
+                    "teleop_source": "native_quest",
+                    "coordinate_frame": "quest_operator_frame",
+                    "session_vr_to_robot": np.eye(3).tolist(),
+                    "wrist_pitch_anchor_local": [1.0, 0.0, 0.0],
+                }
+            }
+        },
+    }))
+
+    right = cal.status()["right"]
+
+    assert right["has_empirical_wrist_pitch_canonical"] is True
+    assert right["has_empirical_wrist_roll_canonical"] is False
+    assert right["has_empirical_wrist_canonical"] is False
+    assert right["wrist_axes_ready"] is False
+
+
+def test_status_rejects_malformed_wrist_axis(tmp_path, monkeypatch):
+    cfg_path = tmp_path / "vr_calibration.yaml"
+    monkeypatch.setattr(cal, "CFG_PATH", cfg_path)
+    cfg_path.write_text(yaml.safe_dump({
+        "active_profile": "default",
+        "profiles": {
+            "default": {
+                "right": {
+                    "calibration_mode": "vr_direction",
+                    "teleop_source": "native_quest",
+                    "coordinate_frame": "quest_operator_frame",
+                    "session_vr_to_robot": np.eye(3).tolist(),
+                    "wrist_pitch_anchor_local": [0.0, 0.0, 0.0],
+                    "wrist_roll_anchor_local": [0.0, 0.0, -1.0],
+                }
+            }
+        },
+    }))
+
+    right = cal.status()["right"]
+
+    assert right["has_empirical_wrist_pitch_canonical"] is False
+    assert right["has_empirical_wrist_roll_canonical"] is True
+    assert right["has_empirical_wrist_canonical"] is False
+    assert right["wrist_axes_ready"] is False
 
 
 def test_robot_verification_reader_accepts_legacy_flat_entry():

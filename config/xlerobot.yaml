@@ -55,11 +55,8 @@ pi05:
 vr:
   kp: 0.75
   homing_present_tolerance_deg: 4.0
-  wrist_delta_limit_deg: 8.0
   pos_ema_alpha: 0.22
-  ori_ema_alpha: 0.25
   pos_deadzone_m: 0.002
-  rot_deadzone_deg: 0.7
   max_ee_step_m: 0.003
   quest_video:
     roles:
@@ -74,8 +71,8 @@ vr:
     saturation: 1.0
   wrist_motor_polarity:
     left:
-      flex: 1
-      roll: -1
+      flex: -1
+      roll: 1
     right:
       flex: -1
       roll: 1

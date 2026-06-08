@@ -217,6 +217,18 @@ def _valid_matrix(raw: Any, *, side: str, label: str) -> np.ndarray | None:
         return None
 
 
+def _valid_wrist_axis(raw: Any) -> bool:
+    try:
+        axis = np.asarray(raw, dtype=float)
+    except Exception:
+        return False
+    return (
+        axis.shape == (3,)
+        and np.all(np.isfinite(axis))
+        and float(np.linalg.norm(axis)) > 1e-6
+    )
+
+
 def matrix_for_arm(side: str) -> np.ndarray | None:
     """The 3×3 session_vr_to_robot matrix for one arm, or None if not saved
     OR if the saved data is malformed (wrong shape, bad values)."""
@@ -310,15 +322,25 @@ def write_for_arm(side: str, matrix: np.ndarray,
         hardware configuration — NOT a wizard output — so we deliberately do
         not write old runtime `wrist_flex_sign` / `wrist_roll_sign` keys. Any
         stale entries left over from older versions are dropped on re-write.
-      - `wrist_pitch_anchor_local` / `wrist_roll_anchor_local` (optional) are
+      - `wrist_pitch_anchor_local` / `wrist_roll_anchor_local` are
         empirical raw controller-anchor unit rotvecs captured by the wrist
-        wizard. None / absent → runtime falls back to the Quest analytical
-        canonical. Older left-arm files without `wrist_canonical_frame` are
-        converted on load for backward compatibility.
+        wizard. Missing or invalid wrist axes block live direct-wrist teleop.
+        Older left-arm files without `wrist_canonical_frame` are converted on
+        load for backward compatibility.
     """
     doc = _normalized_doc()
     existing = dict(_active_profile_entry(doc))
     M = _orthonormalize_matrix(np.array(matrix, dtype=float))
+    def _validated_wrist_axis(axis: tuple[float, float, float] | None, name: str) -> list[float]:
+        if axis is None:
+            raise ValueError(f"{name} is required for direct wrist teleop")
+        if not _valid_wrist_axis(axis):
+            raise ValueError(f"{name} must be a finite non-zero 3-vector")
+        arr = np.asarray(axis, dtype=float)
+        return [float(v) for v in arr]
+
+    wrist_pitch_axis = _validated_wrist_axis(wrist_pitch_anchor_local, "wrist_pitch_anchor_local")
+    wrist_roll_axis = _validated_wrist_axis(wrist_roll_anchor_local, "wrist_roll_anchor_local")
     entry: dict[str, Any] = {
         "calibration_mode": "vr_direction",
         "teleop_source": "native_quest",
@@ -330,13 +352,11 @@ def write_for_arm(side: str, matrix: np.ndarray,
         "up_motion_m": float(up_motion_m),
         "left_motion_m": float(left_motion_m),
         "confidence": str(confidence or "good"),
+        "wrist_pitch_anchor_local": wrist_pitch_axis,
+        "wrist_roll_anchor_local": wrist_roll_axis,
     }
     if invert_lateral is not None:
         entry["invert_lateral"] = bool(invert_lateral)
-    if wrist_pitch_anchor_local is not None:
-        entry["wrist_pitch_anchor_local"] = [float(v) for v in wrist_pitch_anchor_local]
-    if wrist_roll_anchor_local is not None:
-        entry["wrist_roll_anchor_local"] = [float(v) for v in wrist_roll_anchor_local]
     existing[side] = entry
     doc["profiles"][doc["active_profile"]] = existing
     _write_doc(doc)
@@ -438,6 +458,9 @@ def status() -> dict[str, dict[str, Any]]:
         robot_data = robot_verification_entry(data)
         robot_quality = robot_data.get("calibration_quality")
         robot_verified = robot_data.get("calibration_mode") == "robot_verified"
+        has_wrist_pitch = _valid_wrist_axis(data.get("wrist_pitch_anchor_local"))
+        has_wrist_roll = _valid_wrist_axis(data.get("wrist_roll_anchor_local"))
+        wrist_axes_ready = has_wrist_pitch and has_wrist_roll
         out[side] = {
             "saved": "session_vr_to_robot" in data,
             "calibration_mode": data.get("calibration_mode", "legacy" if data else None),
@@ -449,11 +472,10 @@ def status() -> dict[str, dict[str, Any]]:
             "left_motion_m": float(data.get("left_motion_m", 0.0)),
             "invert_lateral": data.get("invert_lateral"),
             "confidence": data.get("confidence", "unknown"),
-            "has_empirical_wrist_canonical": (
-                "wrist_pitch_anchor_local" in data or "wrist_roll_anchor_local" in data
-            ),
-            "has_empirical_wrist_pitch_canonical": "wrist_pitch_anchor_local" in data,
-            "has_empirical_wrist_roll_canonical": "wrist_roll_anchor_local" in data,
+            "has_empirical_wrist_canonical": wrist_axes_ready,
+            "has_empirical_wrist_pitch_canonical": has_wrist_pitch,
+            "has_empirical_wrist_roll_canonical": has_wrist_roll,
+            "wrist_axes_ready": wrist_axes_ready,
             "robot_verified": robot_verified,
             "verified_at": robot_data.get("verified_at"),
             "verified_coordinate_frame": robot_data.get("coordinate_frame"),

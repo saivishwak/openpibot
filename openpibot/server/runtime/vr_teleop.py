@@ -96,10 +96,6 @@ JOINT_COMMAND_DEADBAND_DEG: dict[str, float] = {
 JOINT_COMMAND_FILTER_WEIGHTS: tuple[float, ...] = (0.4, 0.3, 0.2, 0.1)
 JOINT_COMMAND_FILTER_BYPASS: set[str] = {"wrist_flex", "wrist_roll", "gripper"}
 
-# Per-frame wrist rotation cap. The cartesian offset has its own LERP-based
-# smoothing in `_compute_targets_from_vr`; this is the equivalent step cap on
-# orientation, scaled per-tick by `scale` (user-adjustable in the UI).
-WRIST_RAD_DELTA_LIMIT = math.radians(5)
 SAFE_REAR_X_M = 0.035
 IK_JUMP_REJECT_DEG = 25.0
 
@@ -155,14 +151,12 @@ VERIFIED_TRANSLATION_MAX_COND: float = 8.0
 VERIFIED_TRANSLATION_MAX_AXIS_ANGLE_DEG: float = 60.0
 QUEST_OPERATOR_FRAME: str = "quest_operator_frame"
 
-# Smoothing factors. 1.0 = raw input, 0.0 = frozen.
+# Translation smoothing factor. 1.0 = raw input, 0.0 = frozen.
 POS_EMA_ALPHA: float = 0.30
-ORI_EMA_ALPHA: float = 0.35
-# Input filtering for the Quest controller stream. The native Quest app sends per-frame
-# relative_position/relative_rotvec values while grip is held; ignore tiny
-# controller noise before integrating it into the reset-relative target.
+# Input filtering for the Quest controller stream. The native Quest app sends
+# per-frame relative_position while grip is held; ignore tiny controller
+# translation noise before integrating it into the reset-relative target.
 POS_DEADZONE_M: float = 0.001
-ROT_DEADZONE_RAD: float = math.radians(0.3)
 # Cartesian target rate cap in robot base frame. This mirrors LeRobot's
 # EEBoundsAndSafety max_ee_step_m and prevents tracking spikes from entering IK.
 MAX_EE_STEP_M: float = 0.004
@@ -172,8 +166,8 @@ MAX_EE_STEP_M: float = 0.004
 # the user stood when calibrating. Runtime wrist deltas are projected in the
 # controller-anchor-local frame and multiplied by this polarity directly.
 _WRIST_MOTOR_POLARITY: dict[str, dict[str, float]] = {
-    "left":  {"flex": -1.0, "roll": -1.0},
-    "right": {"flex": -1.0, "roll": -1.0},
+    "left":  {"flex": -1.0, "roll": 1.0},
+    "right": {"flex": -1.0, "roll": 1.0},
 }
 
 
@@ -286,12 +280,8 @@ class _SO101Kin:
 # Joint name -> array index for the live 5-DOF arm target. Values are in
 # LeRobot/XLeRobot calibrated motor degrees and match `so101_new_calib.urdf`.
 _SO101_URDF = REPO_ROOT / "reference" / "SO-ARM100" / "Simulation" / "SO101" / "so101_new_calib.urdf"
-_IK_JOINT_ORDER = ("shoulder_pan", "shoulder_lift", "elbow_flex", "wrist_flex", "wrist_roll")
-
-# Rotation noise deadband. Sub-degree wrist twitches at rest are controller
-# jitter, not intentional motion — skip the SLERP step for changes below this
-# threshold so the smoothed orientation target doesn't crawl.
-ROTVEC_DEADBAND_RAD = math.radians(0.3)  # 0.3° per tick
+_BODY_IK_JOINT_ORDER = ("shoulder_pan", "shoulder_lift", "elbow_flex")
+_IK_JOINT_ORDER = _BODY_IK_JOINT_ORDER + ("wrist_flex", "wrist_roll")
 
 # SO101 reach. Used to clamp the running EE target inside the actual workspace.
 WORKSPACE_REACH_M = 0.45         # stay inside mechanical reach to avoid IK edge flips
@@ -313,8 +303,8 @@ def _load_urdf_kinematics():
             return None
         return RobotKinematics(
             urdf_path=str(_SO101_URDF),
-            target_frame_name="gripper_frame_link",
-            joint_names=list(_IK_JOINT_ORDER),
+            target_frame_name="wrist_link",
+            joint_names=list(_BODY_IK_JOINT_ORDER),
         )
     except Exception as e:
         log.warning("failed to load calibrated SO101 URDF kinematics: %s", e)
@@ -451,7 +441,7 @@ def _wrist_rotvec_since_anchor(
 def _canonicalize_empirical_roll_axis(axis_local: _np.ndarray) -> tuple[_np.ndarray, bool]:
     """Normalize a captured roll axis without letting it invert roll direction.
 
-    Main-branch roll control used the Quest analytical "roll right" canonical
+    Main-branch roll control used the Quest reference "roll right" canonical
     of -Z in controller-anchor-local coordinates, then applied the left-hand
     runtime correction separately. The empirical roll step should refine the
     physical axis, not replace that known-good sign convention. If the user
@@ -467,6 +457,25 @@ def _canonicalize_empirical_roll_axis(axis_local: _np.ndarray) -> tuple[_np.ndar
     if float(_np.dot(vec, default_roll_right)) < 0.0:
         return -vec, True
     return vec, False
+
+
+def _valid_wrist_axis_tuple(axis: Any) -> Optional[tuple[float, float, float]]:
+    try:
+        arr = _np.asarray(axis, dtype=float)
+    except Exception:
+        return None
+    if arr.shape != (3,) or not _np.all(_np.isfinite(arr)):
+        return None
+    if float(_np.linalg.norm(arr)) <= 1e-6:
+        return None
+    return (float(arr[0]), float(arr[1]), float(arr[2]))
+
+
+def _wrist_axes_ready(arm: Any) -> bool:
+    return (
+        _valid_wrist_axis_tuple(getattr(arm, "wrist_pitch_canonical", None)) is not None
+        and _valid_wrist_axis_tuple(getattr(arm, "wrist_roll_canonical", None)) is not None
+    )
 
 
 def _effective_wrist_axes(
@@ -739,6 +748,19 @@ class _LiveTargets:
         }
 
 
+@dataclass(frozen=True)
+class _DirectWristTargets:
+    """Wrist command derived only from reset-relative controller rotation."""
+
+    wrist_flex: float
+    wrist_roll: float
+    wrist_flex_delta_deg: float
+    wrist_roll_delta_deg: float
+    pitch_axis: _np.ndarray
+    roll_axis: _np.ndarray
+    polarity: dict[str, float]
+
+
 # --- the session ---------------------------------------------------------------
 
 @dataclass
@@ -802,12 +824,12 @@ class _PerArm:
     cal_wrist_pitch_verify_deg: float = 0.0
     cal_wrist_roll_verify_deg: float = 0.0
     # Per-arm raw controller-anchor-local rotvec (unit vector) the user's wrist
-    # rotates around when pitching UP. None = use the Quest analytical default
-    # (±x_anchor_local depending on side). Captured by the wrist-verify wizard
-    # step; persisted in `vr_calibration.yaml` as `wrist_pitch_anchor_local`.
+    # rotates around when pitching UP. Captured by the wrist-verify wizard step;
+    # persisted in `vr_calibration.yaml` as `wrist_pitch_anchor_local`. None
+    # means wrist calibration is incomplete and live teleop must not drive.
     wrist_pitch_canonical: Optional[tuple[float, float, float]] = None
-    # Empirical anchor-local rotvec for user's roll-right motion. None = use
-    # Quest analytical default (±z_anchor_local depending on side).
+    # Empirical anchor-local rotvec for user's roll-right motion. None means
+    # wrist calibration is incomplete and live teleop must not drive.
     wrist_roll_canonical: Optional[tuple[float, float, float]] = None
     # Last completion-time motion magnitudes (m) — for UI to show "calibrated to N cm"
     cal_last_fwd_m:  float = 0.0
@@ -845,41 +867,42 @@ class _PerArm:
     home_last_present_error_deg: float = 0.0
     home_last_worst_joint: str = ""
     home_next_progress_log_t: float = 0.0
-    # User-facing knob: when True, mirror the LATERAL axis (left/right). Flips
-    # shoulder_pan direction, wrist_roll, and wrist_flex direction all at once
-    # (they all derive from the y-axis mapping). Read from config/xlerobot.yaml's
-    # `vr:` block per arm.
+    # User-facing knob: when True, mirror the LATERAL translation axis
+    # (left/right). Wrist signs are direct controller-rotation mapping and are
+    # controlled only by empirical wrist axes plus vr.wrist_motor_polarity.
+    # Read from config/xlerobot.yaml's `vr:` block per arm.
     invert_lateral: bool = False
     # When True, the YAML setting is EXPLICITLY set by the user (override mode):
     # the calibration wizard's auto-detection at step 3 must not touch
     # `invert_lateral`. Lets users with physically mirror-mounted motors keep
     # their fix in place across recalibrations.
     invert_lateral_override: bool = False
-    # Required calibrated URDF kinematics adapter plus last-good IK solution.
-    # `last_q_sol` is the continuity seed for URDF IK.
+    # Required calibrated URDF kinematics adapter plus last-good IK solutions.
+    # Body IK is solved only over shoulder_pan/shoulder_lift/elbow_flex, seeded
+    # from `last_body_q_sol`; wrist targets are direct VR commands and must not
+    # feed the IK seed.
     kinematics: Any = None
+    last_body_q_sol: _np.ndarray = field(default_factory=lambda: _np.zeros(3, dtype=float))
+    # Full 5-joint command state kept for status, filtering, and compatibility.
     last_q_sol: _np.ndarray = field(default_factory=lambda: _np.zeros(5, dtype=float))
     # Legacy diagnostic field kept for API/test compatibility. Production live
     # teleop refuses to use analytical IK when calibrated URDF is unavailable.
     using_analytical_fallback: bool = False
     # Per-arm filtered target state. The cartesian offset is LERP-smoothed in
-    # `_compute_targets_from_vr`; orientation uses SLERP EMA on the IK target.
-    # The final live command also goes through a newest-heavy weighted moving
-    # filter, matching XR Teleoperate's joint-output smoothing pattern, then a
+    # `_compute_targets_from_vr`. Wrist targets bypass body IK and final command
+    # filtering; the final live command still goes through per-joint caps and a
     # small deadband before send_action.
-    smoothed_R_target: _np.ndarray = field(default_factory=lambda: _np.eye(3))
     last_q_filtered: Optional[_np.ndarray] = None
     command_filter: _JointCommandFilter = field(default_factory=_JointCommandFilter)
-    # Anchor orientation matrix (3×3) captured at RESET. Combined with the
-    # current controller quaternion, gives the absolute desired EE orientation.
+    # Anchor orientation matrix (3×3) captured at RESET. Body IK ignores target
+    # orientation; this is kept for FK/status context only.
     anchor_R_robot: _np.ndarray = field(default_factory=lambda: _np.eye(3))
     controller_anchor_T: Optional[_np.ndarray] = None
     # Rotation from controller-anchor local axes to EE-anchor local axes,
-    # captured on grip RESET. Used to keep wrist intent independent of how the
-    # user is holding the controller at anchor time.
+    # captured on grip RESET. Kept only as a diagnostic signal; production wrist
+    # commands are direct reset-relative controller rotations.
     vr_ctrl_to_ee: Optional[Any] = None
     robot_anchor_T: _np.ndarray = field(default_factory=lambda: _np.eye(4))
-    target_R_robot: _np.ndarray = field(default_factory=lambda: _np.eye(3))
     # Calibration confidence: "good" if the wizard's captured motion vectors
     # were well-separated, "poor" if too parallel (and the matrix is shaky).
     cal_confidence: str = "good"
@@ -1085,12 +1108,12 @@ class VRTeleopSession:
         file exists or the file is malformed. Also reads per-arm invert_lateral
         flags from config/xlerobot.yaml's `vr:` section, both the value AND
         whether it's explicitly set (override mode). Also reads the global
-        smoothing and rate-limit factors, plus the hardware
+        translation smoothing/rate-limit factors, plus the hardware
         `vr.wrist_motor_polarity` block (per-arm motor polarity applied
         directly to wrist pitch/roll deltas)."""
         import yaml
-        global KP, WRIST_RAD_DELTA_LIMIT, HOMING_PRESENT_TOL_DEG
-        global POS_EMA_ALPHA, ORI_EMA_ALPHA, POS_DEADZONE_M, ROT_DEADZONE_RAD, MAX_EE_STEP_M
+        global KP, HOMING_PRESENT_TOL_DEG
+        global POS_EMA_ALPHA, POS_DEADZONE_M, MAX_EE_STEP_M
         global JOINT_COMMAND_FILTER_WEIGHTS
         try:
             cfg = yaml.safe_load((REPO_ROOT / "config" / "xlerobot.yaml").read_text()) or {}
@@ -1108,17 +1131,9 @@ class VRTeleopSession:
                 0.5,
                 8.0,
             )
-            wrist_deg = _float_key("wrist_delta_limit_deg", math.degrees(WRIST_RAD_DELTA_LIMIT), 1.0, 30.0)
-            WRIST_RAD_DELTA_LIMIT = math.radians(wrist_deg)
             POS_EMA_ALPHA = _float_key("pos_ema_alpha", POS_EMA_ALPHA, 0.0, 1.0)
             POS_DEADZONE_M = _float_key("pos_deadzone_m", POS_DEADZONE_M, 0.0, 0.02)
-            rot_deadzone_deg = _float_key("rot_deadzone_deg", math.degrees(ROT_DEADZONE_RAD), 0.0, 10.0)
-            ROT_DEADZONE_RAD = math.radians(rot_deadzone_deg)
             MAX_EE_STEP_M = _float_key("max_ee_step_m", MAX_EE_STEP_M, 0.001, 0.05)
-            # Backward-compatible alias: older configs used rotvec_ema_alpha.
-            ori_alpha = vr_section.get("ori_ema_alpha", vr_section.get("rotvec_ema_alpha"))
-            if ori_alpha is not None:
-                ORI_EMA_ALPHA = max(0.0, min(1.0, float(ori_alpha)))
             joint_caps = vr_section.get("joint_deg_caps") or {}
             if isinstance(joint_caps, dict):
                 for joint, cap in joint_caps.items():
@@ -1177,16 +1192,14 @@ class VRTeleopSession:
                             continue
                         _WRIST_MOTOR_POLARITY[side][axis] = 1.0 if raw >= 0 else -1.0
             log.info(
-                "VR smoothing loaded: homing_kp=%.2f pos_ema=%.2f ori_ema=%.2f "
-                "pos_deadzone=%.1fmm rot_deadzone=%.1f° max_ee_step=%.1fmm "
-                "wrist_cap=%.1f° homing_feedback_tol=%.1f° joint_filter=%s "
+                "VR control loaded: homing_kp=%.2f pos_ema=%.2f "
+                "pos_deadzone=%.1fmm max_ee_step=%.1fmm "
+                "homing_feedback_tol=%.1f° joint_filter=%s "
                 "wrist_motor_polarity(left)=(flex %+.0f, roll %+.0f) "
                 "wrist_motor_polarity(right)=(flex %+.0f, roll %+.0f)",
-                KP, POS_EMA_ALPHA, ORI_EMA_ALPHA,
+                KP, POS_EMA_ALPHA,
                 POS_DEADZONE_M * 1000.0,
-                math.degrees(ROT_DEADZONE_RAD),
                 MAX_EE_STEP_M * 1000.0,
-                math.degrees(WRIST_RAD_DELTA_LIMIT),
                 HOMING_PRESENT_TOL_DEG,
                 tuple(round(w, 3) for w in JOINT_COMMAND_FILTER_WEIGHTS),
                 _WRIST_MOTOR_POLARITY["left"]["flex"], _WRIST_MOTOR_POLARITY["left"]["roll"],
@@ -1292,24 +1305,8 @@ class VRTeleopSession:
         # Empirical wrist pitch/roll canonical vectors are stored as raw
         # controller-anchor-local rotvecs. Older left-arm files omitted the
         # frame marker and are converted below for backward compatibility.
-        saved_canonical = data.get("wrist_pitch_anchor_local")
-        if (isinstance(saved_canonical, (list, tuple))
-                and len(saved_canonical) == 3
-                and all(isinstance(v, (int, float)) for v in saved_canonical)):
-            arm.wrist_pitch_canonical = (float(saved_canonical[0]),
-                                          float(saved_canonical[1]),
-                                          float(saved_canonical[2]))
-        else:
-            arm.wrist_pitch_canonical = None
-        saved_roll_canonical = data.get("wrist_roll_anchor_local")
-        if (isinstance(saved_roll_canonical, (list, tuple))
-                and len(saved_roll_canonical) == 3
-                and all(isinstance(v, (int, float)) for v in saved_roll_canonical)):
-            arm.wrist_roll_canonical = (float(saved_roll_canonical[0]),
-                                        float(saved_roll_canonical[1]),
-                                        float(saved_roll_canonical[2]))
-        else:
-            arm.wrist_roll_canonical = None
+        arm.wrist_pitch_canonical = _valid_wrist_axis_tuple(data.get("wrist_pitch_anchor_local"))
+        arm.wrist_roll_canonical = _valid_wrist_axis_tuple(data.get("wrist_roll_anchor_local"))
         if side == "left" and data.get("wrist_canonical_frame") != "raw_controller_anchor_local":
             if arm.wrist_pitch_canonical is not None:
                 arm.wrist_pitch_canonical = tuple(float(-v) for v in arm.wrist_pitch_canonical)
@@ -1334,8 +1331,8 @@ class VRTeleopSession:
             arm.session_vr_to_robot = arm.base_vr_direction_matrix.copy()
         else:
             arm.session_vr_to_robot = saved_M
-        pitch_label = "empirical" if arm.wrist_pitch_canonical is not None else "analytical"
-        roll_label = "empirical" if arm.wrist_roll_canonical is not None else "analytical"
+        pitch_label = "empirical" if arm.wrist_pitch_canonical is not None else "missing"
+        roll_label = "empirical" if arm.wrist_roll_canonical is not None else "missing"
         polarity = _WRIST_MOTOR_POLARITY.get(side, {"flex": -1.0, "roll": -1.0})
         frame_label = (
             "base_vr_direction"
@@ -1644,21 +1641,34 @@ class VRTeleopSession:
         arm.quality_ticks = 0
         arm.quality_ik_rejects = 0
 
-    def _teleop_anchor_fresh(self, side: ArmSide) -> bool:
+    def _teleop_anchor_fresh(self, side: ArmSide, *, include_wrist_axes: bool = True) -> bool:
         arm = self._arms[side]
         return (
             bool(arm.calibrated)
             and arm.anchor_generation == arm.pose_generation
             and arm.controller_anchor_T is not None
-            and arm.vr_ctrl_to_ee is not None
+            and (not include_wrist_axes or _wrist_axes_ready(arm))
         )
 
-    def _fresh_anchor_blockers(self, sides: list[ArmSide]) -> list[str]:
+    def _fresh_anchor_blockers(
+        self,
+        sides: list[ArmSide],
+        *,
+        include_wrist_axes: bool = True,
+    ) -> list[str]:
         blockers: list[str] = []
         for side in sides:
-            if not self._teleop_anchor_fresh(side):
-                reason = self._arms[side].anchor_invalid_reason or "not anchored"
-                blockers.append(f"{side} teleop anchor not fresh ({reason}); squeeze grip to reset after homing")
+            if not self._teleop_anchor_fresh(side, include_wrist_axes=include_wrist_axes):
+                arm = self._arms[side]
+                if include_wrist_axes and not _wrist_axes_ready(arm):
+                    blockers.append(
+                        f"{side} wrist pitch/roll calibration missing; rerun VR calibration wrist steps"
+                    )
+                elif arm.controller_anchor_T is None:
+                    blockers.append(f"{side} teleop anchor not fresh (missing grip-reset controller anchor); squeeze grip to reset")
+                else:
+                    reason = arm.anchor_invalid_reason or "not anchored"
+                    blockers.append(f"{side} teleop anchor not fresh ({reason}); squeeze grip to reset after homing")
         return blockers
 
     def _recording_anchor_refresh_blockers_locked(self, *, now: float) -> list[str]:
@@ -1785,11 +1795,13 @@ class VRTeleopSession:
             cal = arm_status.get("calibration", {})
             quality = cal.get("quality") or {}
             robot_verify = cal.get("robot_verification") or {}
+            wrist_calibrated = bool(cal.get("wrist_axes_ready", False))
             arm_panels[side] = {
                 "connected": bool(arm_status.get("connected", False)),
                 "torque_enabled": bool(arm_status.get("torque_enabled", False)),
                 "anchored": bool(arm_status.get("calibrated", False)),
-                "wrist_aligned": bool(cal.get("vr_ctrl_to_ee_ready", False)),
+                "wrist_aligned": wrist_calibrated,
+                "wrist_calibrated": wrist_calibrated,
                 "active": bool(self._dual_mode or self._active_arm == side),
                 "controller_age_ms": arm_status.get("controller", {}).get("age_ms"),
                 "ee_speed_cm_s": float(quality.get("offset_speed_ema_mps", 0.0)) * 100.0,
@@ -2036,6 +2048,7 @@ class VRTeleopSession:
                         "age_ms": controller_age_ms,
                     },
                     "calibration": {
+                        "wrist_axes_ready": _wrist_axes_ready(arm),
                         "vr_ctrl_to_ee_ready": arm.vr_ctrl_to_ee is not None,
                         "quality": {
                             "offset_speed_ema_mps": float(arm.quality_offset_speed_ema_mps),
@@ -2224,6 +2237,8 @@ class VRTeleopSession:
                             list(arm.wrist_roll_canonical)
                             if arm.wrist_roll_canonical is not None else None
                         ),
+                        "wrist_axes_ready": _wrist_axes_ready(arm),
+                        "direct_wrist_ready": _wrist_axes_ready(arm),
                         "invert_lateral":       arm.invert_lateral,
                         "confidence":           arm.cal_confidence,
                         "wrist_motor_polarity": dict(_WRIST_MOTOR_POLARITY.get(
@@ -2887,6 +2902,10 @@ class VRTeleopSession:
                                   for j in _motors.JOINTS_PER_ARM}
         arm.last_commanded_targets = dict(arm.last_sent_targets)
         arm.command_filter.reset(arm.last_sent_targets)
+        q_now_deg = _np.array([get(j) for j in _IK_JOINT_ORDER], dtype=float)
+        arm.last_q_sol = q_now_deg.copy()
+        arm.last_body_q_sol = q_now_deg[:len(_BODY_IK_JOINT_ORDER)].copy()
+        arm.last_q_filtered = q_now_deg.copy()
 
     def _ensure_kinematics(self, arm: _PerArm) -> bool:
         """Return whether calibrated SO101 URDF kinematics should be used."""
@@ -2939,7 +2958,7 @@ class VRTeleopSession:
         return step.command, step.settled
 
     def _current_ee_transform(self, side: ArmSide) -> _np.ndarray:
-        """Read current joints and return the estimated gripper-frame pose."""
+        """Read current body joints and return the estimated wrist-link pose."""
         if not MOTORS.is_connected(side):
             raise RuntimeError(f"{side} arm not connected")
         arm = self._arms[side]
@@ -2951,7 +2970,7 @@ class VRTeleopSession:
         present = MOTORS.read_positions(side)
         prefix = f"{side}_arm_"
         get = lambda j: float(present.get(f"{prefix}{j}", 0.0))
-        q_now_deg = _np.array([get(j) for j in _IK_JOINT_ORDER], dtype=float)
+        q_now_deg = _np.array([get(j) for j in _BODY_IK_JOINT_ORDER], dtype=float)
         return arm.kinematics.forward_kinematics(q_now_deg)
 
     def _capture_anchor(self, side: ArmSide) -> None:
@@ -2971,25 +2990,52 @@ class VRTeleopSession:
                 "refusing analytical IK fallback"
             )
             raise RuntimeError(self._last_error)
+        if not _wrist_axes_ready(arm):
+            self._last_error = (
+                f"{side} wrist pitch/roll calibration missing; rerun VR calibration wrist steps"
+            )
+            arm.calibrated = False
+            arm.anchor_invalid_reason = self._last_error
+            raise RuntimeError(self._last_error)
+        ctrl_quat = arm.latest.rotation_quat if arm.latest.has_data else None
+        ctrl_pos = arm.latest.controller_position if arm.latest.has_data else None
+        if ctrl_quat is None or ctrl_pos is None:
+            self._last_error = (
+                f"{side} controller pose missing during reset; hold grip with full Quest pose data"
+            )
+            arm.calibrated = False
+            arm.controller_anchor_T = None
+            arm.vr_ctrl_to_ee = None
+            arm.anchor_invalid_reason = self._last_error
+            raise RuntimeError(self._last_error)
+        try:
+            controller_anchor_T = _pose_matrix_from_vr(ctrl_pos, ctrl_quat)
+        except Exception as e:
+            self._last_error = f"{side} controller pose invalid during reset: {e}"
+            arm.calibrated = False
+            arm.controller_anchor_T = None
+            arm.vr_ctrl_to_ee = None
+            arm.anchor_invalid_reason = self._last_error
+            raise RuntimeError(self._last_error)
 
         present = MOTORS.read_positions(side)
         prefix = f"{side}_arm_"
         get = lambda j: float(present.get(f"{prefix}{j}", 0.0))
 
         q_now_deg = _np.array([get(j) for j in _IK_JOINT_ORDER], dtype=float)
-        # Calibrated SO101 URDF FK at current joints -> 4x4 gripper pose.
-        T_now = arm.kinematics.forward_kinematics(q_now_deg)
+        q_body_now_deg = q_now_deg[:len(_BODY_IK_JOINT_ORDER)].copy()
+        # Calibrated SO101 URDF FK at current body joints -> 4x4 wrist-link pose.
+        T_now = arm.kinematics.forward_kinematics(q_body_now_deg)
 
         arm.target_T = T_now.copy()
         arm.robot_anchor_T = T_now.copy()
         arm.anchor_ee_pos = (float(T_now[0, 3]), float(T_now[1, 3]), float(T_now[2, 3]))
         arm.anchor_R_robot = T_now[:3, :3].copy()
-        arm.target_R_robot = T_now[:3, :3].copy()
         arm.offset_robot = (0.0, 0.0, 0.0)
         arm.vr_offset_accum = (0.0, 0.0, 0.0)
         arm.pending_rel_position = (0.0, 0.0, 0.0)
-        arm.smoothed_R_target = T_now[:3, :3].copy()
         arm.last_q_sol = q_now_deg.copy()
+        arm.last_body_q_sol = q_body_now_deg.copy()
         arm.last_q_filtered = q_now_deg.copy()
         arm.vr_ctrl_to_ee = None
         arm.quality_ticks = 0
@@ -3002,25 +3048,15 @@ class VRTeleopSession:
         # depend on wrist pose at anchor time, so arm motion feels random. Use the
         # saved/wizard/default frame for position; the quaternion is still stored
         # below as the wrist-orientation anchor.
-        ctrl_quat = arm.latest.rotation_quat if arm.latest.has_data else None
-        ctrl_pos = arm.latest.controller_position if arm.latest.has_data else None
-        if ctrl_quat is None or ctrl_pos is None:
-            arm.controller_anchor_T = None
-            log.warning(
-                "[%s] missing controller pose in RESET goal; SE(3) mapping disabled "
-                "until next grip-press with full controller state",
-                side,
-            )
-        else:
-            arm.controller_anchor_T = _pose_matrix_from_vr(ctrl_pos, ctrl_quat)
-            try:
-                R_ee = _R.from_matrix(_project_to_rotation_matrix(T_now[:3, :3]))
-                R_vr = _R.from_quat(_positive_quat_xyzw(_np.array(ctrl_quat, dtype=float)))
-                R_ctrl_in_robot = _R.from_matrix(_project_to_rotation_matrix(arm.session_vr_to_robot)) * R_vr
-                arm.vr_ctrl_to_ee = R_ee.inv() * R_ctrl_in_robot
-            except Exception as e:
-                arm.vr_ctrl_to_ee = None
-                log.warning("[%s] could not capture controller→EE wrist frame: %s", side, e)
+        arm.controller_anchor_T = controller_anchor_T
+        try:
+            R_ee = _R.from_matrix(_project_to_rotation_matrix(T_now[:3, :3]))
+            R_vr = _R.from_quat(_positive_quat_xyzw(_np.array(ctrl_quat, dtype=float)))
+            R_ctrl_in_robot = _R.from_matrix(_project_to_rotation_matrix(arm.session_vr_to_robot)) * R_vr
+            arm.vr_ctrl_to_ee = R_ee.inv() * R_ctrl_in_robot
+        except Exception as e:
+            arm.vr_ctrl_to_ee = None
+            log.warning("[%s] could not capture controller→EE wrist frame: %s", side, e)
         log.info("[%s] keeping VR→robot translation frame:\n%s", side, arm.session_vr_to_robot.round(3))
 
         arm.anchor = _AnchorPose(
@@ -3049,7 +3085,7 @@ class VRTeleopSession:
         arm.calibrated = True
         arm.anchor_generation = arm.pose_generation
         arm.anchor_invalid_reason = ""
-        log.info("[%s] VR anchor: EE=(%.3f, %.3f, %.3f) m (URDF FK)",
+        log.info("[%s] VR anchor: body wrist-link=(%.3f, %.3f, %.3f) m (URDF FK)",
                  side, T_now[0, 3], T_now[1, 3], T_now[2, 3])
 
     def _drive_loop(self) -> None:
@@ -3349,9 +3385,8 @@ class VRTeleopSession:
             arm.cal_wrist_verify_deg = 0.0
             arm.cal_wrist_pitch_verify_deg = 0.0
             arm.cal_wrist_roll_verify_deg = 0.0
-            # Discard any prior empirical wrist pitch canonical — the user
-            # is re-running the wizard. They can either re-capture in step 4
-            # or press 'Skip wrist verify' to fall back to the Quest default.
+            # Discard any prior empirical wrist axes; the user is re-running
+            # the wizard and must capture both direct wrist-control axes again.
             arm.wrist_pitch_canonical = None
             arm.wrist_roll_canonical = None
             arm.cal_validation = {}
@@ -3607,11 +3642,7 @@ class VRTeleopSession:
             elif state in ("awaiting_anchor_wrist_verify", "awaiting_anchor_wrist_pitch"):
                 anchor_q = goal.rotation_quat
                 if anchor_q is None:
-                    log.warning(
-                        "[%s] cal: wrist-pitch reset has no controller quaternion; "
-                        "release grip and try again (or press 'Skip wrist verify')",
-                        side,
-                    )
+                    log.warning("[%s] cal: wrist-pitch reset has no controller quaternion; release grip and try again", side)
                     return
                 arm.cal_anchor_quat_for_wrist = anchor_q
                 arm.cal_wrist_release_quat = None
@@ -3620,18 +3651,13 @@ class VRTeleopSession:
                 arm.cal_state = "motioning_wrist_pitch"
                 log.info(
                     "[%s] cal: wrist-pitch anchor captured. KEEP GRIP HELD and pitch "
-                    "your wrist clearly UP ~20-45°, "
-                    "then release. Or press 'Skip wrist verify' to use the Quest default.",
+                    "your wrist clearly UP ~20-45°, then release.",
                     side,
                 )
             elif state == "awaiting_anchor_wrist_roll":
                 anchor_q = goal.rotation_quat
                 if anchor_q is None:
-                    log.warning(
-                        "[%s] cal: wrist-roll reset has no controller quaternion; "
-                        "release grip and try again (or press 'Skip wrist verify')",
-                        side,
-                    )
+                    log.warning("[%s] cal: wrist-roll reset has no controller quaternion; release grip and try again", side)
                     return
                 arm.cal_anchor_quat_for_wrist = anchor_q
                 arm.cal_wrist_release_quat = None
@@ -3640,8 +3666,7 @@ class VRTeleopSession:
                 arm.cal_state = "motioning_wrist_roll"
                 log.info(
                     "[%s] cal: wrist-roll anchor captured. KEEP GRIP HELD and roll "
-                    "your wrist clearly RIGHT ~20-45°, then release. Or press "
-                    "'Skip wrist verify' to keep roll on the Quest default.",
+                    "your wrist clearly RIGHT ~20-45°, then release.",
                     side,
                 )
             return
@@ -3786,16 +3811,13 @@ class VRTeleopSession:
             arm.session_vr_to_robot.round(3),
         )
 
-        # Hand off to wrist calibration steps. The user can either do clean
-        # pitch + roll motions to capture empirical canonicals (most robust),
-        # or skip via the UI button (Quest analytical canonical is then
-        # used; works for standard Quest controllers).
+        # Hand off to required wrist calibration steps. Live wrist control uses
+        # these captured controller-local axes directly.
         arm.cal_anchor_quat_for_wrist = None
         arm.cal_state = "awaiting_anchor_wrist_pitch"
         log.info(
-            "[%s] Translation done. Next (OPTIONAL): squeeze grip, pitch wrist UP, "
-            "release, then roll wrist RIGHT. Or press 'Skip wrist verify' "
-            "to finish with Quest analytical wrist axes.",
+            "[%s] Translation done. Next: squeeze grip, pitch wrist UP, release, "
+            "then capture roll RIGHT for direct wrist control.",
             side,
         )
 
@@ -3809,7 +3831,7 @@ class VRTeleopSession:
         if anchor_q is None or release_q is None:
             log.warning(
                 "[%s] cal: wrist-%s missing controller quaternion (anchor=%s, "
-                "release=%s); re-grip and rotate wrist again, or press 'Skip'.",
+                "release=%s); re-grip and rotate wrist again.",
                 side, axis,
                 anchor_q is not None, release_q is not None,
             )
@@ -3826,8 +3848,7 @@ class VRTeleopSession:
         if mag < math.radians(WRIST_VERIFY_MIN_DEG):
             log.warning(
                 "[%s] cal: wrist-%s motion too small (%.1f°, need ≥%.0f°). "
-                "Re-grip and rotate wrist further, or press 'Skip wrist verify' "
-                "to use the Quest analytical default for this axis.",
+                "Re-grip and rotate wrist further.",
                 side, axis, deg, WRIST_VERIFY_MIN_DEG,
             )
             arm.cal_state = f"awaiting_anchor_wrist_{axis}"
@@ -3874,18 +3895,14 @@ class VRTeleopSession:
             arm.cal_state = "awaiting_anchor_wrist_roll"
             log.info(
                 "[%s] wrist pitch captured. Now squeeze grip and roll wrist RIGHT "
-                "~20-45°, then release. Or press 'Skip wrist verify' to keep roll default.",
+                "~20-45°, then release.",
                 side,
             )
         else:
             self._persist_final_calibration(side)
 
     def skip_wrist_verify(self, side: ArmSide) -> dict:
-        """Skip the remaining optional wrist calibration step(s).
-
-        Safe to call any time the wizard is in the wrist-verify substep; no-op
-        otherwise. The user can always re-run the full wizard later to capture
-        an empirical canonical if wrist tracking turns out to be off."""
+        """Reject wrist-calibration skipping; direct wrist axes are required."""
         with self._lock:
             arm = self._arms[side]
             if arm.cal_state not in (
@@ -3894,22 +3911,10 @@ class VRTeleopSession:
                 "awaiting_anchor_wrist_roll", "motioning_wrist_roll",
             ):
                 return self.status()
-            if arm.cal_state in (
-                "awaiting_anchor_wrist_verify", "motioning_wrist_verify",
-                "awaiting_anchor_wrist_pitch", "motioning_wrist_pitch",
-            ):
-                arm.wrist_pitch_canonical = None
-                arm.wrist_roll_canonical = None
-                log.info("[%s] wrist pitch+roll skipped — using Quest analytical defaults", side)
-            else:
-                arm.wrist_roll_canonical = None
-                log.info("[%s] wrist roll skipped — keeping pitch capture and using roll default", side)
-            arm.cal_anchor_quat_for_wrist = None
-            arm.cal_wrist_release_quat = None
-            arm.cal_wrist_verify_deg = 0.0
-            arm.cal_wrist_pitch_verify_deg = 0.0
-            arm.cal_wrist_roll_verify_deg = 0.0
-            self._persist_final_calibration(side)
+            self._last_error = (
+                f"{side} wrist pitch and roll calibration are required for direct VR wrist control"
+            )
+            log.warning("[%s] %s", side, self._last_error)
         return self.status()
 
     # ── robot-verified calibration refinement ─────────────────────────────
@@ -4402,6 +4407,18 @@ class VRTeleopSession:
 
     def _persist_final_calibration(self, side: ArmSide) -> None:
         arm = self._arms[side]
+        if not _wrist_axes_ready(arm):
+            arm.cal_state = (
+                "awaiting_anchor_wrist_pitch"
+                if _valid_wrist_axis_tuple(arm.wrist_pitch_canonical) is None
+                else "awaiting_anchor_wrist_roll"
+            )
+            self._last_error = (
+                f"{side} wrist pitch and roll calibration are required before saving VR calibration"
+            )
+            log.warning("[%s] %s", side, self._last_error)
+            return
+
         # Persist to disk so subsequent sessions don't need to re-run the wizard.
         # Runtime wrist polarity is not persisted here. Motor polarity lives in
         # config/xlerobot.yaml; empirical wrist axes are persisted when captured.
@@ -4418,7 +4435,10 @@ class VRTeleopSession:
                 coordinate_frame=self._native_quest.coordinate_frame,
             )
         except Exception as e:
-            log.warning("[%s] could not persist VR calibration: %s", side, e)
+            arm.cal_state = "awaiting_anchor_wrist_roll"
+            self._last_error = f"{side} VR calibration save failed: {e}"
+            log.warning("[%s] %s", side, self._last_error)
+            return
         # A fresh VR-only calibration changes the base frame. Any older
         # robot-verified refinement was solved against a different base, so it
         # must be explicitly re-collected.
@@ -4434,9 +4454,10 @@ class VRTeleopSession:
         arm.robot_verify_test_completed = False
         arm.cal_state = "idle"
         arm.cal_motion_acc = (0.0, 0.0, 0.0)
+        self._last_error = None
         self._invalidate_teleop_anchor(side, "VR calibration changed")
-        pitch_label = "empirical" if arm.wrist_pitch_canonical is not None else "analytical"
-        roll_label = "empirical" if arm.wrist_roll_canonical is not None else "analytical"
+        pitch_label = "empirical" if arm.wrist_pitch_canonical is not None else "missing"
+        roll_label = "empirical" if arm.wrist_roll_canonical is not None else "missing"
         polarity = _WRIST_MOTOR_POLARITY.get(side, {"flex": -1.0, "roll": -1.0})
         log.info(
             "[%s] calibration COMPLETE — confidence=%s invert_lateral=%s "
@@ -4770,6 +4791,8 @@ class VRTeleopSession:
         arms: dict[str, Any] = {}
         for side in RECORDING_REQUIRED_SIDES:
             arm = self._arms[side]
+            pitch_axis = _valid_wrist_axis_tuple(arm.wrist_pitch_canonical)
+            roll_axis = _valid_wrist_axis_tuple(arm.wrist_roll_canonical)
             arms[side] = {
                 "teleop_source": "native_quest",
                 "coordinate_frame": self._native_quest.coordinate_frame,
@@ -4785,6 +4808,15 @@ class VRTeleopSession:
                     "verified_at": arm.robot_verified_at,
                     "low_scale_test_completed": arm.robot_verify_test_completed,
                     "sample_residuals": list(arm.robot_verify_sample_residuals),
+                },
+                "wrist_mapping": {
+                    "source": "direct_controller_rotation",
+                    "ready": pitch_axis is not None and roll_axis is not None,
+                    "pitch_axis": list(pitch_axis) if pitch_axis is not None else None,
+                    "roll_axis": list(roll_axis) if roll_axis is not None else None,
+                    "motor_polarity": dict(_WRIST_MOTOR_POLARITY.get(
+                        side, {"flex": -1.0, "roll": -1.0}
+                    )),
                 },
             }
         return {
@@ -5241,6 +5273,10 @@ class VRTeleopSession:
                 blockers.append(f"{side} home pose not captured")
             if not self._ensure_kinematics(arm):
                 blockers.append(f"{side} calibrated URDF kinematics missing")
+            if not _wrist_axes_ready(arm):
+                blockers.append(
+                    f"{side} wrist pitch/roll calibration missing; rerun VR calibration wrist steps"
+                )
             if arm.robot_verify_test_active:
                 blockers.append(f"{side} low-scale calibration test is still active")
             if arm.cal_confidence != "good":
@@ -5294,7 +5330,10 @@ class VRTeleopSession:
         connected = list(MOTORS.connected_sides)
         if set(connected) != set(RECORDING_REQUIRED_SIDES):
             return []
-        return self._fresh_anchor_blockers(list(RECORDING_REQUIRED_SIDES))
+        return self._fresh_anchor_blockers(
+            list(RECORDING_REQUIRED_SIDES),
+            include_wrist_axes=False,
+        )
 
     @staticmethod
     def _is_skippable_recording_camera_error(message: str) -> bool:
@@ -5516,6 +5555,58 @@ class VRTeleopSession:
             state["t"] = now
             state["trig"] = trigger_now
 
+    def _direct_wrist_targets_from_vr(
+        self,
+        side: ArmSide,
+        arm: _PerArm,
+        controller_rel_T: _np.ndarray,
+    ) -> _DirectWristTargets:
+        """Map reset-relative controller rotation directly to SO101 wrist joints.
+
+        This is deliberately independent from body IK. The SO101 wrist has two
+        controllable DOFs, so the calibrated controller-anchor-local rotation
+        vector is projected onto the calibrated pitch/roll axes and added to the
+        wrist joint values captured at grip RESET.
+        """
+        R_delta_vr = _controller_rotation_delta_for_side(side, controller_rel_T[:3, :3])
+        wrist_rotvec_local = _np.asarray(_R.from_matrix(R_delta_vr).as_rotvec(), dtype=float)
+        if wrist_rotvec_local.shape != (3,) or not _np.all(_np.isfinite(wrist_rotvec_local)):
+            raise ValueError("controller wrist rotation is invalid")
+
+        pitch_canonical = _valid_wrist_axis_tuple(arm.wrist_pitch_canonical)
+        roll_canonical = _valid_wrist_axis_tuple(arm.wrist_roll_canonical)
+        if pitch_canonical is None or roll_canonical is None:
+            raise RuntimeError("calibrated wrist pitch/roll axes are required")
+
+        pitch_axis, roll_axis = _effective_wrist_axes(
+            side,
+            pitch_canonical=pitch_canonical,
+            roll_canonical=roll_canonical,
+        )
+        polarity = dict(_WRIST_MOTOR_POLARITY.get(side, {"flex": -1.0, "roll": -1.0}))
+        flex_pol = 1.0 if float(polarity.get("flex", -1.0)) >= 0.0 else -1.0
+        roll_pol = 1.0 if float(polarity.get("roll", -1.0)) >= 0.0 else -1.0
+        wrist_flex_delta_deg = flex_pol * math.degrees(float(_np.dot(wrist_rotvec_local, pitch_axis)))
+        wrist_roll_delta_deg = roll_pol * math.degrees(float(_np.dot(wrist_rotvec_local, roll_axis)))
+
+        wrist_flex = arm.anchor.wrist_flex_deg + wrist_flex_delta_deg
+        wrist_roll = arm.anchor.wrist_roll_deg + wrist_roll_delta_deg
+        bounds = MOTORS.bounds
+        wrist_flex_lo, wrist_flex_hi = bounds.get(f"{side}_arm_wrist_flex", (-180.0, 180.0))
+        wrist_roll_lo, wrist_roll_hi = bounds.get(f"{side}_arm_wrist_roll", (-180.0, 180.0))
+        wrist_flex = max(wrist_flex_lo, min(wrist_flex_hi, float(wrist_flex)))
+        wrist_roll = max(wrist_roll_lo, min(wrist_roll_hi, float(wrist_roll)))
+
+        return _DirectWristTargets(
+            wrist_flex=float(wrist_flex),
+            wrist_roll=float(wrist_roll),
+            wrist_flex_delta_deg=float(wrist_flex_delta_deg),
+            wrist_roll_delta_deg=float(wrist_roll_delta_deg),
+            pitch_axis=pitch_axis,
+            roll_axis=roll_axis,
+            polarity=polarity,
+        )
+
     def _compute_targets_from_vr(self, side: ArmSide, goal: _LatestGoal,
                                   scale: float) -> None:
         """Convert the latest VR controller pose -> SO101 joint targets.
@@ -5527,9 +5618,9 @@ class VRTeleopSession:
           2. Map the integrated reset-relative VR displacement through the
              runtime translation matrix, then LERP-smooth and cap the Cartesian
              target step before IK.
-          3. Map controller-relative rotation through the calibrated session
-             frame and the reset-time controller→EE alignment, then SLERP-smooth
-             toward the robot-frame target.
+          3. Map controller-relative rotation directly to wrist_flex/wrist_roll
+             using calibrated wrist axes and motor polarity. This path does not
+             read IK output or smoothed EE orientation.
           4. Clamp the resulting EE position to the workspace box + reach sphere
              + rear-singularity guard, then reconcile `arm.offset_robot` so a
              clamped step doesn't accumulate hidden motion debt.
@@ -5537,8 +5628,7 @@ class VRTeleopSession:
              degrees; large jumps are rejected and the previous solution is
              reused. Missing URDF kinematics holds the target instead of
              issuing uncalibrated commands.
-          6. Wrist flex/roll come directly from the smoothed orientation delta
-             (no IK, no EMA) so they stay snappy.
+          6. Wrist flex/roll are added from the direct controller-rotation path.
           7. The drive loop rate-caps every joint, applies weighted filtering
              to IK arm joints, and deliberately bypasses that filter for wrist
              pitch/roll and gripper.
@@ -5547,15 +5637,9 @@ class VRTeleopSession:
         (captured on RESET), the current controller position, and the current
         controller quaternion.
         """
-        from scipy.spatial.transform import Rotation as _R
         arm = self._arms[side]
-        M = arm.session_vr_to_robot
         current_pos = goal.controller_position
         current_q = goal.rotation_quat
-        # Wrist responsiveness must not be tied to translation scale. The UI
-        # scale changes hand-to-EE translation reach; wrist pitch/roll are
-        # direct orientation DOFs with their own cap.
-        wrist_cap = WRIST_RAD_DELTA_LIMIT
 
         if arm.controller_anchor_T is None or current_pos is None or current_q is None:
             log.warning(
@@ -5572,6 +5656,12 @@ class VRTeleopSession:
             controller_rel_T = _np.linalg.solve(arm.controller_anchor_T, controller_current_T)
         except Exception as e:
             log.warning("[%s] SE(3) controller mapping failed (%s); holding targets", side, e)
+            return
+
+        try:
+            wrist_targets = self._direct_wrist_targets_from_vr(side, arm, controller_rel_T)
+        except Exception as e:
+            log.warning("[%s] direct wrist mapping failed (%s); holding targets", side, e)
             return
 
         with self._lock:
@@ -5614,41 +5704,6 @@ class VRTeleopSession:
             0.85 * arm.quality_offset_speed_ema_mps + 0.15 * inst_speed
         )
 
-        R_delta_vr = _controller_rotation_delta_for_side(side, controller_rel_T[:3, :3])
-        R_delta_robot = _project_to_rotation_matrix(M @ R_delta_vr @ M.T)
-        if arm.invert_lateral:
-            D = _np.diag([1.0, -1.0, 1.0])
-            R_delta_robot = _project_to_rotation_matrix(D @ R_delta_robot @ D)
-
-        if arm.vr_ctrl_to_ee is not None and current_pos is not None:
-            try:
-                R_current_vr = _R.from_quat(_positive_quat_xyzw(_np.array(current_q, dtype=float)))
-                R_ctrl_in_robot = _R.from_matrix(_project_to_rotation_matrix(M)) * R_current_vr
-                R_raw = _project_to_rotation_matrix(R_ctrl_in_robot.as_matrix() @ arm.vr_ctrl_to_ee.inv().as_matrix())
-                if arm.invert_lateral:
-                    D = _np.diag([1.0, -1.0, 1.0])
-                    R_raw = _project_to_rotation_matrix(D @ R_raw @ D)
-            except Exception:
-                R_raw = _project_to_rotation_matrix(arm.anchor_R_robot @ R_delta_robot)
-        else:
-            # BEAVR-style reset-relative target: robot anchor pose post-multiplied by
-            # the mapped controller-relative rotation.
-            R_raw = _project_to_rotation_matrix(arm.anchor_R_robot @ R_delta_robot)
-        raw_step = (
-            _R.from_matrix(R_raw)
-            * _R.from_matrix(arm.smoothed_R_target).inv()
-        ).magnitude()
-        if raw_step >= ROT_DEADZONE_RAD:
-            arm.smoothed_R_target = _slerp_rotation_matrix(
-                arm.smoothed_R_target,
-                R_raw,
-                ORI_EMA_ALPHA,
-                max_step_rad=wrist_cap,
-            )
-        arm.target_R_robot = _project_to_rotation_matrix(arm.smoothed_R_target)
-
-        R_wrist_delta = _project_to_rotation_matrix(arm.anchor_R_robot.T @ arm.target_R_robot)
-
         # Target position from anchor + offset, axis-clamped to EE_BOUNDS
         # (sanity box), then radially clamped before IK near the edge of the
         # SO101 reach envelope. We reconcile `arm.offset_robot` to the clamped
@@ -5666,7 +5721,7 @@ class VRTeleopSession:
             tz - arm.anchor_ee_pos[2],
         )
         arm.target_T[:3, 3] = (tx, ty, tz)
-        arm.target_T[:3, :3] = arm.target_R_robot
+        arm.target_T[:3, :3] = arm.anchor_R_robot
 
         # Position IK in calibrated SO101 joint space. Prefer the per-arm URDF
         # solver so RESET anchors and target pose use the same motor-degree
@@ -5679,95 +5734,59 @@ class VRTeleopSession:
         ik_rejected = False
         try:
             q_ik = arm.kinematics.inverse_kinematics(
-                arm.last_q_sol,
+                arm.last_body_q_sol,
                 arm.target_T,
                 position_weight=1.0,
                 orientation_weight=0.0,
             )
-            q_sol = arm.last_q_sol.copy()
-            q_sol[:3] = q_ik[:3]
-            if not _np.all(_np.isfinite(q_sol)):
-                log.warning("[%s] position IK output NaN/Inf; reusing previous q_sol", side)
-                q_sol = arm.last_q_sol
+            q_body = _np.asarray(q_ik, dtype=float).copy()
+            if q_body.ndim != 1 or q_body.shape[0] < len(_BODY_IK_JOINT_ORDER):
+                raise RuntimeError(
+                    f"body IK returned shape {q_body.shape}; expected at least {len(_BODY_IK_JOINT_ORDER)} joints"
+                )
+            q_body = q_body[:len(_BODY_IK_JOINT_ORDER)].copy()
+            if not _np.all(_np.isfinite(q_body)):
+                log.warning("[%s] position IK output NaN/Inf; reusing previous body q_sol", side)
+                q_body = arm.last_body_q_sol.copy()
             else:
-                raw_jump = _np.abs(q_sol[:3] - arm.last_q_sol[:3])
+                raw_jump = _np.abs(q_body - arm.last_body_q_sol)
                 if _np.any(raw_jump > IK_JUMP_REJECT_DEG):
                     ik_rejected = True
                     log.warning(
                         "[%s] position IK jump rejected: target_pos=(%.3f, %.3f, %.3f), dq=%s",
                         side, tx, ty, tz, tuple(f"{v:.1f}" for v in raw_jump),
                     )
-                    q_sol = arm.last_q_sol.copy()
-                if arm.last_q_filtered is None:
-                    arm.last_q_filtered = q_sol.copy()
+                    q_body = arm.last_body_q_sol.copy()
                 # The cartesian offset is already LERP-smoothed; the drive loop
                 # applies output filtering only to IK arm joints. Wrist joints
-                # bypass that final filter so roll/pitch stay responsive.
+                # are direct VR commands and bypass that final filter.
                 bounds = MOTORS.bounds
-                for idx, joint in enumerate(_IK_JOINT_ORDER):
+                for idx, joint in enumerate(_BODY_IK_JOINT_ORDER):
                     lo, hi = bounds.get(f"{side}_arm_{joint}", (-180.0, 180.0))
-                    q_sol[idx] = max(lo, min(hi, float(q_sol[idx])))
-                arm.last_q_filtered = q_sol.copy()
-                arm.last_q_sol = q_sol.copy()
+                    q_body[idx] = max(lo, min(hi, float(q_body[idx])))
+                arm.last_body_q_sol = q_body.copy()
         except Exception as e:
             ik_rejected = True
-            log.warning("[%s] position IK failed (%s); reusing previous q_sol", side, e)
-            q_sol = arm.last_q_sol
+            log.warning("[%s] position IK failed (%s); reusing previous body q_sol", side, e)
+            q_body = arm.last_body_q_sol.copy()
 
-        # Build the live joint targets. Order: shoulder_pan, shoulder_lift,
-        # elbow_flex, wrist_flex, wrist_roll (matches _IK_JOINT_ORDER).
-        #
-        # SO101 has only two wrist DOFs, so do not project wrist pitch/roll
-        # through the VR→robot translation frame. That can attenuate pitch when
-        # the calibrated position frame is not aligned with the controller local
-        # pitch axis. Instead, read the reset-relative controller rotvec in the
-        # same handedness-corrected controller-local frame used by calibration,
-        # project onto the calibrated pitch/roll axes, then apply hardware
-        # motor polarity.
-        wrist_rotvec_local = _np.asarray(_R.from_matrix(R_delta_vr).as_rotvec(), dtype=float)
-        pitch_axis, roll_axis = _effective_wrist_axes(
-            side,
-            pitch_canonical=arm.wrist_pitch_canonical,
-            roll_canonical=arm.wrist_roll_canonical,
-        )
-        if arm.vr_ctrl_to_ee is not None:
-            wrist_rotvec_local = _np.asarray(_R.from_matrix(R_wrist_delta).as_rotvec(), dtype=float)
-            pitch_axis = _np.asarray(arm.vr_ctrl_to_ee.apply(pitch_axis), dtype=float)
-            roll_axis = _np.asarray(arm.vr_ctrl_to_ee.apply(roll_axis), dtype=float)
-        polarity = _WRIST_MOTOR_POLARITY.get(side, {"flex": -1.0, "roll": -1.0})
-        flex_pol = 1.0 if float(polarity.get("flex", -1.0)) >= 0.0 else -1.0
-        roll_pol = 1.0 if float(polarity.get("roll", -1.0)) >= 0.0 else -1.0
-        wrist_flex_delta_deg = flex_pol * math.degrees(float(_np.dot(wrist_rotvec_local, pitch_axis)))
-        wrist_roll_delta_deg = roll_pol * math.degrees(float(_np.dot(wrist_rotvec_local, roll_axis)))
-        anchor_pitch_deg = (
-            arm.anchor.shoulder_lift_deg
-            + arm.anchor.elbow_flex_deg
-            + arm.anchor.wrist_flex_deg
-        )
-        wrist_flex = (
-            anchor_pitch_deg
-            - float(q_sol[1])
-            - float(q_sol[2])
-            + wrist_flex_delta_deg
-        )
-        wrist_roll = arm.anchor.wrist_roll_deg + wrist_roll_delta_deg
-        bounds = MOTORS.bounds
-        wrist_flex_lo, wrist_flex_hi = bounds.get(f"{side}_arm_wrist_flex", (-180.0, 180.0))
-        wrist_roll_lo, wrist_roll_hi = bounds.get(f"{side}_arm_wrist_roll", (-180.0, 180.0))
-        wrist_flex = max(wrist_flex_lo, min(wrist_flex_hi, float(wrist_flex)))
-        wrist_roll = max(wrist_roll_lo, min(wrist_roll_hi, float(wrist_roll)))
-        q_seed = q_sol.copy()
-        q_seed[3] = wrist_flex
-        q_seed[4] = wrist_roll
-        arm.last_q_sol = q_seed.copy()
-        arm.last_q_filtered = q_seed.copy()
+        # Build the live joint targets. The first three joints come from body
+        # position IK; wrist joints come only from direct controller rotation.
+        q_full = _np.asarray(arm.last_q_sol, dtype=float).copy()
+        if q_full.shape != (len(_IK_JOINT_ORDER),) or not _np.all(_np.isfinite(q_full)):
+            q_full = _np.zeros(len(_IK_JOINT_ORDER), dtype=float)
+        q_full[:len(_BODY_IK_JOINT_ORDER)] = q_body
+        q_full[3] = wrist_targets.wrist_flex
+        q_full[4] = wrist_targets.wrist_roll
+        arm.last_q_sol = q_full.copy()
+        arm.last_q_filtered = q_full.copy()
         gripper_target = self._gripper_closed if goal.trigger else self._gripper_open
         arm.targets = _LiveTargets(
-            shoulder_pan=float(q_sol[0]),
-            shoulder_lift=float(q_sol[1]),
-            elbow_flex=float(q_sol[2]),
-            wrist_flex=float(wrist_flex),
-            wrist_roll=float(wrist_roll),
+            shoulder_pan=float(q_body[0]),
+            shoulder_lift=float(q_body[1]),
+            elbow_flex=float(q_body[2]),
+            wrist_flex=float(wrist_targets.wrist_flex),
+            wrist_roll=float(wrist_targets.wrist_roll),
             gripper=gripper_target,
         )
         arm.quality_ticks += 1
@@ -5788,16 +5807,20 @@ class VRTeleopSession:
             "translation_source": self._runtime_translation_source(arm),
             "offset_robot": [float(v) for v in arm.offset_robot],
             "target_ee_pos": [tx, ty, tz],
-            "target_quat_xyzw": [
-                float(v) for v in _positive_quat_xyzw(_R.from_matrix(arm.target_R_robot).as_quat())
+            "body_target_quat_xyzw": [
+                float(v) for v in _positive_quat_xyzw(_R.from_matrix(arm.anchor_R_robot).as_quat())
             ],
             "ik_mode": ik_mode,
-            "q_arm": [float(v) for v in q_sol[:3]],
-            "wrist_delta_deg": [wrist_flex_delta_deg, wrist_roll_delta_deg],
-            "wrist_motor_polarity": dict(polarity),
+            "q_arm": [float(v) for v in q_body],
+            "wrist_mapping_source": "direct_controller_rotation",
+            "wrist_delta_deg": [
+                wrist_targets.wrist_flex_delta_deg,
+                wrist_targets.wrist_roll_delta_deg,
+            ],
+            "wrist_motor_polarity": dict(wrist_targets.polarity),
             "wrist_axes": {
-                "pitch": [float(v) for v in pitch_axis],
-                "roll": [float(v) for v in roll_axis],
+                "pitch": [float(v) for v in wrist_targets.pitch_axis],
+                "roll": [float(v) for v in wrist_targets.roll_axis],
             },
             "using_analytical_fallback": bool(arm.using_analytical_fallback),
             "quality": {

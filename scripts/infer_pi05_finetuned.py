@@ -25,6 +25,7 @@ from __future__ import annotations
 import argparse
 import json
 import pathlib
+import subprocess
 import sys
 import time
 from typing import Any
@@ -73,8 +74,14 @@ _JOINT_DEADBAND_DEG: dict[str, float] = {
 _FINAL_SMOOTHING_BYPASS = {"wrist_flex", "wrist_roll", "gripper"}
 _HOMING_TOL_DEG = 0.5
 _HOMING_PRESENT_TOL_DEG = 1.0
+_HOMING_FINAL_DIRECT_TOL_DEG = 8.0
+_HOMING_SOFT_STALL_TOL_DEG = 6.0
 _HOMING_SETTLE_TICKS = 5
 _HOMING_KP = 0.75
+_HOMING_PROGRESS_LOG_S = 2.0
+_HOMING_STALL_WINDOW_S = 3.0
+_HOMING_STALL_MIN_COMMAND_DEG = 1.0
+_HOMING_STALL_MAX_FEEDBACK_CHANGE_DEG = 0.25
 # VR recording uses KP=1.0 → action label is rate-limited absolute command (see _shape_action_like_recording).
 _DEFAULT_VR_KP = 1.0
 
@@ -92,6 +99,61 @@ def _load_yaml() -> dict[str, Any]:
     if not CONFIG_YAML.is_file():
         sys.exit(f"missing {CONFIG_YAML}")
     return yaml.safe_load(CONFIG_YAML.read_text()) or {}
+
+
+def _configured_motor_ports(cfg: dict[str, Any]) -> list[tuple[str, str]]:
+    robot_cfg = cfg.get("robot") if isinstance(cfg.get("robot"), dict) else {}
+    ports: list[tuple[str, str]] = []
+    for label, key in (
+        ("left/base bus", "port_left_base"),
+        ("right/head bus", "port_right_head"),
+    ):
+        value = robot_cfg.get(key)
+        if value:
+            ports.append((label, str(value)))
+    return ports
+
+
+def _run_motor_port_preflight(cfg: dict[str, Any]) -> None:
+    """Fail before model load if motor serial ports are missing or already owned."""
+    ports = _configured_motor_ports(cfg)
+    if not ports:
+        return
+
+    busy: list[str] = []
+    missing: list[str] = []
+    print("Motor port preflight:")
+    for label, port in ports:
+        path = pathlib.Path(port)
+        if not path.exists():
+            missing.append(f"{label}: {port}")
+            print(f"  {label:14} MISSING\n    {port}")
+            continue
+        print(f"  {label:14} ok\n    {port}")
+        try:
+            proc = subprocess.run(
+                ["fuser", "-v", port],
+                capture_output=True,
+                text=True,
+                timeout=2.0,
+            )
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            continue
+        combined = ((proc.stdout or "") + (proc.stderr or "")).strip()
+        if proc.returncode == 0 and combined:
+            busy.append(f"{label}: {port}\n{combined[:800]}")
+
+    if missing:
+        sys.exit(
+            "Motor port preflight failed: configured serial port(s) do not exist.\n"
+            + "\n".join(f"  {item}" for item in missing)
+        )
+    if busy:
+        sys.exit(
+            "Motor port preflight failed: another process is using the robot motor bus.\n"
+            "Stop the dashboard backend / VR teleop / older inference run, then re-run inference.\n\n"
+            + "\n\n".join(busy)
+        )
 
 
 def _load_vr_control_shaping(cfg: dict[str, Any]) -> tuple[dict[str, float], dict[str, float]]:
@@ -127,6 +189,26 @@ def _load_vr_control_shaping(cfg: dict[str, Any]) -> tuple[dict[str, float], dic
                 except (TypeError, ValueError):
                     pass
     return caps, deadbands
+
+
+def _load_homing_tolerances(cfg: dict[str, Any]) -> tuple[float, float]:
+    vr_cfg = cfg.get("vr") if isinstance(cfg.get("vr"), dict) else {}
+    present_tol = _HOMING_PRESENT_TOL_DEG
+    raw_present_tol = vr_cfg.get("homing_present_tolerance_deg")
+    if raw_present_tol is not None:
+        try:
+            present_tol = max(0.25, min(10.0, float(raw_present_tol)))
+        except (TypeError, ValueError):
+            pass
+
+    soft_stall_tol = max(_HOMING_SOFT_STALL_TOL_DEG, present_tol + 2.0)
+    raw_soft_stall_tol = vr_cfg.get("homing_soft_stall_tolerance_deg")
+    if raw_soft_stall_tol is not None:
+        try:
+            soft_stall_tol = max(present_tol, min(15.0, float(raw_soft_stall_tol)))
+        except (TypeError, ValueError):
+            pass
+    return present_tol, soft_stall_tol
 
 
 def _parse_args() -> argparse.Namespace:
@@ -302,11 +384,11 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument(
         "--clamp-to-present",
         action=argparse.BooleanOptionalAction,
-        default=False,
+        default=True,
         help=(
             "Clamp each command vs measured joint pose (robot.max_relative_target). "
-            "Default off: training labels are rate-limited vs the previous command, not "
-            "present; present clamp often causes oscillation during policy chunks."
+            "Default on to match the SOFollower safety layer used during recording; "
+            "use --no-clamp-to-present only for controlled debugging."
         ),
     )
     p.add_argument(
@@ -577,7 +659,7 @@ def _send_positions(
     command: dict[str, float],
     *,
     present: dict[str, float] | None = None,
-) -> None:
+) -> dict[str, float]:
     """Send joint goals; clamp here so older XLerobot send_action bugs are avoided."""
     max_rel = getattr(robot.config, "max_relative_target", None)
     if present is not None and max_rel is not None:
@@ -585,9 +667,14 @@ def _send_positions(
     saved_max_rel = robot.config.max_relative_target
     robot.config.max_relative_target = None
     try:
-        robot.send_action(command)
+        sent = robot.send_action(command)
     finally:
         robot.config.max_relative_target = saved_max_rel
+    sent_command = {str(k): float(v) for k, v in (sent or command).items()}
+    missing = sorted(set(command) - set(sent_command))
+    if missing:
+        raise RuntimeError(f"robot.send_action ignored {len(missing)} command key(s): {missing}")
+    return sent_command
 
 
 def _connect_robot_with_retries(
@@ -644,6 +731,8 @@ def go_to_home_pose(
     timeout_s: float,
     precise_sleep: Any,
     caps: dict[str, float] | None = None,
+    present_tolerance_deg: float = _HOMING_PRESENT_TOL_DEG,
+    soft_stall_tolerance_deg: float = _HOMING_SOFT_STALL_TOL_DEG,
     episode_deadline: float | None = None,
 ) -> None:
     """Rate-limited move to `robot.home_pose` joint targets (degrees)."""
@@ -656,6 +745,10 @@ def go_to_home_pose(
     paused_lerobot_cams = False
     controller: JointHomingController | None = None
     last_step = None
+    start_t = time.perf_counter()
+    next_progress_log_t = start_t
+    stall_window_t = start_t
+    stall_window_present: dict[str, float] | None = None
 
     print(f"Homing to saved pose ({len(keys)} joints, timeout={timeout_s:.0f}s)...")
     if getattr(robot, "cameras", None):
@@ -667,7 +760,16 @@ def go_to_home_pose(
         while time.perf_counter() < deadline:
             loop_start = time.perf_counter()
             obs = _read_motor_observation(robot)
-            present = {k: float(obs[k]) for k in keys if k in obs}
+            missing_obs = sorted(set(keys) - set(obs))
+            if missing_obs:
+                raise RuntimeError(
+                    "homing cannot read motor feedback for "
+                    f"{len(missing_obs)} joint(s): {missing_obs}"
+                )
+            present = {k: float(obs[k]) for k in keys}
+            if stall_window_present is None:
+                stall_window_present = dict(present)
+                stall_window_t = loop_start
             if controller is None:
                 controller = JointHomingController(
                     targets=targets,
@@ -675,13 +777,66 @@ def go_to_home_pose(
                     cap_for_key=lambda key: _cap_for_joint_key(key, caps),
                     kp=_HOMING_KP,
                     command_tolerance_deg=_HOMING_TOL_DEG,
-                    present_tolerance_deg=_HOMING_PRESENT_TOL_DEG,
+                    present_tolerance_deg=present_tolerance_deg,
+                    final_direct_tolerance_deg=max(
+                        _HOMING_FINAL_DIRECT_TOL_DEG,
+                        present_tolerance_deg,
+                    ),
                     settle_ticks=_HOMING_SETTLE_TICKS,
                 )
 
             step = controller.step(present)
             last_step = step
-            _send_positions(robot, step.command, present=present)
+            sent_command = _send_positions(robot, step.command, present=present)
+            max_sent_delta = max(
+                abs(float(sent_command[k]) - float(present[k])) for k in keys
+            )
+
+            now = time.perf_counter()
+            if now >= next_progress_log_t:
+                joint = f" worst={step.worst_present_joint}" if step.worst_present_joint else ""
+                print(
+                    f"  Homing {now - start_t:.1f}s: command_error="
+                    f"{step.max_command_error_deg:.2f} deg, feedback_error="
+                    f"{step.max_present_error_deg:.2f} deg{joint}, "
+                    f"max_sent_delta={max_sent_delta:.2f} deg, settled={step.settled}"
+                )
+                for name, delta in _top_joint_deltas(sent_command, present, top_k=3):
+                    print(f"    homing sent delta {name}: {delta:+.2f} deg")
+                next_progress_log_t = now + _HOMING_PROGRESS_LOG_S
+
+            if stall_window_present is not None and now - stall_window_t >= _HOMING_STALL_WINDOW_S:
+                max_feedback_change = max(
+                    abs(float(present[k]) - float(stall_window_present.get(k, present[k])))
+                    for k in keys
+                )
+                if (
+                    max_sent_delta >= _HOMING_STALL_MIN_COMMAND_DEG
+                    and step.max_present_error_deg > present_tolerance_deg
+                    and max_feedback_change <= _HOMING_STALL_MAX_FEEDBACK_CHANGE_DEG
+                ):
+                    top_deltas = ", ".join(
+                        f"{name} {delta:+.2f} deg"
+                        for name, delta in _top_joint_deltas(sent_command, present, top_k=3)
+                    )
+                    if step.max_present_error_deg <= soft_stall_tolerance_deg:
+                        print(
+                            "Warning: homing stalled near saved home; continuing "
+                            f"(max feedback error {step.max_present_error_deg:.2f} deg <= "
+                            f"soft tolerance {soft_stall_tolerance_deg:.2f} deg; "
+                            f"max feedback change {max_feedback_change:.2f} deg over "
+                            f"{now - stall_window_t:.1f}s; {top_deltas})."
+                        )
+                        return
+                    raise RuntimeError(
+                        "homing is commanding motion but motor feedback is not changing "
+                        f"(max feedback change {max_feedback_change:.2f} deg over "
+                        f"{now - stall_window_t:.1f}s; {top_deltas}). "
+                        "Stop the dashboard backend/VR teleop or any other process using "
+                        "the motor serial ports, then retry."
+                    )
+                stall_window_present = dict(present)
+                stall_window_t = now
 
             if step.settled:
                 print(f"Home pose reached (max feedback error {step.max_present_error_deg:.2f} deg).")
@@ -799,6 +954,8 @@ def _safe_finish_episode(
     home_timeout_s: float,
     precise_sleep: Any,
     caps: dict[str, float],
+    homing_present_tolerance_deg: float,
+    homing_soft_stall_tolerance_deg: float,
     hold_cmd: dict[str, float] | None,
     hold_s: float = 0.5,
     episode_deadline: float | None = None,
@@ -832,6 +989,8 @@ def _safe_finish_episode(
                     timeout_s=post_home_timeout,
                     precise_sleep=precise_sleep,
                     caps=caps,
+                    present_tolerance_deg=homing_present_tolerance_deg,
+                    soft_stall_tolerance_deg=homing_soft_stall_tolerance_deg,
                     episode_deadline=episode_deadline,
                 )
             except Exception as exc:
@@ -842,6 +1001,8 @@ def _run_home_only(args: argparse.Namespace, cfg: dict[str, Any]) -> None:
     """Connect, homing only, disconnect — no policy."""
     home_pose = _read_home_pose(cfg)
     caps, _deadbands = _load_vr_control_shaping(cfg)
+    homing_present_tol, homing_soft_stall_tol = _load_homing_tolerances(cfg)
+    _run_motor_port_preflight(cfg)
     _ensure_xlerobot_import()
     from _xlerobot_loader import make_config, patch_motors_bus_lenient
     from lerobot.robots.xlerobot import XLerobot
@@ -860,10 +1021,14 @@ def _run_home_only(args: argparse.Namespace, cfg: dict[str, Any]) -> None:
             timeout_s=float(args.home_timeout),
             precise_sleep=precise_sleep,
             caps=caps,
+            present_tolerance_deg=homing_present_tol,
+            soft_stall_tolerance_deg=homing_soft_stall_tol,
         )
         print("Dry-run home complete.")
     except KeyboardInterrupt:
         print("\nInterrupted by user.")
+    except Exception as exc:
+        sys.exit(f"Dry-run home failed: {exc}")
     finally:
         robot.disconnect()
 
@@ -901,6 +1066,7 @@ def main() -> None:
     cfg = _load_yaml()
     args = _parse_args()
     vr_joint_caps, vr_joint_deadbands = _load_vr_control_shaping(cfg)
+    homing_present_tol, homing_soft_stall_tol = _load_homing_tolerances(cfg)
     if args.joint_deadband_deg is not None:
         override_deadband = max(0.0, min(5.0, float(args.joint_deadband_deg)))
         vr_joint_deadbands = {
@@ -913,6 +1079,10 @@ def main() -> None:
         print("  Mode              : dry-run-home (homing only)")
         print(f"  FPS               : {args.fps}")
         print(f"  Home timeout      : {args.home_timeout}s")
+        print(
+            f"  Home tolerance    : feedback {homing_present_tol:.2f} deg, "
+            f"soft stall {homing_soft_stall_tol:.2f} deg"
+        )
         print("=" * 60)
         _run_home_only(args, cfg)
         return
@@ -949,6 +1119,10 @@ def main() -> None:
     print(f"  Device            : {args.device}")
     print(f"  Home before run   : {not args.skip_home}")
     print(f"  Home per episode  : {args.home_before_episode and not args.skip_home}")
+    print(
+        f"  Home tolerance    : feedback {homing_present_tol:.2f} deg, "
+        f"soft stall {homing_soft_stall_tol:.2f} deg"
+    )
     robot_cfg_yaml = cfg.get("robot") or {}
     max_rel = args.max_relative_target
     if max_rel is None:
@@ -974,6 +1148,7 @@ def main() -> None:
     if policy_path is None:
         sys.exit("--policy-path is required for inference")
 
+    _run_motor_port_preflight(cfg)
     home_pose = _read_home_pose(cfg) if not args.skip_home else {}
 
     _ensure_xlerobot_import()
@@ -1068,14 +1243,19 @@ def main() -> None:
     last_policy_smoothed: dict[str, float] = {}
     try:
         if home_pose and not args.home_before_episode:
-            go_to_home_pose(
-                robot,
-                home_pose,
-                fps=float(args.fps),
-                timeout_s=float(args.home_timeout),
-                precise_sleep=precise_sleep,
-                caps=vr_joint_caps,
-            )
+            try:
+                go_to_home_pose(
+                    robot,
+                    home_pose,
+                    fps=float(args.fps),
+                    timeout_s=float(args.home_timeout),
+                    precise_sleep=precise_sleep,
+                    caps=vr_joint_caps,
+                    present_tolerance_deg=homing_present_tol,
+                    soft_stall_tolerance_deg=homing_soft_stall_tol,
+                )
+            except Exception as exc:
+                sys.exit(f"Pre-run homing failed: {exc}")
 
         for ep in range(args.episodes):
             print(f"\n=== Episode {ep + 1}/{args.episodes} ===")
@@ -1085,15 +1265,20 @@ def main() -> None:
                 pre_home_timeout = float(args.home_timeout)
                 if _episode_seconds_left(episode_deadline) < pre_home_timeout:
                     pre_home_timeout = max(1.0, _episode_seconds_left(episode_deadline) - 1.0)
-                go_to_home_pose(
-                    robot,
-                    home_pose,
-                    fps=float(args.fps),
-                    timeout_s=pre_home_timeout,
-                    precise_sleep=precise_sleep,
-                    caps=vr_joint_caps,
-                    episode_deadline=episode_deadline,
-                )
+                try:
+                    go_to_home_pose(
+                        robot,
+                        home_pose,
+                        fps=float(args.fps),
+                        timeout_s=pre_home_timeout,
+                        precise_sleep=precise_sleep,
+                        caps=vr_joint_caps,
+                        present_tolerance_deg=homing_present_tol,
+                        soft_stall_tolerance_deg=homing_soft_stall_tol,
+                        episode_deadline=episode_deadline,
+                    )
+                except Exception as exc:
+                    sys.exit(f"Pre-episode homing failed: {exc}")
             _reset_policy_episode_state(
                 policy,
                 preprocessor,
@@ -1136,9 +1321,9 @@ def main() -> None:
 
                     if step < settle_steps:
                         hold_cmd = dict(present_dict)
-                        _send_positions(robot, hold_cmd, present=present_dict)
-                        last_sent = dict(hold_cmd)
-                        last_filtered = dict(hold_cmd)
+                        sent_cmd = _send_positions(robot, hold_cmd, present=present_dict)
+                        last_sent = dict(sent_cmd)
+                        last_filtered = dict(sent_cmd)
                         step += 1
                         remaining = dt - (time.perf_counter() - loop_start)
                         if remaining > 0:
@@ -1242,12 +1427,18 @@ def main() -> None:
                             miss_replans += 1
                     if not logged_action_debug:
                         present = _build_state_vector(raw_obs, JOINT_ORDER)
+                        debug_final_cmd = final_cmd
+                        max_rel_cfg = getattr(robot.config, "max_relative_target", None)
+                        if args.clamp_to_present and max_rel_cfg is not None:
+                            debug_final_cmd = _clamp_max_relative(
+                                final_cmd, present_dict, float(max_rel_cfg)
+                            )
                         raw_cmd = np.array([action_dict[f"{n}.pos"] for n in JOINT_ORDER])
                         shaped_cmd = np.array([shaped[f"{n}.pos"] for n in JOINT_ORDER])
-                        sent_cmd = np.array([final_cmd[f"{n}.pos"] for n in JOINT_ORDER])
+                        sent_cmd_arr = np.array([debug_final_cmd[f"{n}.pos"] for n in JOINT_ORDER])
                         raw_delta = raw_cmd - present
                         shaped_delta = shaped_cmd - present
-                        final_delta = sent_cmd - present
+                        final_delta = sent_cmd_arr - present
                         print(
                             f"  First step |policy-present| max={np.abs(raw_delta).max():.2f} deg "
                             f"(raw policy, before VR shaping)"
@@ -1265,19 +1456,19 @@ def main() -> None:
                             f"  First step |sent-present|   max={np.abs(final_delta).max():.2f} deg "
                             f"(final command {sent_note})"
                         )
-                        for name, delta in _top_joint_deltas(final_cmd, present_dict):
+                        for name, delta in _top_joint_deltas(debug_final_cmd, present_dict):
                             print(f"    sent delta {name}: {delta:+.2f} deg")
                         logged_action_debug = True
 
                     try:
                         send_present = present_dict if args.clamp_to_present else None
-                        _send_positions(robot, final_cmd, present=send_present)
+                        sent_cmd = _send_positions(robot, final_cmd, present=send_present)
                     except Exception as exc:
                         stop_reason = f"motor command failed: {exc}"
                         break
 
-                    last_sent = dict(final_cmd)
-                    last_filtered = dict(final_cmd)
+                    last_sent = dict(sent_cmd)
+                    last_filtered = dict(sent_cmd)
 
                     step += 1
                     progress_log_t = _maybe_log_episode_progress(
@@ -1316,6 +1507,8 @@ def main() -> None:
                     home_timeout_s=float(args.home_timeout),
                     precise_sleep=precise_sleep,
                     caps=vr_joint_caps,
+                    homing_present_tolerance_deg=homing_present_tol,
+                    homing_soft_stall_tolerance_deg=homing_soft_stall_tol,
                     hold_cmd=hold if hold else None,
                     episode_deadline=episode_deadline,
                     skip_home_after=bool(args.skip_home_after_episode),

@@ -92,9 +92,17 @@ While grip is held, the native Quest app streams Unity/OpenXR controller poses t
 the backend. The backend converts those packets into reset-relative controller
 displacements, maps them through the saved VR-to-robot frame, and caps the
 end-effector target step before IK. This keeps slow hand motion smooth and
-rejects one-frame tracking spikes. The controller's rotation is also mapped
-through the reset-time controller-to-EE alignment so wrist intent does not
-depend on the exact grip angle at anchor time.
+rejects one-frame tracking spikes.
+
+The body and wrist are intentionally separate:
+
+- `shoulder_pan`, `shoulder_lift`, and `elbow_flex` come from calibrated
+  controller translation and URDF position IK.
+- `wrist_flex` and `wrist_roll` come directly from the calibrated Quest
+  controller rotation since the grip/reset anchor. They are not compensated by
+  shoulder/elbow IK and are not inferred from smoothed end-effector orientation.
+  Live control requires the wrist pitch and roll axes captured by the calibration
+  wizard; missing wrist-axis calibration blocks teleop until the axes are captured.
 
 The native adapter converts Unity/OpenXR controller coordinates into the
 backend operator frame before calibration. The default frame is
@@ -114,11 +122,8 @@ Useful tuning keys live in `config/xlerobot.yaml`:
 vr:
   kp: 0.75
   pos_ema_alpha: 0.22
-  ori_ema_alpha: 0.25
   pos_deadzone_m: 0.002
-  rot_deadzone_deg: 0.7
   max_ee_step_m: 0.003
-  wrist_delta_limit_deg: 8.0
   joint_deg_caps:
     shoulder_pan: 5.0
     shoulder_lift: 5.0
@@ -137,7 +142,8 @@ vr:
 ```
 
 `wrist_flex`, `wrist_roll`, and `gripper` bypass the final command EMA/filter so
-wrist and gripper intent remains responsive. Translation joints use the command
+wrist and gripper intent remains responsive. The wrist still respects calibrated
+motor bounds, per-tick caps, and deadbands. Translation joints use the command
 filter to reduce jitter. Recording stores the final commanded joint target after
 these same caps/deadbands/filters, so dataset labels match what the robot was
 asked to do.

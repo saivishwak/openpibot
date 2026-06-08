@@ -104,6 +104,8 @@ def _mark_strict_recording_ready(session, monkeypatch):
         arm = session._arms[side]
         arm.kinematics = _FakeKinematics()
         arm.using_analytical_fallback = False
+        arm.wrist_pitch_canonical = (1.0, 0.0, 0.0)
+        arm.wrist_roll_canonical = (0.0, 0.0, -1.0)
         arm.cal_confidence = "good"
         arm.robot_verify_quality = "good"
         arm.robot_verify_fit_error_cm = 0.0
@@ -299,6 +301,31 @@ def test_record_frame_uses_same_tick_commanded_actions(monkeypatch):
     action, observed, _ = recorder.frames[0]
     assert observed == present
     assert action == {**left_command, **right_command}
+
+
+def test_record_frame_keeps_direct_vr_wrist_command(monkeypatch):
+    session = vr_mod.VRTeleopSession()
+    recorder = _FakeRecorder()
+    present = {**_joint_values("left", 10), **_joint_values("right", 20)}
+    right_command = _joint_values("right", 200)
+    right_command["right_arm_wrist_flex"] = 37.5
+    right_command["right_arm_wrist_roll"] = -18.25
+    present["right_arm_wrist_flex"] = -70.0
+    present["right_arm_wrist_roll"] = 70.0
+
+    session._recording = True
+    session._recorder = recorder
+    session._engaged = True
+    monkeypatch.setattr(vr_mod, "MOTORS", _FakeMotors(present))
+    monkeypatch.setattr(vr_mod._dataset, "grab_camera_frames", lambda: {})
+
+    session._record_frame_if_active(commanded_this_tick={"right": right_command})
+
+    action, observed, _ = recorder.frames[0]
+    assert observed["right_arm_wrist_flex"] == pytest.approx(-70.0)
+    assert observed["right_arm_wrist_roll"] == pytest.approx(70.0)
+    assert action["right_arm_wrist_flex"] == pytest.approx(37.5)
+    assert action["right_arm_wrist_roll"] == pytest.approx(-18.25)
 
 
 def test_record_frame_uses_recorder_owned_camera_streams(monkeypatch):
@@ -1478,6 +1505,37 @@ def test_recording_status_marks_anchor_only_blockers_as_start_allowed(monkeypatc
     assert info["verification_blockers"] == []
     assert status["operator"]["recording"]["start_allowed"] is True
     assert status["operator"]["recording"]["anchor_pending"] is True
+
+
+def test_recording_status_blocks_missing_wrist_axes_as_hard_calibration(monkeypatch):
+    session = vr_mod.VRTeleopSession()
+    _mark_strict_recording_ready(session, monkeypatch)
+    session._arms["right"].wrist_roll_canonical = None
+
+    info = session.status()["recording_info"]
+
+    assert info["calibration_ready"] is False
+    assert info["start_allowed"] is False
+    assert any(
+        "right wrist pitch/roll calibration missing" in blocker
+        for blocker in info["start_blockers"]
+    )
+    assert info["anchor_pending"] is False
+    assert info["anchor_blockers"] == []
+
+
+def test_recording_context_records_direct_wrist_mapping_provenance(monkeypatch):
+    session = vr_mod.VRTeleopSession()
+    _mark_strict_recording_ready(session, monkeypatch)
+
+    meta = session._recording_context_metadata("Pick the red block")
+    wrist = meta["arms"]["right"]["wrist_mapping"]
+
+    assert wrist["source"] == "direct_controller_rotation"
+    assert wrist["ready"] is True
+    assert wrist["pitch_axis"] == [1.0, 0.0, 0.0]
+    assert wrist["roll_axis"] == [0.0, 0.0, -1.0]
+    assert wrist["motor_polarity"] == vr_mod._WRIST_MOTOR_POLARITY["right"]
 
 
 def test_recording_status_keeps_verified_state_when_other_gate_blocks(monkeypatch):
