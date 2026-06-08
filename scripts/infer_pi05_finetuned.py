@@ -82,8 +82,9 @@ _HOMING_PROGRESS_LOG_S = 2.0
 _HOMING_STALL_WINDOW_S = 3.0
 _HOMING_STALL_MIN_COMMAND_DEG = 1.0
 _HOMING_STALL_MAX_FEEDBACK_CHANGE_DEG = 0.25
-# VR recording uses KP=1.0 → action label is rate-limited absolute command (see _shape_action_like_recording).
-_DEFAULT_VR_KP = 1.0
+# VR recording labels are rate-limited absolute commands from the final send path.
+# Homing uses vr.kp, but normal live teleop does not P-blend against feedback.
+_DEFAULT_ACTION_SHAPE_KP = 1.0
 
 
 def _normalize_joint_name(name: str) -> str:
@@ -355,6 +356,26 @@ def _parse_args() -> argparse.Namespace:
         help="Max joint change (deg) per policy command (default: robot.max_relative_target in yaml).",
     )
     p.add_argument(
+        "--gripper-max-relative-target",
+        type=float,
+        default=None,
+        help=(
+            "Override present-position clamp for gripper joints only. "
+            "Useful when the arm reaches correctly but grasp closure is late/weak "
+            "(try 15-25 while leaving arm joints at robot.max_relative_target)."
+        ),
+    )
+    p.add_argument(
+        "--action-shape-kp",
+        type=float,
+        default=float(pi05.get("action_shape_kp", _DEFAULT_ACTION_SHAPE_KP)),
+        help=(
+            "P blend used while converting policy targets into VR-style commands [0..1]. "
+            "Default 1.0 matches recorded action labels; lower values slow commands toward "
+            "measured feedback."
+        ),
+    )
+    p.add_argument(
         "--policy-ema-alpha",
         type=float,
         default=0.36,
@@ -504,8 +525,53 @@ def _cap_for_joint_key(key: str, caps: dict[str, float] | None = None) -> float:
     return 2.0
 
 
-def _vr_kp(cfg: dict[str, Any]) -> float:
-    return float((cfg.get("vr") or {}).get("kp", _DEFAULT_VR_KP))
+def _effective_max_relative_target(
+    args: argparse.Namespace,
+    cfg: dict[str, Any],
+) -> float | dict[str, float] | None:
+    robot_cfg = cfg.get("robot") if isinstance(cfg.get("robot"), dict) else {}
+    base: float | dict[str, float] | None
+    if args.max_relative_target is None:
+        base = robot_cfg.get("max_relative_target")
+    else:
+        base = float(args.max_relative_target)
+
+    if args.gripper_max_relative_target is None:
+        return base
+
+    gripper_cap = max(0.1, min(100.0, float(args.gripper_max_relative_target)))
+    if isinstance(base, dict):
+        out = {str(k): float(v) for k, v in base.items()}
+    elif base is None:
+        out = {}
+    else:
+        out = {"default": float(base)}
+    out["gripper"] = gripper_cap
+    return out
+
+
+def _max_relative_cap_for_key(
+    key: str,
+    max_rel: float | int | dict[str, float],
+) -> float | None:
+    if isinstance(max_rel, (int, float)):
+        return max(0.0, float(max_rel))
+    if not isinstance(max_rel, dict):
+        raise TypeError(f"invalid max_relative_target: {max_rel!r}")
+
+    base = _normalize_joint_name(key)
+    candidates = (key, base)
+    for candidate in candidates:
+        if candidate in max_rel:
+            return max(0.0, float(max_rel[candidate]))
+    for suffix in _JOINTS_PER_ARM:
+        if f"_{suffix}.pos" in key or base.endswith(f"_{suffix}"):
+            if suffix in max_rel:
+                return max(0.0, float(max_rel[suffix]))
+            break
+    if "default" in max_rel:
+        return max(0.0, float(max_rel["default"]))
+    return None
 
 
 def _shape_action_like_recording(
@@ -539,13 +605,17 @@ def _shape_action_like_recording(
 def _clamp_max_relative(
     command: dict[str, float],
     present: dict[str, float],
-    max_rel: float,
+    max_rel: float | int | dict[str, float],
 ) -> dict[str, float]:
     """Clamp absolute goals vs present (same semantics as XLerobot max_relative_target)."""
     out: dict[str, float] = {}
     for key, goal in command.items():
+        cap = _max_relative_cap_for_key(key, max_rel)
+        if cap is None:
+            out[key] = goal
+            continue
         here = present.get(key, goal)
-        delta = max(-max_rel, min(max_rel, goal - here))
+        delta = max(-cap, min(cap, goal - here))
         out[key] = here + delta
     return out
 
@@ -663,7 +733,7 @@ def _send_positions(
     """Send joint goals; clamp here so older XLerobot send_action bugs are avoided."""
     max_rel = getattr(robot.config, "max_relative_target", None)
     if present is not None and max_rel is not None:
-        command = _clamp_max_relative(command, present, float(max_rel))
+        command = _clamp_max_relative(command, present, max_rel)
     saved_max_rel = robot.config.max_relative_target
     robot.config.max_relative_target = None
     try:
@@ -889,6 +959,7 @@ def _reset_policy_episode_state(
     preprocessor: Any,
     postprocessor: Any,
     *,
+    action_horizon: int,
     open_loop_steps: int,
     last_sent: dict[str, float],
     last_filtered: dict[str, float],
@@ -903,6 +974,7 @@ def _reset_policy_episode_state(
     last_filtered.clear()
     last_policy_smoothed.clear()
     policy.config.n_action_steps = min(
+        int(action_horizon),
         int(open_loop_steps),
         int(policy.config.chunk_size),
     )
@@ -1067,6 +1139,8 @@ def main() -> None:
     args = _parse_args()
     vr_joint_caps, vr_joint_deadbands = _load_vr_control_shaping(cfg)
     homing_present_tol, homing_soft_stall_tol = _load_homing_tolerances(cfg)
+    action_shape_kp = max(0.0, min(1.0, float(args.action_shape_kp)))
+    effective_max_rel = _effective_max_relative_target(args, cfg)
     if args.joint_deadband_deg is not None:
         override_deadband = max(0.0, min(5.0, float(args.joint_deadband_deg)))
         vr_joint_deadbands = {
@@ -1123,14 +1197,15 @@ def main() -> None:
         f"  Home tolerance    : feedback {homing_present_tol:.2f} deg, "
         f"soft stall {homing_soft_stall_tol:.2f} deg"
     )
-    robot_cfg_yaml = cfg.get("robot") or {}
-    max_rel = args.max_relative_target
-    if max_rel is None:
-        max_rel = robot_cfg_yaml.get("max_relative_target")
     print(
         f"  Clamp to present  : {args.clamp_to_present}"
-        + (f" (max {max_rel} deg)" if args.clamp_to_present and max_rel is not None else "")
+        + (
+            f" (max {effective_max_rel} deg)"
+            if args.clamp_to_present and effective_max_rel is not None
+            else ""
+        )
     )
+    print(f"  Action shape KP   : {action_shape_kp}")
     print(f"  Policy EMA alpha  : {args.policy_ema_alpha}")
     print(f"  Command EMA alpha : {args.command_ema_alpha}")
     print(f"  VR joint caps     : {vr_joint_caps}")
@@ -1184,8 +1259,8 @@ def main() -> None:
     if not args.strict_motors:
         patch_motors_bus_lenient()
 
-    if args.max_relative_target is not None:
-        cfg.setdefault("robot", {})["max_relative_target"] = args.max_relative_target
+    if args.max_relative_target is not None or args.gripper_max_relative_target is not None:
+        cfg.setdefault("robot", {})["max_relative_target"] = effective_max_rel
 
     device = torch.device(args.device)
     policy = _load_pi05_policy_with_compat(policy_path, device)
@@ -1236,8 +1311,10 @@ def main() -> None:
     )
 
     dt = 1.0 / float(args.fps)
-    vr_kp = _vr_kp(cfg)
-    print(f"  VR-style cmd shape : kp={vr_kp} per-tick caps (matches dataset action labels)")
+    print(
+        f"  VR-style cmd shape : kp={action_shape_kp} per-tick caps "
+        "(matches dataset action labels at 1.0)"
+    )
     last_sent: dict[str, float] = {}
     last_filtered: dict[str, float] = {}
     last_policy_smoothed: dict[str, float] = {}
@@ -1283,6 +1360,7 @@ def main() -> None:
                 policy,
                 preprocessor,
                 postprocessor,
+                action_horizon=int(args.action_horizon),
                 open_loop_steps=int(args.open_loop_steps),
                 last_sent=last_sent,
                 last_filtered=last_filtered,
@@ -1335,6 +1413,7 @@ def main() -> None:
                             policy,
                             preprocessor,
                             postprocessor,
+                            action_horizon=int(args.action_horizon),
                             open_loop_steps=int(args.open_loop_steps),
                             last_sent=last_sent,
                             last_filtered=last_filtered,
@@ -1392,7 +1471,7 @@ def main() -> None:
                         action_dict,
                         present_dict,
                         last_sent,
-                        kp=vr_kp,
+                        kp=action_shape_kp,
                         caps=vr_joint_caps,
                     )
                     final_cmd = shaped
@@ -1400,7 +1479,7 @@ def main() -> None:
                         max_rel_cfg = getattr(robot.config, "max_relative_target", None)
                         if max_rel_cfg is not None:
                             final_cmd = _clamp_max_relative(
-                                shaped, present_dict, float(max_rel_cfg)
+                                shaped, present_dict, max_rel_cfg
                             )
                     final_cmd = _apply_joint_deadband(
                         final_cmd, last_filtered, vr_joint_deadbands
@@ -1431,7 +1510,7 @@ def main() -> None:
                         max_rel_cfg = getattr(robot.config, "max_relative_target", None)
                         if args.clamp_to_present and max_rel_cfg is not None:
                             debug_final_cmd = _clamp_max_relative(
-                                final_cmd, present_dict, float(max_rel_cfg)
+                                final_cmd, present_dict, max_rel_cfg
                             )
                         raw_cmd = np.array([action_dict[f"{n}.pos"] for n in JOINT_ORDER])
                         shaped_cmd = np.array([shaped[f"{n}.pos"] for n in JOINT_ORDER])
@@ -1493,6 +1572,7 @@ def main() -> None:
                     policy,
                     preprocessor,
                     postprocessor,
+                    action_horizon=int(args.action_horizon),
                     open_loop_steps=int(args.open_loop_steps),
                     last_sent=last_sent,
                     last_filtered=last_filtered,

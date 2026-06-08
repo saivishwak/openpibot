@@ -116,6 +116,79 @@ def test_inference_clamp_to_present_default_enabled():
     assert args.clamp_to_present is True
 
 
+def test_inference_action_shape_kp_defaults_to_dataset_label_mode():
+    old_argv = sys.argv
+    sys.argv = [str(SCRIPT), "--dry-run"]
+    try:
+        args = infer._parse_args()
+    finally:
+        sys.argv = old_argv
+
+    assert args.action_shape_kp == pytest.approx(1.0)
+
+
+def test_inference_gripper_max_relative_override_keeps_arm_default():
+    args = SimpleNamespace(max_relative_target=None, gripper_max_relative_target=15.0)
+    max_rel = infer._effective_max_relative_target(
+        args,
+        {"robot": {"max_relative_target": 8.0}},
+    )
+
+    assert max_rel == {"default": 8.0, "gripper": 15.0}
+
+    out = infer._clamp_max_relative(
+        {
+            "right_arm_shoulder_pan.pos": 20.0,
+            "right_arm_gripper.pos": 100.0,
+        },
+        {
+            "right_arm_shoulder_pan.pos": 0.0,
+            "right_arm_gripper.pos": 0.0,
+        },
+        max_rel,
+    )
+
+    assert out["right_arm_shoulder_pan.pos"] == pytest.approx(8.0)
+    assert out["right_arm_gripper.pos"] == pytest.approx(15.0)
+
+
+def test_reset_policy_episode_state_uses_action_horizon_cap():
+    class Resettable:
+        def __init__(self):
+            self.reset_calls = 0
+
+        def reset(self):
+            self.reset_calls += 1
+
+    policy = Resettable()
+    policy.config = SimpleNamespace(n_action_steps=50, chunk_size=50)
+    preprocessor = Resettable()
+    postprocessor = Resettable()
+    last_sent = {"right_arm_gripper.pos": 10.0}
+    last_filtered = {"right_arm_gripper.pos": 10.0}
+    last_policy_smoothed = {"right_arm_gripper.pos": 10.0}
+
+    infer._reset_policy_episode_state(
+        policy,
+        preprocessor,
+        postprocessor,
+        action_horizon=20,
+        open_loop_steps=35,
+        last_sent=last_sent,
+        last_filtered=last_filtered,
+        last_policy_smoothed=last_policy_smoothed,
+        reason="test",
+    )
+
+    assert policy.config.n_action_steps == 20
+    assert policy.reset_calls == 1
+    assert preprocessor.reset_calls == 1
+    assert postprocessor.reset_calls == 1
+    assert last_sent == {}
+    assert last_filtered == {}
+    assert last_policy_smoothed == {}
+
+
 def test_send_positions_applies_present_relative_clamp_and_returns_sent_command():
     sent_calls = []
 

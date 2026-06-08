@@ -92,15 +92,18 @@ Homing reads **joint positions only** (no cameras). Expect warnings about pruned
 
 ## Run inference (balanced, recommended)
 
-Validated on-robot for bimanual medicine→bowl. Defaults balance **reaching the target** vs **smooth motion**: VR rate limits (matching the dataset), policy EMA before shaping, moderate command EMA / deadband, 35-step open-loop chunks, and **no** present-based `max_relative_target` clamp (`Clamp to present: False` in the startup banner).
+Validated on-robot for marker→cup with the 80-episode / 25k-step checkpoint. This keeps the arm joints on the configured present-position safety clamp while allowing the gripper to close at the same 15°/tick cap used in the VR recording labels.
 
 ```bash
 uv run python scripts/infer_pi05_finetuned.py \
-  --policy-path outputs/pi05_finetune/checkpoints/last/pretrained_model \
-  --task "Pick up the medicine and place it in the bowl" \
-  --episodes 1 \
-  --episode-time 60 \
-  --fps 30
+  --policy-path outputs/pi05_finetune_80ep/checkpoints/last/pretrained_model \
+  --task "Pick up the marker from the table and place it inside the cup" \
+  --camera-backend dashboard \
+  --episodes 2 \
+  --episode-time 180 \
+  --fps 30 \
+  --settle-steps 30 \
+  --gripper-max-relative-target 15
 ```
 
 ## Run inference with extra smoothing disabled
@@ -113,11 +116,14 @@ the dataset label contract.
 
 ```bash
 uv run python scripts/infer_pi05_finetuned.py \
-  --policy-path outputs/pi05_finetune/checkpoints/last/pretrained_model \
-  --task "Pick up the medicine and place it in the bowl" \
-  --episodes 1 \
-  --episode-time 60 \
+  --policy-path outputs/pi05_finetune_80ep/checkpoints/last/pretrained_model \
+  --task "Pick up the marker from the table and place it inside the cup" \
+  --camera-backend dashboard \
+  --episodes 2 \
+  --episode-time 180 \
   --fps 30 \
+  --settle-steps 30 \
+  --gripper-max-relative-target 15 \
   --policy-ema-alpha=1 \
   --command-ema-alpha=1 \
   --replan-blend=1
@@ -134,21 +140,25 @@ raise `--command-ema-alpha` or use this preset as a diagnostic.
 | Stuck at home, only small bobbing | Raise `--command-ema-alpha` (e.g. `0.26`) and/or lower `--joint-deadband-deg` (e.g. `0.65`) |
 | Reaches target but **jittery** | Lower `--command-ema-alpha` (e.g. `0.18`), raise `--joint-deadband-deg` (e.g. `0.85`), raise `--policy-ema-alpha` (e.g. `0.38`), or `--open-loop-steps 50` |
 | Snappy reach, still noisy at replans | `--replan-blend 0.15` and/or longer `--open-loop-steps` |
-| Misses grasp / stuck mid-chunk | `--replan-on-miss-deg 18` (execution lag vs last command; off by default) |
+| Misses grasp / closes late | Keep `--action-shape-kp 1.0`; raise `--gripper-max-relative-target` from `15` toward `20–25` |
+| Stuck mid-chunk | `--replan-on-miss-deg 18` (execution lag vs last command; off by default) |
 
 Known snappy preset (reaches well, may jitter): `--command-ema-alpha 0.28 --joint-deadband-deg 0.6`.
 
-Optional: reach medicine before the full place-in-bowl task (first ~20s):
+Optional: reach the marker before the full place-in-cup task (first ~20s):
 
 ```bash
 uv run python scripts/infer_pi05_finetuned.py \
-  --policy-path outputs/pi05_finetune/checkpoints/last/pretrained_model \
-  --phase1-task "Pick up the medicine bottle from the table. Do not go to the bowl yet." \
+  --policy-path outputs/pi05_finetune_80ep/checkpoints/last/pretrained_model \
+  --camera-backend dashboard \
+  --phase1-task "Reach the marker on the table. Do not go to the cup yet." \
   --phase1-sec 20 \
-  --task "Pick up the medicine and place it in the bowl" \
-  --episodes 1 \
-  --episode-time 60 \
-  --fps 30
+  --task "Pick up the marker from the table and place it inside the cup" \
+  --episodes 2 \
+  --episode-time 180 \
+  --fps 30 \
+  --settle-steps 30 \
+  --gripper-max-relative-target 15
 ```
 
 ### Control loop
@@ -163,8 +173,8 @@ uv run python scripts/infer_pi05_finetuned.py \
 ```bash
 uv run python scripts/infer_pi05_finetuned.py \
   --dry-run \
-  --policy-path outputs/pi05_finetune/checkpoints/005000/pretrained_model \
-  --task "..."
+  --policy-path outputs/pi05_finetune_80ep/checkpoints/last/pretrained_model \
+  --task "Pick up the marker from the table and place it inside the cup"
 ```
 
 ## CLI reference (`infer_pi05_finetuned.py`)
@@ -190,8 +200,8 @@ Inference runs **one observation → one action** per control tick (batch size 1
 | `--policy-ema-alpha` | `0.36` | EMA on raw policy targets before VR shaping; `1.0` disables |
 | `--command-ema-alpha` | `0.2` | EMA on final motor command; lower = smoother, `1.0` disables |
 | `--joint-deadband-deg` | yaml `vr.joint_command_deadband_deg` | Override final command deadband for every joint; otherwise uses per-joint config |
-| `--clamp-to-present` | off | Clamp vs measured pose; usually causes jitter |
-| `--phase1-task` | — | Shorter prompt for the first segment (e.g. reach medicine only) |
+| `--clamp-to-present` | on | Clamp vs measured pose using `robot.max_relative_target`; use `--no-clamp-to-present` only for controlled debugging |
+| `--phase1-task` | — | Shorter prompt for the first segment (e.g. reach marker only) |
 | `--phase1-sec` | `0` | Seconds to use `--phase1-task` before `--task` |
 | `--camera-backend` | `dashboard` | `dashboard` (shared V4L streams) or `lerobot` (robot OpenCVCamera) |
 | `--show-cameras` / `--no-show-cameras` | on if `DISPLAY` set | Resizable pygame camera mosaic (background thread) |
@@ -201,6 +211,8 @@ Inference runs **one observation → one action** per control tick (batch size 1
 | `--skip-home-after-episode` | off | Skip post-episode homing |
 | `--home-timeout` | `60` | Seconds before homing gives up and continues |
 | `--max-relative-target` | yaml `robot.max_relative_target` | Per-command joint cap (degrees); optional override |
+| `--gripper-max-relative-target` | — | Override present clamp for gripper joints only; useful for late/weak grasps |
+| `--action-shape-kp` | `1.0` | P blend while converting policy targets into VR-style commands; `1.0` matches recorded action labels |
 | `--strict-motors` | off | Fail if base/head motors are missing |
 | `--dry-run` | off | Print settings and exit |
 | `--dry-run-home` | off | Connect, home, disconnect; no policy |
@@ -218,11 +230,11 @@ Training data from the dashboard uses:
 `action` is built in `vr_teleop.py` the same way as teleop:
 
 1. Per-joint cap vs **previous command**: `cmd = last_sent + clip(target - last_sent, ±cap)` (caps 5–15°/tick).
-2. With `vr.kp: 1.0` (default), that command is stored as the dataset label.
+2. Normal live teleop stores that rate-limited command as the dataset label.
 
 So each training frame’s `|action − state|` is usually **small** (≤ per-tick cap) while moving, not a 40°+ jump.
 
-`infer_pi05_finetuned.py` applies the same VR rate limits to policy outputs before `send_action`: optional policy EMA, optional replan blend, per-joint cap/KP shaping vs previous command, optional present clamp, deadband, then final command EMA. `wrist_flex`, `wrist_roll`, and `gripper` bypass the final command EMA so wrist/gripper response matches the recording path more closely. **Present-based** `max_relative_target` clamp is **off by default** (`--no-clamp-to-present`) because training labels are capped vs the previous command, not measured pose — enabling present clamp often causes oscillation. Use **`--fps 30`** to match `dataset.fps`.
+`infer_pi05_finetuned.py` applies the same VR rate limits to policy outputs before `send_action`: optional policy EMA, optional replan blend, per-joint cap/KP shaping vs previous command, optional present clamp, deadband, then final command EMA. `wrist_flex`, `wrist_roll`, and `gripper` bypass the final command EMA so wrist/gripper response matches the recording path more closely. **Present-based** `max_relative_target` clamp is **on by default** for safety; use `--gripper-max-relative-target 15` when the arm reaches correctly but the gripper closes late or weakly. Use **`--fps 30`** to match `dataset.fps`.
 
 ## Configuration (`config/xlerobot.yaml`)
 
@@ -253,9 +265,9 @@ Observation keys sent to the policy match finetuning rename map:
 | `missing camera observations` | Camera path wrong or unplugged | Fix `cameras.*.path` in yaml; check `/dev/v4l/...` |
 | CUDA OOM during **training** | Full PI0.5 finetune | Keep default `--oom-safe`; reduce batch or steps |
 | Policy moves wrong / no task following | Wrong checkpoint or no finetune | Use a finetuned `pretrained_model`, not only `pi05_base` |
-| Arms **oscillate** / jitter in place | FPS != dataset, replan too often, **clamp-to-present**, or command EMA too high | Use `--fps 30`, defaults; if still jittery after reaching, lower `--command-ema-alpha` and raise `--policy-ema-alpha`; keep `--no-clamp-to-present` |
+| Arms **oscillate** / jitter in place | FPS != dataset, replan too often, present clamp too tight, or command EMA too high | Use `--fps 30`, defaults; if still jittery after reaching, lower `--command-ema-alpha` and raise `--policy-ema-alpha`; use `--no-clamp-to-present` only for controlled debugging |
 | **Never leaves home** for a long time | Command EMA too low or deadband too high | Raise `--command-ema-alpha` (e.g. `0.26–0.28`) and/or lower `--joint-deadband-deg` (e.g. `0.6–0.65`) |
-| Robot goes to **bowl before medicine** | Single task string for whole episode; head cam may bias toward bowl; demos pause at home first | Use `--settle-steps 60`, `--phase1-task` / `--phase1-sec`; align scene with training; finetune longer |
+| Robot goes to **cup before marker** | Single task string for whole episode; head cam may bias toward cup; demos pause at home first | Use `--settle-steps 30–60`, `--phase1-task` / `--phase1-sec`; align scene with training; finetune longer |
 | `create_causal_mask() got an unexpected keyword argument 'cache_position'` | transformers 5.6+ in venv | `uv sync` (root pins `transformers<5.6`) |
 
 ## File map
