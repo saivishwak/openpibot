@@ -106,6 +106,100 @@ uv run python scripts/infer_pi05_finetuned.py \
   --gripper-max-relative-target 15
 ```
 
+## Agentic System 2 REPL
+
+For image-grounded task reasoning, use the System 2 agent REPL. It follows the
+same practical hierarchy used by current dual-system VLA work: a slower VLM
+planner reasons over language and a fresh camera image, then the fast PI0.5 VLA
+controller executes bounded language subgoals through the existing inference
+script.
+
+Research mapping:
+
+- Figure Helix-style split: System 2 handles scene/language understanding and
+  high-level task planning; System 1 performs fast continuous control.
+- NVIDIA GR00T N1-style split: a VLM System 2 interprets the environment and
+  instruction, then a real-time action model System 1 produces motor actions.
+- PI0.5 already supplies the System 1 VLA role in this repo; the agent only
+  adds the System 2 planner and does not duplicate robot-control logic.
+- Recent hierarchical VLA work uses the same planner/controller interface:
+  VLM decomposes tasks into language subgoals, VLA executes them.
+
+The agent requires a fresh image for every query. If the selected camera cannot
+produce a snapshot, planning is blocked and no robot motion is executed.
+The REPL still behaves like a normal assistant: greetings, clarifying questions,
+and non-physical turns get normal chat responses instead of empty execution
+plans.
+
+For physical manipulation requests, the Bun-hosted Pi agent exposes a local
+REST service with native tools for the PI0.5 System 1 contract, execution
+preview, and staging the candidate execution plan. The Python CLI sends each
+camera-grounded turn to that REST agent and uses the staged tool result as the
+executable plan. It does not ask the model to emit a special JSON command
+object. These tools do not move the robot; the CLI performs physical execution
+only after it prints the staged plan and the operator types `yes`.
+
+Install the Pi agent dependencies once:
+
+```bash
+bun install
+```
+
+The Python CLI starts both local REST services automatically:
+
+- Pi System 2 reasoning agent on `http://127.0.0.1:8765`
+- Warm PI0.5 System 1 runner on `http://127.0.0.1:8767`
+
+The PI0.5 runner embeds `openpibot.pi05_inference_runtime`, loads the checkpoint
+once at agent startup, keeps the robot and policy process alive, and accepts
+confirmed task prompts over REST. This avoids reloading the checkpoint after
+every `yes`. `scripts/infer_pi05_finetuned.py` is now only a compatibility CLI
+wrapper around the same module.
+
+To run the System 2 agent service manually:
+
+```bash
+bun run openpibot:agent --host 127.0.0.1 --port 8765
+```
+
+To run the warm PI0.5 runner manually:
+
+```bash
+uv run python scripts/pi05_inference_runner.py \
+  --host 127.0.0.1 \
+  --port 8767 \
+  --policy-path outputs/pi05_finetune_80ep/checkpoints/last/pretrained_model \
+  --camera-backend dashboard \
+  --episodes 2 \
+  --episode-time 120 \
+  --fps 30 \
+  --settle-steps 30 \
+  --gripper-max-relative-target 15 \
+  --no-show-cameras
+```
+
+```bash
+OPENAI_API_KEY=... uv run openpibot agent \
+  --policy-path outputs/pi05_finetune_80ep/checkpoints/last/pretrained_model \
+  --model gpt-5.4 \
+  --vision-camera head \
+  --camera-backend dashboard \
+  --episodes 2 \
+  --episode-time 120 \
+  --fps 30 \
+  --settle-steps 30 \
+  --gripper-max-relative-target 15
+```
+
+Inside the REPL, enter a physical task such as:
+
+```text
+Pick up the pencil from the table and place it inside the cup
+```
+
+The REPL prints the VLM plan first. Type `yes` only after checking the planned
+PI0.5 subgoals; any other response skips execution.
+
 ## Run inference with extra smoothing disabled
 
 Use this when you want to evaluate the policy with the closest behavior to the

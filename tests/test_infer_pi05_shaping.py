@@ -229,6 +229,16 @@ def test_send_positions_tracks_robot_returned_command():
     assert out == {"right_arm_wrist_flex.pos": 17.5}
 
 
+def test_operator_interruption_skips_post_episode_home():
+    args = SimpleNamespace(skip_home_after_episode=False)
+
+    assert infer._skip_post_home_after_episode(args, "interrupted by operator") is True
+    assert infer._skip_post_home_after_episode(args, "wall-clock limit (120s)") is False
+
+    args.skip_home_after_episode = True
+    assert infer._skip_post_home_after_episode(args, "episode loop ended") is True
+
+
 def test_inference_dry_run_does_not_require_policy_path():
     proc = subprocess.run(
         [sys.executable, str(SCRIPT), "--dry-run"],
