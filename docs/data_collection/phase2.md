@@ -6,13 +6,13 @@ not start until Phase 1 passes the marker/pen pickup gate.
 Dataset:
 
 ```text
-saivishwak/xlerobot-vr-desk-cleanup-phase2
+saivishwak/xlerobot-desk-cleanup-phase2
 ```
 
 Local root:
 
 ```text
-~/.cache/huggingface/lerobot/saivishwak/xlerobot-vr-desk-cleanup-phase2
+~/.cache/huggingface/lerobot/saivishwak/xlerobot-desk-cleanup-phase2
 ```
 
 ## Acceptance Gate
@@ -309,8 +309,8 @@ evaluation.
 
 ```bash
 uv run python scripts/finetune_pi05.py \
-  --dataset-repo-id saivishwak/xlerobot-vr-desk-cleanup-phase2 \
-  --dataset-root ~/.cache/huggingface/lerobot/saivishwak/xlerobot-vr-desk-cleanup-phase2 \
+  --dataset-repo-id saivishwak/xlerobot-desk-cleanup-phase2 \
+  --dataset-root ~/.cache/huggingface/lerobot/saivishwak/xlerobot-desk-cleanup-phase2 \
   --output-dir outputs/pi05_desk_cleanup_phase2 \
   --steps 40000
 ```

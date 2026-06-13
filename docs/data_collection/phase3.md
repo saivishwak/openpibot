@@ -6,13 +6,13 @@ phase is for a cold, unplugged toaster only.
 Dataset:
 
 ```text
-saivishwak/xlerobot-vr-cold-toaster-phase3
+saivishwak/xlerobot-desk-cleanup-phase3
 ```
 
 Local root:
 
 ```text
-~/.cache/huggingface/lerobot/saivishwak/xlerobot-vr-cold-toaster-phase3
+~/.cache/huggingface/lerobot/saivishwak/xlerobot-desk-cleanup-phase3
 ```
 
 ## Safety Gate
@@ -291,8 +291,8 @@ Train and evaluate only on cold/unplugged tasks first:
 
 ```bash
 uv run python scripts/finetune_pi05.py \
-  --dataset-repo-id saivishwak/xlerobot-vr-cold-toaster-phase3 \
-  --dataset-root ~/.cache/huggingface/lerobot/saivishwak/xlerobot-vr-cold-toaster-phase3 \
+  --dataset-repo-id saivishwak/xlerobot-desk-cleanup-phase3 \
+  --dataset-root ~/.cache/huggingface/lerobot/saivishwak/xlerobot-desk-cleanup-phase3 \
   --output-dir outputs/pi05_cold_toaster_phase3 \
   --steps 40000
 ```

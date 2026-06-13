@@ -58,3 +58,72 @@ Keep the historical baseline dataset frozen:
 ```text
 saivishwak/xlerobot-vr-pick-place-pen
 ```
+
+## Data Collection Records
+
+### Phase 1 (150 episodes)
+
+Dataset:
+
+```text
+saivishwak/xlerobot-desk-cleanup-phase1
+```
+
+Local root:
+
+```text
+~/.cache/huggingface/lerobot/saivishwak/xlerobot-desk-cleanup-phase1
+```
+
+#### Batch 1: 20 Pilot demos 
+
+Status: Complete
+
+Total 20 Demos, 10 with marker in normal position, 5 with slightly rotated, 5 with displacement left/right/front/back 
+
+Task string:
+
+```text
+Pick up the marker from the table and place it inside the white mesh cup
+```
+
+#### Batch 2: 80 Grasp-Focused Pose Demos
+
+Status: Complete 
+
+Task strings (First 50 episodes):
+
+```text
+Pick up the marker from the table (20 episodes)
+Pick up the blue marker from the table (10 episodes)
+Pick up the black marker from the table (10 episodes)
+Pick up the pencil from the table (10 episodes)
+```
+
+Task string (second 30 episodes):
+
+```text
+Pick up the marker from the table and place it inside the white mesh cup
+```
+
+#### Batch 3: 30 Recovery/Regrasp Demos
+
+Status: Complete 
+
+Task strings (30 episodes):
+
+```text
+Pick up the marker from the table (15 episodes)
+Pick up the marker from the table and place it inside the white mesh cup (15 episodes)
+```
+
+#### Batch 4: 20 Object And Clutter Demos
+
+Status: Complete 
+
+Task strings (20 episodes):
+
+```text
+Pick up the blue marker from the table and place it inside the white mesh cup (10 episodes)
+Pick up the black marker from the table and place it inside the white mesh cup (10 episodes)
+```

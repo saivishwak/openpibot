@@ -12,9 +12,9 @@ saivishwak/xlerobot-vr-pick-place-pen
 Record new data into versioned datasets:
 
 ```text
-saivishwak/xlerobot-vr-pick-place-pen-phase1
-saivishwak/xlerobot-vr-desk-cleanup-phase2
-saivishwak/xlerobot-vr-cold-toaster-phase3
+saivishwak/xlerobot-desk-cleanup-phase1
+saivishwak/xlerobot-desk-cleanup-phase2
+saivishwak/xlerobot-desk-cleanup-phase3
 ```
 
 ## Collection Order
@@ -92,8 +92,8 @@ Recording page or edit it directly:
 
 ```yaml
 dataset:
-  repo_id: saivishwak/xlerobot-vr-pick-place-pen-phase1
-  root: ~/.cache/huggingface/lerobot/saivishwak/xlerobot-vr-pick-place-pen-phase1
+  repo_id: saivishwak/xlerobot-desk-cleanup-phase1
+  root: ~/.cache/huggingface/lerobot/saivishwak/xlerobot-desk-cleanup-phase1
   fps: 30
   push_to_hub: false
   home_before_episode: true
@@ -103,8 +103,8 @@ After each batch:
 
 ```bash
 uv run python scripts/finetune_pi05.py \
-  --dataset-repo-id saivishwak/xlerobot-vr-pick-place-pen-phase1 \
-  --dataset-root ~/.cache/huggingface/lerobot/saivishwak/xlerobot-vr-pick-place-pen-phase1 \
+  --dataset-repo-id saivishwak/xlerobot-desk-cleanup-phase1 \
+  --dataset-root ~/.cache/huggingface/lerobot/saivishwak/xlerobot-desk-cleanup-phase1 \
   --check-only
 ```
 
@@ -112,6 +112,6 @@ Upload only after the dataset passes inspection:
 
 ```bash
 uv run python scripts/push_dataset.py \
-  --repo-id saivishwak/xlerobot-vr-pick-place-pen-phase1 \
-  --root ~/.cache/huggingface/lerobot/saivishwak/xlerobot-vr-pick-place-pen-phase1
+  --repo-id saivishwak/xlerobot-desk-cleanup-phase1 \
+  --root ~/.cache/huggingface/lerobot/saivishwak/xlerobot-desk-cleanup-phase1
 ```

@@ -26,13 +26,13 @@ fails on grasp acquisition.
 Dataset:
 
 ```text
-saivishwak/xlerobot-vr-pick-place-pen-phase1
+saivishwak/xlerobot-desk-cleanup-phase1
 ```
 
 Local root:
 
 ```text
-~/.cache/huggingface/lerobot/saivishwak/xlerobot-vr-pick-place-pen-phase1
+~/.cache/huggingface/lerobot/saivishwak/xlerobot-desk-cleanup-phase1
 ```
 
 ## Acceptance Gate
@@ -124,8 +124,8 @@ After the batch:
 
 ```bash
 uv run python scripts/finetune_pi05.py \
-  --dataset-repo-id saivishwak/xlerobot-vr-pick-place-pen-phase1 \
-  --dataset-root ~/.cache/huggingface/lerobot/saivishwak/xlerobot-vr-pick-place-pen-phase1 \
+  --dataset-repo-id saivishwak/xlerobot-desk-cleanup-phase1 \
+  --dataset-root ~/.cache/huggingface/lerobot/saivishwak/xlerobot-desk-cleanup-phase1 \
   --check-only
 ```
 
@@ -337,8 +337,8 @@ the full 220-demo budget or Phase 2; the current bottleneck is grasp acquisition
 
 ```bash
 uv run python scripts/finetune_pi05.py \
-  --dataset-repo-id saivishwak/xlerobot-vr-pick-place-pen-phase1 \
-  --dataset-root ~/.cache/huggingface/lerobot/saivishwak/xlerobot-vr-pick-place-pen-phase1 \
+  --dataset-repo-id saivishwak/xlerobot-desk-cleanup-phase1 \
+  --dataset-root ~/.cache/huggingface/lerobot/saivishwak/xlerobot-desk-cleanup-phase1 \
   --output-dir outputs/pi05_marker_phase1 \
   --steps 30000
 ```
@@ -348,8 +348,8 @@ dataset is diverse enough:
 
 ```bash
 uv run python scripts/finetune_pi05.py \
-  --dataset-repo-id saivishwak/xlerobot-vr-pick-place-pen-phase1 \
-  --dataset-root ~/.cache/huggingface/lerobot/saivishwak/xlerobot-vr-pick-place-pen-phase1 \
+  --dataset-repo-id saivishwak/xlerobot-desk-cleanup-phase1 \
+  --dataset-root ~/.cache/huggingface/lerobot/saivishwak/xlerobot-desk-cleanup-phase1 \
   --output-dir outputs/pi05_marker_phase1_full \
   --steps 30000 \
   --no-train-expert-only \

@@ -42,11 +42,11 @@ cameras:
     height: 480
     fourcc: MJPG
 dataset:
-  repo_id: saivishwak/xlerobot-vr-pick-place-pen
+  repo_id: saivishwak/xlerobot-desk-cleanup-phase1
   home_before_episode: true
   fps: 30
   push_to_hub: false
-  root: ~/.cache/huggingface/lerobot/saivishwak/xlerobot-vr-pick-place-pen
+  root: ~/.cache/huggingface/lerobot/saivishwak/xlerobot-desk-cleanup-phase1
 pi05:
   server_host: 127.0.0.1
   server_port: 8000
