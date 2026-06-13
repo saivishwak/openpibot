@@ -1,0 +1,1 @@
+{"trial_id":"phase0_001","checkpoint":"outputs/pi05_finetune_80ep/checkpoints/025000/pretrained_model","task":"Pick up the marker from the table and place it inside the white mesh cup","object_pose_bin":"front_center_horizontal","arm":null,"lighting":"normal","clutter_level":"none","success":null,"failure_mode":null,"operator_intervention":"none","notes":""}
