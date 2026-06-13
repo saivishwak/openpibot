@@ -37,6 +37,20 @@ pen/marker-to-cup robustness. Phase 2 should only include a small bridge set for
 pen/marker cleanup inside a denser desk scene, then focus on new cleanup targets:
 cloth, safe tray objects, and staged multi-step cleanup.
 
+Use the same data-engine loop as Phase 1. Do not record the whole Phase 2 budget
+in one pass. Start with:
+
+```text
+30 pilot cleanup demos
+20 pen/marker bridge demos
+40 cloth demos
+train combined Phase 1 + Phase 2
+evaluate staged cleanup
+```
+
+Only add safe-object/tray and longer staged cleanup data after the item-level
+skills pass held-out evaluation.
+
 Use these Phase 2 task families:
 
 ```text
@@ -91,7 +105,7 @@ Reject if:
 - The robot sweeps multiple objects accidentally.
 - The task string does not match the manipulated object.
 
-## Batch 2: 40 Pen/Marker Cleanup Bridge Demos
+## Batch 2: 20-40 Pen/Marker Cleanup Bridge Demos
 
 Purpose: confirm Phase 1 pen/marker pickup transfers into cleanup scenes with
 multiple visible objects. Keep this small; do not duplicate Phase 1.
@@ -106,7 +120,10 @@ Put the green pen nearest the keyboard into the white mesh cup
 Put the rightmost pencil into the white mesh cup
 ```
 
-Collect roughly:
+First cycle: collect 20 demos. Continue up to 40 only if Phase 1 pickup fails
+specifically because multiple similar objects are visible.
+
+Full budget mix:
 
 - 10 leftmost/rightmost target demos.
 - 10 front/back target demos.
@@ -140,7 +157,7 @@ Put the front black pen into the white mesh cup
 Put the leftmost pencil into the white mesh cup
 ```
 
-## Batch 3: 120 Cloth Demos
+## Batch 3: 40-120 Cloth Demos
 
 Purpose: add a non-rigid desk object without mixing it into long-horizon cleanup
 too early.
@@ -153,7 +170,10 @@ Pick up the cloth from the table and place it in the tray
 Move the folded cloth from the table to the tray
 ```
 
-Collect roughly:
+First cycle: collect 40 demos. Continue up to 120 only if cloth handling is the
+dominant blocker for cleanup.
+
+Full budget mix:
 
 - 40 move-cloth-to-clear-area demos.
 - 40 cloth-to-tray demos.
@@ -180,7 +200,7 @@ Reject if:
 - The cloth drags electronics/cables.
 - The target area is not visible or not clearly defined.
 
-## Batch 4: 100 Safe Object To Tray Demos
+## Batch 4: 30-100 Safe Object To Tray Demos
 
 Purpose: broaden cleanup beyond pens/cloth while staying in the desk domain.
 
@@ -200,7 +220,10 @@ Move the sticky note pad from the table into the tray
 Move the small box from the table into the tray
 ```
 
-Collect roughly:
+Start with 30 demos across 2-3 safe objects. Continue up to 100 only after cloth
+and pen/marker cleanup work reliably.
+
+Full budget mix:
 
 - 25 eraser demos.
 - 25 sticky note pad demos.
@@ -217,7 +240,7 @@ Reject if:
 - Object is heavy, sharp, breakable, powered, or connected by cable.
 - The object has no stable grasp for the current gripper.
 
-## Batch 5: 80 Staged Multi-Step Cleanup Demos
+## Batch 5: 20-80 Staged Multi-Step Cleanup Demos
 
 Purpose: prepare System 2 execution where the agent runs several item-level VLA
 prompts until the desk is clean.
@@ -233,7 +256,10 @@ Example staged layout:
 4. Move the eraser from the table into the tray
 ```
 
-Collect:
+Start with 20 short two-item sequences. Continue up to 80 only after individual
+item-level skills work and System 2 execution exposes sequencing failures.
+
+Full budget mix:
 
 - 20 two-item cleanup sequences, recorded as separate episodes per item.
 - 25 three-item cleanup sequences, recorded as separate episodes per item.
@@ -277,8 +303,9 @@ These should be used cautiously. The main production path should still be System
 
 ## Phase 2 Training Check
 
-Start by training with Phase 1 + Phase 2 data or with a curated combined dataset.
-Keep a held-out physical layout set for real robot evaluation.
+Train after the first Phase 2 cycle with Phase 1 + Phase 2 data or with a
+curated combined dataset. Keep a held-out physical layout set for real robot
+evaluation.
 
 ```bash
 uv run python scripts/finetune_pi05.py \

@@ -34,6 +34,18 @@ a cable, or uses excessive force on the lever.
 ## Phase 3 Task Strategy
 
 Collect atomic skills before full bread-to-toaster sequences.
+Treat every count below as a budget, not a requirement. Start with a small cold
+pilot, train, and only expand the atomic skill that fails.
+
+Recommended first cycle:
+
+```text
+20 cold toaster pilot demos
+20 bread pickup demos
+20 bread-above-slot demos
+train
+evaluate cold/unplugged only
+```
 
 Good task strings:
 
@@ -93,7 +105,7 @@ Reject if:
 - Bread folds around the gripper and blocks visibility.
 - Robot contacts the toaster with high force.
 
-## Batch 2: 80 Bread Pickup And Handling Demos
+## Batch 2: 20-80 Bread Pickup And Handling Demos
 
 Purpose: learn robust bread grasping before aiming at the toaster.
 
@@ -103,7 +115,10 @@ Task string:
 Pick up the bread slice from the table
 ```
 
-Collect roughly:
+First cycle: collect 20 demos. Continue up to 80 only if bread grasping is the
+dominant failure.
+
+Full budget mix:
 
 - 20 bread horizontal/front demos.
 - 20 bread rotated demos.
@@ -129,7 +144,7 @@ Reject if:
 - Gripper closes on empty space.
 - Robot drags bread across unsafe items.
 
-## Batch 3: 80 Bread Alignment Over Slot Demos
+## Batch 3: 20-80 Bread Alignment Over Slot Demos
 
 Purpose: learn positioning above the toaster before insertion.
 
@@ -139,7 +154,10 @@ Task string:
 Move the bread slice above the toaster slot
 ```
 
-Collect roughly:
+First cycle: collect 20 demos. Continue up to 80 only if alignment over the slot
+is the dominant failure.
+
+Full budget mix:
 
 - 40 demos from bread already grasped or immediately after pickup.
 - 40 demos starting with bread on the table, then pick and align.
@@ -163,7 +181,7 @@ Reject if:
 - Bread is not aligned enough to imply insertion would be possible.
 - The toaster moves.
 
-## Batch 4: 80 Cold Insertion Demos
+## Batch 4: 20-80 Cold Insertion Demos
 
 Purpose: learn the contact-rich final insertion skill.
 
@@ -173,7 +191,10 @@ Task string:
 Insert the bread slice into the cold toaster slot
 ```
 
-Collect roughly:
+Start with 20 insertions from an already aligned position. Continue up to 80 only
+if cold insertion remains the bottleneck.
+
+Full budget mix:
 
 - 40 insertions from an already aligned position.
 - 40 pickup-and-insert demos.
@@ -197,7 +218,7 @@ Reject if:
 - Toaster tips, slides, or rotates significantly.
 - Gripper collides with the slot edges in a way that could damage hardware.
 
-## Batch 5: 40 Cold Lever Demos
+## Batch 5: 0-40 Cold Lever Demos
 
 Purpose: learn the lever skill separately, only if the cold toaster mechanics
 are safe and reachable.
@@ -208,7 +229,10 @@ Task string:
 Press the cold toaster lever down
 ```
 
-Collect:
+Skip this batch unless lever pressing is safe and mechanically easy. If included,
+start with 10 demos and continue up to 40 only if needed.
+
+Full budget mix:
 
 - 20 approach-and-press demos.
 - 20 varied toaster pose demos.
@@ -228,7 +252,7 @@ Reject if:
 If lever pressing is unreliable, remove it from Phase 3 and keep the toaster
 task limited to bread insertion.
 
-## Batch 6: 40 Full Cold Bread-To-Toaster Demos
+## Batch 6: 10-40 Full Cold Bread-To-Toaster Demos
 
 Purpose: combine pickup, alignment, insertion, and release after the atomic
 skills pass.
@@ -239,7 +263,10 @@ Task string:
 Pick up the bread slice from the table and place it into the cold toaster slot
 ```
 
-Collect:
+Start with 10 full cold sequences only after pickup, alignment, and insertion
+work separately. Continue up to 40 if the composed sequence fails.
+
+Full budget mix:
 
 - 20 normal layout demos.
 - 10 shifted toaster demos.

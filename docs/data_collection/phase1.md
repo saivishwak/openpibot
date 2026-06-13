@@ -5,9 +5,23 @@ and transport after a successful grasp are mostly okay; the weak point is
 spending too long around the marker and failing when the marker is not in a
 convenient grasp pose.
 
-Phase 1 should produce about 220 new demonstrations. Start with a pilot batch and
-only continue if the dataset checks and visual inspection look correct. Bias the
-data toward pre-grasp alignment, decisive close, lift, and recovery/regrasp.
+Phase 1 has an upper budget of about 220 demonstrations, but do not collect all
+of them upfront. Start with one small targeted cycle, train, evaluate, then add
+only the failure mode that still dominates. Bias the data toward pre-grasp
+alignment, decisive close, lift, and recovery/regrasp.
+
+Recommended first cycle:
+
+```text
+20 pilot demos
+40 grasp-focused pose demos
+20 recovery/regrasp demos
+train
+evaluate 10-20 held-out marker poses
+```
+
+Only continue toward the full Phase 1 budget if the trained checkpoint still
+fails on grasp acquisition.
 
 Dataset:
 
@@ -117,13 +131,13 @@ uv run python scripts/finetune_pi05.py \
 
 Also visualize the first, middle, and last pilot episodes.
 
-## Batch 2: 100 Grasp-Focused Pose Demos
+## Batch 2: 40-100 Grasp-Focused Pose Demos
 
 Purpose: teach the hard part directly: approach, open gripper, align around the
 marker body, close decisively, and lift. These episodes should make the grasp
 phase visible and high quality.
 
-Use pickup-only task strings for 40-60 demos:
+Use pickup-only task strings for about half of this batch:
 
 ```text
 Pick up the marker from the table
@@ -138,7 +152,10 @@ Use the original full-task string for the remaining demos:
 Pick up the marker from the table and place it inside the white mesh cup
 ```
 
-Collect roughly 100 demos:
+First cycle: collect 40 demos. Continue up to 100 only if held-out evaluation
+still shows pose-sensitive grasp failures.
+
+Full budget mix:
 
 - 25 horizontal marker/pen demos.
 - 25 vertical marker/pen demos.
@@ -183,7 +200,7 @@ Reject if:
 - The marker is only dragged.
 - The pickup-only episode ends before a stable lift is visible.
 
-## Batch 3: 60 Recovery/Regrasp Demos
+## Batch 3: 20-60 Recovery/Regrasp Demos
 
 Purpose: teach the policy what to do when the first grasp attempt is imperfect.
 These episodes should still end in success, but they should include one visible
@@ -198,7 +215,10 @@ Pick up the black pen from the table
 Pick up the marker from the table and place it inside the white mesh cup
 ```
 
-Collect roughly:
+First cycle: collect 20 demos focused on the most common correction. Continue
+up to 60 only if the policy still fails after a bad first grasp.
+
+Full budget mix:
 
 - 15 close-beside-marker demos: reopen, realign, close correctly.
 - 15 marker-rolls-slightly demos: follow the new pose, then grasp.
@@ -227,7 +247,7 @@ Reject if:
 - Recovery becomes a long uncontrolled chase.
 - The robot contacts the white mesh cup or distractors hard enough to move or tip them.
 
-## Batch 4: 40 Full Pick-And-Place Demos
+## Batch 4: 20-40 Full Pick-And-Place Demos
 
 Purpose: keep the complete skill connected after the grasp-focused batches:
 grasp, lift, transport, release into white mesh cup.
@@ -246,7 +266,11 @@ Pick up the black pen from the table and place it inside the white mesh cup
 Pick up the pencil from the table and place it inside the white mesh cup
 ```
 
-Collect roughly:
+First cycle: collect 20 full pick-and-place demos after the grasp-focused data
+passes inspection. Continue up to 40 only if the model starts grasping well but
+regresses on transport or release.
+
+Full budget mix:
 
 - 20 normal full pick-and-place demos.
 - 10 awkward-pose full pick-and-place demos.
@@ -265,7 +289,7 @@ Reject if:
 - Placement succeeds only because the marker was already in a convenient pose.
 - The gripper never clearly closes on the marker.
 
-## Optional Batch 5: 40 Object And Clutter Demos
+## Optional Batch 5: 20-40 Object And Clutter Demos
 
 Purpose: add more object identity and desk robustness only after grasp acquisition
 improves. Skip this batch initially if Batch 2/3 are not yet enough.
@@ -282,7 +306,11 @@ Add safe distractors:
 - Water bottle visible but outside path.
 - Electronics visible but outside path.
 
-Collect roughly:
+Collect this only after the core grasp problem improves. Start with 20 demos;
+continue up to 40 only if object identity or light clutter becomes the next
+dominant failure.
+
+Full budget mix:
 
 - 10 blue marker / black pen / green pen / pencil object-variation demos.
 - 10 thick marker / thin marker demos.
@@ -304,8 +332,8 @@ Reject if:
 
 ## Phase 1 Training Check
 
-Train after Batch 2 + Batch 3 if the dataset passes inspection. Do not wait for
-Phase 2; the current bottleneck is grasp acquisition.
+Train after the first cycle if the dataset passes inspection. Do not wait for
+the full 220-demo budget or Phase 2; the current bottleneck is grasp acquisition.
 
 ```bash
 uv run python scripts/finetune_pi05.py \

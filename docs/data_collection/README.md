@@ -26,6 +26,33 @@ saivishwak/xlerobot-vr-cold-toaster-phase3
 Do not start Phase 2 until Phase 1 passes the marker pickup gate. Do not start
 powered toaster work until Phase 3 cold/unplugged tests pass.
 
+## Industry-Aligned Collection Strategy
+
+Do not collect a large fixed quota blindly. Modern VLA work is moving toward a
+data engine:
+
+```text
+small targeted batch -> train -> real robot eval -> collect failure corrections -> train again
+```
+
+The batch counts in the phase files are collection budgets, not mandatory
+one-shot targets. Stop early when the acceptance gate is met, and only add data
+for the failure mode that still dominates.
+
+For this robot, the first practical cycle should be small:
+
+```text
+20 pilot demos
+40 grasp-focused demos
+20 recovery/regrasp demos
+train
+evaluate 10-20 held-out trials
+```
+
+Then add 20-40 more demos only for the dominant failure mode. This matches the
+direction of foundation VLA post-training: use broad pretrained capability,
+then spend robot time on targeted in-domain corrections.
+
 ## Global Rules
 
 - Record at 30 FPS with the three camera roles: `head`, `left_wrist`, `right_wrist`.
