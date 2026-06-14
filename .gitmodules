@@ -2,3 +2,6 @@
 	path = vendor/lerobot
 	url = https://github.com/huggingface/lerobot.git
 	branch = main
+[submodule "vendor/allenai-lerobot"]
+	path = vendor/allenai-lerobot
+	url = https://github.com/allenai/lerobot.git
