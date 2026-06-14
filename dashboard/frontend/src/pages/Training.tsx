@@ -2,7 +2,14 @@ import { Database, Play } from "lucide-react";
 import { useState } from "react";
 import useSWR from "swr";
 import { Job, api, fetcher } from "../api";
-import { Badge, Button, Card, Field, Page, TextInput } from "../components/ui";
+import { Badge, Button, Card, Field, Page, SelectField, TextInput } from "../components/ui";
+
+type TrainingModel = "pi05" | "molmoact2";
+
+const modelOptions = [
+  { value: "pi05", label: "PI0.5" },
+  { value: "molmoact2", label: "MolmoAct2" },
+];
 
 function Jobs({ jobs }: { jobs: Job[] }) {
   return (
@@ -28,10 +35,17 @@ function Jobs({ jobs }: { jobs: Job[] }) {
 
 export function Training() {
   const { data: jobs, mutate } = useSWR<{ jobs: Job[] }>("/api/jobs", fetcher, { refreshInterval: 1500 });
+  const [model, setModel] = useState<TrainingModel>("pi05");
   const [datasetRepo, setDatasetRepo] = useState("");
   const [outputDir, setOutputDir] = useState("outputs/pi05_finetune");
   const [steps, setSteps] = useState("20000");
   const [busy, setBusy] = useState(false);
+
+  const changeModel = (next: string) => {
+    const selected = next as TrainingModel;
+    setModel(selected);
+    setOutputDir(selected === "molmoact2" ? "outputs/molmoact2_finetune" : "outputs/pi05_finetune");
+  };
 
   const start = async () => {
     const args = [
@@ -41,7 +55,11 @@ export function Training() {
     ].filter(Boolean);
     setBusy(true);
     try {
-      await api.startTraining(args);
+      if (model === "molmoact2") {
+        await api.startMolmoAct2Training(args);
+      } else {
+        await api.startTraining(args);
+      }
       await mutate();
     } catch (err) {
       alert(String(err));
@@ -51,9 +69,12 @@ export function Training() {
   };
 
   return (
-    <Page title="AI Training" description="Start PI0.5 fine-tuning jobs against the configured LeRobot dataset and follow command output from the dashboard.">
+    <Page title="AI Training" description="Start fine-tuning jobs against the configured LeRobot dataset and follow command output from the dashboard.">
       <Card>
         <div className="grid gap-4 lg:grid-cols-3">
+          <Field label="Model">
+            <SelectField value={model} onValueChange={changeModel} options={modelOptions} ariaLabel="Training model" />
+          </Field>
           <Field label="Dataset repo id">
             <TextInput value={datasetRepo} onChange={(e) => setDatasetRepo(e.currentTarget.value)} placeholder="from config when blank" />
           </Field>
@@ -73,4 +94,3 @@ export function Training() {
     </Page>
   );
 }
-

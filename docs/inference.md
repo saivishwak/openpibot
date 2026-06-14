@@ -1,10 +1,12 @@
-# PI0.5 inference on XLeRobot (bimanual SO-101)
+# VLA inference on XLeRobot (bimanual SO-101)
 
-This repo supports local finetuned PI0.5 inference:
+This repo supports local finetuned PI0.5 and MolmoAct2 inference:
 
 | Path | Script | Policy runtime | When to use |
 |------|--------|----------------|-------------|
-| **Finetuned (recommended)** | `scripts/infer_pi05_finetuned.py` | Local LeRobot checkpoint on GPU | After finetuning on your VR dataset |
+| **PI0.5 finetuned (recommended)** | `scripts/infer_pi05_finetuned.py` | Local LeRobot checkpoint on GPU | After finetuning on your VR dataset |
+| **MolmoAct2 finetuned** | `scripts/infer_molmoact2_finetuned.py` | Local LeRobot MolmoAct2 checkpoint on GPU | After fine-tuning MolmoAct2 on your VR dataset |
+| **MolmoAct2 base baseline** | `scripts/infer_molmoact2_finetuned.py` | Released MolmoAct2 checkpoint plus dataset stats | Before fine-tuning, for baseline comparison |
 
 This document focuses on **finetuned local inference**, which matches the dataset layout recorded via the dashboard (`head`, `left_wrist`, `right_wrist` cameras and 12 arm joints).
 
@@ -19,9 +21,15 @@ contract, see [architecture.md](architecture.md).
 
 3. **Home pose** in `config/xlerobot.yaml` (`robot.home_pose`). Capture it from the dashboard (VR Teleop → Capture home) or edit the YAML directly.
 
-4. **Finetuned checkpoint** (see [Finetuning](#finetuning)). Checkpoints are saved under `outputs/pi05_finetune/checkpoints/<step>/pretrained_model/`.
+4. **Checkpoint source**. PI0.5 requires a finetuned checkpoint. MolmoAct2 can
+   run either a finetuned LeRobot checkpoint or the released base checkpoint
+   (`allenai/MolmoAct2`) with dataset metadata for normalization/action names.
+   PI0.5 checkpoints are saved under
+   `outputs/pi05_finetune/checkpoints/<step>/pretrained_model/`; MolmoAct2
+   finetuned checkpoints are saved under
+   `outputs/molmoact2_finetune/checkpoints/<step>/pretrained_model/`.
 
-5. **Dependencies**: root `pyproject.toml` pins `transformers>=5.4.0,<5.6.0` for PI0.5. After pulling changes, run `git submodule update --init vendor/lerobot` and `uv sync`. If inference fails with `create_causal_mask() ... cache_position`, you likely have transformers 5.6+ installed — re-sync the venv.
+5. **Dependencies**: root `pyproject.toml` pins `transformers>=5.4.0,<5.6.0` and includes MolmoAct2's `peft`/`scipy` dependencies. After pulling changes, run `git submodule update --init vendor/lerobot vendor/allenai-lerobot` and `uv sync`. If inference fails with `create_causal_mask() ... cache_position`, you likely have transformers 5.6+ installed — re-sync the venv.
 
 ## Finetuning
 
@@ -45,6 +53,38 @@ Example checkpoint path after 5k steps:
 outputs/pi05_finetune/checkpoints/005000/pretrained_model/
 ```
 
+Train MolmoAct2 on the same dataset using the full command in
+[training.md](training.md#molmoact2-fresh-finetune). The example below mirrors
+the canonical production command from the training guide:
+
+```bash
+HF_HUB_DISABLE_XET=1 uv run python scripts/finetune_molmoact2.py \
+  --dataset-repo-id saivishwak/xlerobot-desk-cleanup-phase1 \
+  --checkpoint-path allenai/MolmoAct2 \
+  --output-dir outputs/train/molmoact2_xlerobot \
+  --job-name molmoact2_xlerobot_phase1 \
+  --steps 50000 \
+  --batch-size 2 \
+  --device cuda \
+  --model-dtype bfloat16 \
+  --action-mode continuous \
+  --train-mode-vlm freeze \
+  --chunk-size 50 \
+  --n-action-steps 30 \
+  --num-flow-timesteps 8 \
+  --normalize-gripper \
+  --save-freq 5000 \
+  --eval-freq 5000 \
+  --log-freq 100
+```
+
+MolmoAct2 defaults come from `config/xlerobot.yaml` → `molmoact2.*` and use
+frozen-VLM continuous-action fine-tuning. Example checkpoint path:
+
+```text
+outputs/train/molmoact2_xlerobot/checkpoints/005000/pretrained_model/
+```
+
 ## Shared Runtime Contract
 
 Inference intentionally uses the same runtime assumptions as recording:
@@ -64,6 +104,9 @@ Inference intentionally uses the same runtime assumptions as recording:
   order is: optional policy EMA, optional first-action replan blend, VR-style
   per-joint cap/KP shaping vs previous command, optional present clamp,
   deadband, then optional final command EMA.
+- MolmoAct2 inference imports the policy from `vendor/allenai-lerobot` and the
+  XLerobot hardware driver from `vendor/lerobot`. The wrapper verifies both
+  sources at startup and exits if import resolution is mixed.
 
 ## Bimanual SO-101 vs full XLerobot driver
 
@@ -105,6 +148,78 @@ uv run python scripts/infer_pi05_finetuned.py \
   --settle-steps 30 \
   --gripper-max-relative-target 15
 ```
+
+## Run MolmoAct2 finetuned inference
+
+MolmoAct2 uses the same robot loop and flags as PI0.5. The wrapper only swaps
+the policy loader and pre/post processors. Finetuned mode requires a real
+LeRobot MolmoAct2 checkpoint with saved dataset action feature metadata; it
+does not fall back to dimensional guesses or PI0.5.
+
+```bash
+uv run python scripts/infer_molmoact2_finetuned.py \
+  --policy-path outputs/molmoact2_finetune/checkpoints/last/pretrained_model \
+  --task "Pick up the marker from the table and place it inside the cup" \
+  --camera-backend dashboard \
+  --episodes 2 \
+  --episode-time 180 \
+  --fps 30 \
+  --settle-steps 30 \
+  --gripper-max-relative-target 15
+```
+
+For a startup check that does not load the checkpoint or connect hardware:
+
+```bash
+uv run python scripts/infer_molmoact2_finetuned.py \
+  --dry-run \
+  --task "Pick up the marker from the table and place it inside the cup"
+```
+
+The default MolmoAct2 policy path is
+`outputs/molmoact2_finetune/checkpoints/last/pretrained_model` when not using
+`--dry-run`.
+
+## Run MolmoAct2 base baseline inference
+
+Use `--checkpoint-path` instead of `--policy-path` to evaluate the released
+MolmoAct2 base checkpoint before fine-tuning. Base mode still needs LeRobot
+dataset metadata and stats so the runtime can build the exact XLerobot action
+names, camera features, state features, and normalization processors. The
+defaults come from `config/xlerobot.yaml` → `dataset.*` and `molmoact2.*`.
+
+```bash
+uv run python scripts/infer_molmoact2_finetuned.py \
+  --checkpoint-path allenai/MolmoAct2 \
+  --dataset-repo-id saivishwak/xlerobot-desk-cleanup-phase1 \
+  --task "Pick up the marker from the table and place it inside the cup" \
+  --camera-backend dashboard \
+  --episodes 1 \
+  --episode-time 120 \
+  --fps 30 \
+  --settle-steps 30 \
+  --gripper-max-relative-target 15
+```
+
+For a local/offline dataset metadata source, add `--dataset-root`:
+
+```bash
+uv run python scripts/infer_molmoact2_finetuned.py \
+  --checkpoint-path allenai/MolmoAct2 \
+  --dataset-repo-id saivishwak/xlerobot-desk-cleanup-phase1 \
+  --dataset-root ~/.cache/huggingface/lerobot/saivishwak/xlerobot-desk-cleanup-phase1 \
+  --task "Pick up the marker from the table and place it inside the cup"
+```
+
+Base mode writes a small descriptor under `.cache/molmoact2_baseline_sources/`
+and passes that descriptor through the shared inference runtime. The descriptor
+is not model data; it records the base checkpoint id, dataset metadata source,
+MolmoAct2 action settings, camera keys, and normalization mapping used to
+construct the policy and processors. XLerobot gripper channels are degree-valued,
+so base mode defaults `--normalize-gripper`; use `--no-normalize-gripper` only
+for datasets whose gripper channels are already constrained to `[-1, 1]`. The
+released base checkpoint generates 50-step action chunks, so base mode defaults
+`--action-horizon=50` while still replanning every `--open-loop-steps=30`.
 
 ## Agentic System 2 REPL
 

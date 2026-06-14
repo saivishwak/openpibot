@@ -38,10 +38,24 @@ def train_pi05(body: dict[str, Any] | None = Body(default=None)) -> dict[str, An
     return {"job": job.public()}
 
 
+@router.post("/train/molmoact2")
+def train_molmoact2(body: dict[str, Any] | None = Body(default=None)) -> dict[str, Any]:
+    args = list((body or {}).get("args") or [])
+    job = JOBS.start(["uv", "run", "python", "scripts/finetune_molmoact2.py", *map(str, args)])
+    return {"job": job.public()}
+
+
 @router.post("/inference/pi05")
 def infer_pi05(body: dict[str, Any] | None = Body(default=None)) -> dict[str, Any]:
     args = list((body or {}).get("args") or [])
     job = JOBS.start(["uv", "run", "python", "scripts/infer_pi05_finetuned.py", *map(str, args)])
+    return {"job": job.public()}
+
+
+@router.post("/inference/molmoact2")
+def infer_molmoact2(body: dict[str, Any] | None = Body(default=None)) -> dict[str, Any]:
+    args = list((body or {}).get("args") or [])
+    job = JOBS.start(["uv", "run", "python", "scripts/infer_molmoact2_finetuned.py", *map(str, args)])
     return {"job": job.public()}
 
 

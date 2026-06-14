@@ -591,8 +591,12 @@ export const api = {
     req<{ job: Job }>(`/api/jobs/${id}/cancel`, { method: "POST" }),
   startTraining: (args: string[]) =>
     req<{ job: Job }>("/api/jobs/train/pi05", { method: "POST", body: JSON.stringify({ args }) }),
+  startMolmoAct2Training: (args: string[]) =>
+    req<{ job: Job }>("/api/jobs/train/molmoact2", { method: "POST", body: JSON.stringify({ args }) }),
   startInference: (args: string[]) =>
     req<{ job: Job }>("/api/jobs/inference/pi05", { method: "POST", body: JSON.stringify({ args }) }),
+  startMolmoAct2Inference: (args: string[]) =>
+    req<{ job: Job }>("/api/jobs/inference/molmoact2", { method: "POST", body: JSON.stringify({ args }) }),
   startPi05Server: () =>
     req<{ job: Job }>("/api/jobs/pi05/server", { method: "POST", body: JSON.stringify({}) }),
   pushDataset: (args: string[]) =>

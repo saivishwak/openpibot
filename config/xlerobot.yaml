@@ -52,6 +52,35 @@ pi05:
   server_port: 8000
   action_horizon: 50
   control_fps: 30
+molmoact2:
+  checkpoint_path: allenai/MolmoAct2
+  policy_path: outputs/molmoact2_finetune/checkpoints/last/pretrained_model
+  output_dir: outputs/molmoact2_finetune
+  job_name: molmoact2_finetune_xlerobot
+  action_mode: continuous
+  train_mode_vlm: freeze
+  model_dtype: bfloat16
+  device: cuda
+  chunk_size: 50
+  n_action_steps: 30
+  action_horizon: 50
+  open_loop_steps: 30
+  num_flow_timesteps: 8
+  batch_size: 2
+  num_workers: 4
+  steps: 20000
+  video_backend: pyav
+  image_keys:
+  - observation.images.head
+  - observation.images.left_wrist
+  - observation.images.right_wrist
+  setup_type: dual-arm XLerobot tabletop manipulation
+  control_mode: absolute joint position in degrees
+  normalize_gripper: true
+  normalization_mapping:
+    ACTION: MEAN_STD
+    STATE: MEAN_STD
+    VISUAL: IDENTITY
 vr:
   kp: 0.75
   homing_present_tolerance_deg: 4.0
